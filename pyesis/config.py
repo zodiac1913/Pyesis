@@ -13,6 +13,12 @@ STATE_PATH = Path("pyesis_state.json")
 NEAR_DUP_DIFF_SIMILARITY_THRESHOLD = 0.80
 
 
+def default_export_directory() -> str:
+    documents_dir = Path.home() / "Documents"
+    base_dir = documents_dir if documents_dir.exists() else Path.home()
+    return str(base_dir / "Pyesis")
+
+
 @dataclass
 class RepoConfig:
     path: str
@@ -38,6 +44,7 @@ class AppConfig:
     theme_mode: str = "system"
     high_contrast: bool = False
     ui_font_size: int = 11
+    export_directory: str = field(default_factory=default_export_directory)
     auto_export_time: str = ""
     last_auto_export_date: str = ""
     repos: list[RepoConfig] = field(default_factory=list)
@@ -274,6 +281,17 @@ def load_config() -> AppConfig:
         return AppConfig()
 
     data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    default_export_dir = default_export_directory()
+    raw_export_directory = str(data.get("export_directory", "") or "").strip()
+    if not raw_export_directory:
+        export_directory = default_export_dir
+    else:
+        configured_path = Path(raw_export_directory).expanduser()
+        legacy_export_dir = Path("exports")
+        if configured_path == legacy_export_dir or configured_path.resolve() == legacy_export_dir.resolve():
+            export_directory = default_export_dir
+        else:
+            export_directory = raw_export_directory
     theme_mode = str(data.get("theme_mode", "system")).lower()
     if theme_mode not in {"system", "light", "dark"}:
         theme_mode = "system"
@@ -288,6 +306,7 @@ def load_config() -> AppConfig:
         theme_mode=theme_mode,
         high_contrast=bool(data.get("high_contrast", False)),
         ui_font_size=max(10, min(20, int(data.get("ui_font_size", 11)))),
+        export_directory=export_directory,
         auto_export_time=str(data.get("auto_export_time", "")),
         last_auto_export_date=str(data.get("last_auto_export_date", "")),
         repos=[_decode_repo(item) for item in data.get("repos", [])],
@@ -302,6 +321,7 @@ def save_config(config: AppConfig) -> None:
         "theme_mode": config.theme_mode,
         "high_contrast": config.high_contrast,
         "ui_font_size": config.ui_font_size,
+        "export_directory": config.export_directory,
         "auto_export_time": config.auto_export_time,
         "last_auto_export_date": config.last_auto_export_date,
         "repos": [asdict(repo) for repo in config.repos],

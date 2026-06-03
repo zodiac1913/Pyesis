@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from html import escape
@@ -19,7 +20,7 @@ import ctypes
 import markdown
 
 from pyesis.ai_summary import build_summary
-from pyesis.config import AppConfig, EntryRecord, RepoConfig, dedupe_entries, load_config, save_config
+from pyesis.config import AppConfig, EntryRecord, RepoConfig, dedupe_entries, default_export_directory, load_config, save_config
 from pyesis.diff_buffer import find_item, mark_as_shown, purge_old_daily_buffers, remember_diff
 from pyesis.document_formatter import export_docx, render_plain_text
 from pyesis.git_monitor import capture_snapshot, validate_repo
@@ -31,8 +32,19 @@ WINDOWS_APP_ID = "rxjr.pyesis.app"
 PYESIS_GITHUB_URL = "https://github.com/cms-enterprise/Pyesis"
 
 
+def _default_font_families() -> tuple[str, str]:
+    if sys.platform == "win32":
+        return "Segoe UI", "Consolas"
+    if sys.platform == "darwin":
+        return "Helvetica Neue", "Menlo"
+    return "TkDefaultFont", "TkFixedFont"
+
+
+DEFAULT_UI_FONT_FAMILY, DEFAULT_EDITOR_FONT_FAMILY = _default_font_families()
+
+
 class ToolTip:
-    def __init__(self, widget: tk.Widget, text: str) -> None:
+    def __init__(self, widget: tk.Widget, text: str | Callable[[], str]) -> None:
         self.widget = widget
         self.text = text
         self.tip_window: tk.Toplevel | None = None
@@ -49,9 +61,10 @@ class ToolTip:
         self.tip_window = tk.Toplevel(self.widget)
         self.tip_window.wm_overrideredirect(True)
         self.tip_window.wm_geometry(f"+{x}+{y}")
+        text = self.text() if callable(self.text) else self.text
         label = tk.Label(
             self.tip_window,
-            text=self.text,
+            text=text,
             background="#111111",
             foreground="#ffffff",
             relief="solid",
@@ -221,13 +234,17 @@ class PyesisApp:
         github_button = ttk.Button(editor_header, text="🐙 GitHub", underline=2, width=10, command=self._open_github_repo)
         github_button.grid(row=0, column=1, sticky="e", padx=(0, 6))
 
+        docs_button = ttk.Button(editor_header, text="Docs", underline=0, width=8, command=self._open_docx_folder)
+        docs_button.grid(row=0, column=2, sticky="e", padx=(0, 6))
+
         info_button = ttk.Button(editor_header, text="ⓘ Info", underline=2, width=8, command=self._open_readme_view)
-        info_button.grid(row=0, column=2, sticky="e", padx=(0, 6))
+        info_button.grid(row=0, column=3, sticky="e", padx=(0, 6))
 
         settings_button = ttk.Button(editor_header, text="⚙ Settings", underline=2, width=11, command=self._open_settings)
-        settings_button.grid(row=0, column=3, sticky="e")
+        settings_button.grid(row=0, column=4, sticky="e")
 
         ToolTip(github_button, "Open GitHub Repository (Ctrl+Shift+G)")
+        ToolTip(docs_button, lambda: f"Pyesis docx file folder ({self._docx_output_dir()})")
         ToolTip(info_button, "Open README (F1)")
         ToolTip(settings_button, "Settings (Ctrl+,)")
 
@@ -246,7 +263,7 @@ class PyesisApp:
         self.editor = tk.Text(
             preview_shell,
             wrap="word",
-            font=("Consolas", 11),
+            font=(DEFAULT_EDITOR_FONT_FAMILY, 11),
             tabs=(36,),
             borderwidth=0,
             highlightthickness=0,
@@ -476,24 +493,42 @@ class PyesisApp:
         frame.grid(row=0, column=0, sticky="nsew")
 
         time_var = tk.StringVar(value=self.config.auto_export_time)
+        export_dir_var = tk.StringVar(value=self.config.export_directory or default_export_directory())
         high_contrast_var = tk.BooleanVar(value=self.config.high_contrast)
         font_size_var = tk.IntVar(value=self.config.ui_font_size)
+
+        def browse_export_directory() -> None:
+            selected = filedialog.askdirectory(
+                title="Select DOCX export folder",
+                initialdir=export_dir_var.get().strip() or str(Path.cwd()),
+                mustexist=False,
+            )
+            if selected:
+                export_dir_var.set(selected)
 
         ttk.Label(frame, text="Daily DOCX export time (24h HH:MM)").grid(row=0, column=0, sticky="w")
         ttk.Entry(frame, textvariable=time_var, width=12).grid(row=1, column=0, sticky="w", pady=(6, 0))
         ttk.Label(frame, text="Leave blank to disable daily auto-export.").grid(row=2, column=0, sticky="w", pady=(6, 12))
 
-        ttk.Label(frame, text="Accessibility").grid(row=3, column=0, sticky="w")
-        ttk.Checkbutton(frame, text="High contrast mode", variable=high_contrast_var).grid(row=4, column=0, sticky="w", pady=(6, 0))
-        ttk.Label(frame, text="UI font size").grid(row=5, column=0, sticky="w", pady=(8, 2))
-        ttk.Spinbox(frame, from_=10, to=20, textvariable=font_size_var, width=6).grid(row=6, column=0, sticky="w")
-        ttk.Label(frame, text="Tip: Keyboard shortcuts include Alt+B/A/R/C/E/S/I/G").grid(row=7, column=0, sticky="w", pady=(6, 12))
+        ttk.Label(frame, text="DOCX export folder").grid(row=3, column=0, sticky="w")
+        export_row = ttk.Frame(frame)
+        export_row.grid(row=4, column=0, sticky="ew", pady=(6, 12))
+        export_row.columnconfigure(0, weight=1)
+        ttk.Entry(export_row, textvariable=export_dir_var, width=42).grid(row=0, column=0, sticky="ew")
+        ttk.Button(export_row, text="Browse", command=browse_export_directory).grid(row=0, column=1, padx=(6, 0))
+
+        ttk.Label(frame, text="Accessibility").grid(row=5, column=0, sticky="w")
+        ttk.Checkbutton(frame, text="High contrast mode", variable=high_contrast_var).grid(row=6, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(frame, text="UI font size").grid(row=7, column=0, sticky="w", pady=(8, 2))
+        ttk.Spinbox(frame, from_=10, to=20, textvariable=font_size_var, width=6).grid(row=8, column=0, sticky="w")
+        ttk.Label(frame, text="Tip: Keyboard shortcuts include Alt+B/A/R/C/E/S/I/G").grid(row=9, column=0, sticky="w", pady=(6, 12))
 
         controls = ttk.Frame(frame)
-        controls.grid(row=8, column=0, sticky="e")
+        controls.grid(row=10, column=0, sticky="e")
 
         def save_and_close() -> None:
             raw_time = time_var.get().strip()
+            export_directory = export_dir_var.get().strip() or default_export_directory()
             if raw_time:
                 try:
                     self.config.auto_export_time = self._normalize_time(raw_time)
@@ -502,13 +537,14 @@ class PyesisApp:
                     return
             else:
                 self.config.auto_export_time = ""
+            self.config.export_directory = export_directory
             self.high_contrast_var.set(high_contrast_var.get())
             self.ui_font_size_var.set(max(10, min(20, int(font_size_var.get()))))
             self._apply_fonts()
             self._apply_theme()
             self._persist()
             state = self.config.auto_export_time or "disabled"
-            self.status_var.set(f"Auto-export time set to {state}")
+            self.status_var.set(f"Auto-export time set to {state}; DOCX folder set to {self.config.export_directory}")
             dialog.destroy()
 
         ttk.Button(controls, text="Cancel", command=dialog.destroy).grid(row=0, column=0, padx=(0, 6))
@@ -596,7 +632,7 @@ class PyesisApp:
         self.config.week_end_day = self.week_end_var.get()
         file_name = now.strftime("%Y%b%d") + "Pyesis.docx"
         try:
-            target = export_docx(self.config, Path("exports"), file_name=file_name)
+            target = export_docx(self.config, self._docx_output_dir(), file_name=file_name)
         except Exception as exc:
             self.status_var.set(f"Auto-export failed: {exc}")
             return
@@ -616,6 +652,17 @@ class PyesisApp:
         return self._detect_system_theme()
 
     def _detect_system_theme(self) -> str:
+        if sys.platform == "darwin":
+            try:
+                completed = subprocess.run(
+                    ["defaults", "read", "-g", "AppleInterfaceStyle"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            except Exception:
+                return "light"
+            return "dark" if completed.returncode == 0 and completed.stdout.strip().lower() == "dark" else "light"
         if sys.platform != "win32":
             return "light"
         try:
@@ -736,11 +783,16 @@ class PyesisApp:
         for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont", "TkTooltipFont"):
             try:
                 font = tkfont.nametofont(name)
-                font.configure(size=size)
+                font.configure(family=DEFAULT_UI_FONT_FAMILY, size=size)
             except tk.TclError:
                 continue
+        try:
+            fixed_font = tkfont.nametofont("TkFixedFont")
+            fixed_font.configure(family=DEFAULT_EDITOR_FONT_FAMILY, size=size)
+        except tk.TclError:
+            pass
         if hasattr(self, "editor"):
-            self.editor.configure(font=("Consolas", size))
+            self.editor.configure(font=(DEFAULT_EDITOR_FONT_FAMILY, size))
 
     def _refresh_editor(self) -> None:
         self.editor.delete("1.0", tk.END)
@@ -952,9 +1004,30 @@ class PyesisApp:
     def _export_docx(self) -> None:
         self.config.week_end_day = self.week_end_var.get()
         self._persist()
-        target = export_docx(self.config, Path("exports"))
+        target = export_docx(self.config, self._docx_output_dir())
         self.status_var.set(f"Exported {target.name}")
         messagebox.showinfo("Export complete", f"Saved {target}")
+
+    def _open_docx_folder(self) -> None:
+        target_dir = self._docx_output_dir()
+        target_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            if sys.platform == "win32":
+                os.startfile(str(target_dir))
+            elif sys.platform == "darwin":
+                subprocess.run(["open", str(target_dir)], check=False)
+            else:
+                completed = subprocess.run(["xdg-open", str(target_dir)], check=False)
+                if completed.returncode != 0:
+                    webbrowser.open(target_dir.as_uri())
+        except Exception as exc:
+            messagebox.showerror("Open folder failed", f"Could not open {target_dir}: {exc}")
+            return
+        self.status_var.set(f"Opened {target_dir}")
+
+    def _docx_output_dir(self) -> Path:
+        configured = self.config.export_directory.strip()
+        return Path(configured or default_export_directory()).expanduser()
 
 
 def launch() -> None:

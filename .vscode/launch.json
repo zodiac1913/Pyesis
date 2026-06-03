@@ -5,7 +5,7 @@
             "name": "Python: Pyesis (main.py)",
             "type": "debugpy",
             "request": "launch",
-            "python": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+            "python": "${command:python.interpreterPath}",
             "program": "${workspaceFolder}/main.py",
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",

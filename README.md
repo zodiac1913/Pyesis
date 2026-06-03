@@ -2,6 +2,12 @@
 
 Desktop tool for monitoring `git diff` activity across multiple repositories and building a weekly first-person work log.
 
+## Platform prerequisites
+
+- Python 3.11 or newer
+- Git available on `PATH`
+- Linux desktop environments may require the system Tk package, for example `python3-tk` on Debian/Ubuntu
+
 ## Features
 
 - Add and remove repositories to monitor.
@@ -11,17 +17,22 @@ Desktop tool for monitoring `git diff` activity across multiple repositories and
 - Start each Monday with blank spacing and a weekly header.
 - Export the current log to `.docx`.
 - Optional daily auto-export at a configured time from Settings, saved as `YYYYMMMddPyesis.docx`.
+- Settings include a configurable DOCX export folder, so generated files do not need to live inside the repo.
 - Accessibility options in Settings: high contrast mode and adjustable UI font size.
 - Keyboard shortcuts for common actions (Settings, README, GitHub, add/remove/check/export repo actions).
 
 ## Quick start
 
-```powershell
+```bash
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+source .venv/bin/activate
 python -m pip install -r requirements.txt
 python main.py
 ```
+
+On Windows PowerShell, activate the environment with `.venv\Scripts\Activate.ps1` instead.
+
+The same source tree is intended to run on Windows, macOS, and Linux. Use the platform's normal Python and git installation; there is no platform-specific branch.
 
 ## AI configuration
 
@@ -29,34 +40,44 @@ The app works without an external model. By default it uses a local heuristic su
 
 To use an OpenAI-compatible endpoint instead, set these environment variables before starting the app:
 
-```powershell
-$env:PYESIS_AI_MODE = "openai-compatible"
-$env:PYESIS_AI_URL = "https://your-endpoint/v1/chat/completions"
-$env:PYESIS_AI_MODEL = "your-model-name"
-$env:PYESIS_AI_API_KEY = "your-api-key"
+```bash
+export PYESIS_AI_MODE="openai-compatible"
+export PYESIS_AI_URL="https://your-endpoint/v1/chat/completions"
+export PYESIS_AI_MODEL="your-model-name"
+export PYESIS_AI_API_KEY="your-api-key"
 ```
+
+On Windows PowerShell, use `$env:PYESIS_AI_MODE = "openai-compatible"` style assignments.
 
 ## Notes
 
 - The app stores configuration in `pyesis_state.json` in the project root.
 - Each entry stores a larger diff excerpt to improve summary quality for future rewrites.
-- Exported documents are written to the `exports` folder.
+- Exported documents are written to the configured DOCX output folder.
+- New installs default DOCX output to a `Pyesis` folder in your home Documents directory when available, and legacy `exports` settings are migrated away from the repo-local folder automatically.
+- On macOS, the app follows the current light/dark appearance when Theme is set to `System`.
 
 ## Release Automation
 
 - GitHub Actions release workflow lives at `.github/workflows/release.yml`.
 - Versioning format is `YYYY.MM.DD.xx` (example: `2026.06.01.01`).
 - Release tags must use `vYYYY.MM.DD.xx` (example: `v2026.06.01.01`).
-- Pushing a valid release tag builds `sdist`/wheel artifacts and a Windows `Pyesis-vYYYY.MM.DD.xx.exe`, then publishes a GitHub Release with all artifacts.
+- Pushing a valid release tag builds `sdist`/wheel artifacts plus native artifacts for Windows, macOS, and Linux, then publishes a GitHub Release with all artifacts.
 - You can also run it manually from Actions using `workflow_dispatch` and provide a valid tag.
 
-### Local Windows EXE Test
+### Local Native Build Test
 
-Use this to verify the EXE icon locally before a release:
+Use this on the current OS to verify the native package locally before a release:
 
-```powershell
+```bash
 python -m pip install --upgrade pip -r requirements.txt pyinstaller
-pyinstaller --clean --noconfirm --onefile --icon assets/pyesis.ico --name Pyesis main.py
+python scripts/build_native.py --tag v2026.06.03.01
 ```
 
-The generated executable is written to `dist/Pyesis.exe`.
+Generated artifacts are written to `dist/`:
+
+- Windows: `Pyesis-vYYYY.MM.DD.xx-windows-x64.exe`
+- macOS: `Pyesis-vYYYY.MM.DD.xx-macos-{x64|arm64}.zip` containing `Pyesis.app`
+- Linux: `Pyesis-vYYYY.MM.DD.xx-linux-{x64|arm64}.tar.gz`
+
+The macOS app bundle produced by CI is unsigned. It runs locally, but distribution outside your own machine will require the usual Apple signing and notarization work.
