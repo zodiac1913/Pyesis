@@ -60,8 +60,8 @@ On Windows PowerShell, use `$env:PYESIS_AI_MODE = "openai-compatible"` style ass
 ## Release Automation
 
 - GitHub Actions release workflow lives at `.github/workflows/release.yml`.
-- Versioning format is `YYYY.MM.DD.xx` (example: `2026.06.01.01`).
-- Release tags must use `vYYYY.MM.DD.xx` (example: `v2026.06.01.01`).
+- Versioning format can be compact (`YYYY.M.D.x`) or zero-padded (`YYYY.MM.DD.xx`) for example `2026.6.3.0` or `2026.06.03.00`.
+- Release tags must use the same format with a `v` prefix (for example: `v2026.6.3.0` or `v2026.06.03.00`).
 - Pushing a valid release tag builds `sdist`/wheel artifacts plus native artifacts for Windows, macOS, and Linux, then publishes a GitHub Release with all artifacts.
 - You can also run it manually from Actions using `workflow_dispatch` and provide a valid tag.
 
@@ -71,13 +71,13 @@ Use this on the current OS to verify the native package locally before a release
 
 ```bash
 python -m pip install --upgrade pip -r requirements.txt pyinstaller
-python scripts/build_native.py --tag v2026.06.03.01
+python scripts/build_native.py --tag v2026.6.3.0
 ```
 
 Generated artifacts are written to `dist/`:
 
-- Windows: `Pyesis-vYYYY.MM.DD.xx-windows-x64.exe`
-- macOS: `Pyesis-vYYYY.MM.DD.xx-macos-{x64|arm64}.zip` containing `Pyesis.app`
-- Linux: `Pyesis-vYYYY.MM.DD.xx-linux-{x64|arm64}.tar.gz`
+- Windows: `Pyesis-vYYYY.M.D.x-windows-x64.exe`
+- macOS: `Pyesis-vYYYY.M.D.x-macos-{x64|arm64}.zip` containing `Pyesis.app`
+- Linux: `Pyesis-vYYYY.M.D.x-linux-{x64|arm64}.tar.gz`
 
 The macOS app bundle produced by CI is unsigned. It runs locally, but distribution outside your own machine will require the usual Apple signing and notarization work.

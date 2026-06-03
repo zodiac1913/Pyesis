@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026.6.3.0 - 2026-06-03
+
+### Changed
+- Release tag validation now accepts compact and zero-padded date formats.
+- Release automation docs now match the supported tag formats.
+
+### Fixed
+- Ensured markdown dependency is declared for runtime installs.
+
 ## 2026.06.01.01 - 2026-06-01
 
 ### Added
