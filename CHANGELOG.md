@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026.6.3.1 - 2026-06-03
+
+### Fixed
+- Local native build now invokes PyInstaller via the active Python interpreter for reliable venv builds.
+
 ## 2026.6.3.0 - 2026-06-03
 
 ### Changed
