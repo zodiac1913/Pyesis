@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 import hashlib
+import os
 from pathlib import Path
 import subprocess
 
@@ -39,14 +40,20 @@ class FileChangeSummary:
 
 
 def _run_git(repo_path: str, *args: str) -> str:
+    kwargs = {
+        "cwd": repo_path,
+        "capture_output": True,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "check": False,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
     completed = subprocess.run(
         ["git", *args],
-        cwd=repo_path,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
+        **kwargs,
     )
     if completed.returncode != 0:
         raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or "git command failed")

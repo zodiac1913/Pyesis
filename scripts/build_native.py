@@ -36,6 +36,7 @@ def build_with_pyinstaller(current_platform: str) -> Path:
 
     data_separator = ";" if current_platform == "windows" else ":"
     command.extend(["--add-data", f"assets{data_separator}assets"])
+    command.extend(["--add-data", f"pyproject.toml{data_separator}."])
 
     if current_platform == "windows":
         command.extend(["--onefile", "--windowed", "--icon", "assets/pyesis.ico"])
@@ -55,9 +56,13 @@ def build_with_pyinstaller(current_platform: str) -> Path:
 def archive_artifact(built_path: Path, tag: str, current_platform: str) -> Path:
     arch = platform.machine().lower().replace("x86_64", "x64").replace("amd64", "x64").replace("aarch64", "arm64")
     if current_platform == "windows":
-        target = DIST_DIR / f"{APP_NAME}-{tag}-{current_platform}-{arch}.exe"
-        shutil.copy2(built_path, target)
-        return target
+        versioned_exe = DIST_DIR / f"{APP_NAME}-{tag}-{current_platform}-{arch}.exe"
+        shutil.copy2(built_path, versioned_exe)
+
+        zip_target = DIST_DIR / f"{APP_NAME}-{tag}-{current_platform}-{arch}.zip"
+        with ZipFile(zip_target, "w", compression=ZIP_DEFLATED) as archive:
+            archive.write(versioned_exe, versioned_exe.name)
+        return zip_target
 
     if current_platform == "macos":
         target = DIST_DIR / f"{APP_NAME}-{tag}-{current_platform}-{arch}.zip"

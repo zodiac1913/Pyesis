@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from html import escape
 import hashlib
+import tomllib
 import os
 from pathlib import Path
 import re
@@ -97,7 +98,7 @@ class PyesisApp:
         self._editor_bg_image: tk.PhotoImage | None = None
         self._editor_bg_canvas: tk.Canvas | None = None
         self._set_windows_app_id()
-        self.root.title("Pyesis")
+        self.root.title(self._window_title())
         self.root.geometry("1180x760")
         self._apply_window_icon()
         self.config = load_config()
@@ -110,6 +111,8 @@ class PyesisApp:
         self.repo_label_var = tk.StringVar()
         self.poll_seconds_var = tk.StringVar(value="120")
         self.repo_items: dict[str, RepoConfig] = {}
+        self._selected_repo_index: int | None = None
+        self.repo_action_button: ttk.Button | None = None
         self._poll_in_flight = False
         self._poll_thread: threading.Thread | None = None
         self._poll_results: list[SnapshotCaptureResult] = []
@@ -148,6 +151,26 @@ class PyesisApp:
         roots.append(Path.cwd())
         roots.append(Path(__file__).resolve().parent.parent)
         return roots
+
+    def _window_title(self) -> str:
+        return f"Pyesis v{self._app_version()}"
+
+    def _app_version(self) -> str:
+        version_file_names = ("pyproject.toml",)
+        for root in self._asset_roots():
+            for name in version_file_names:
+                candidate = root / name
+                if not candidate.exists():
+                    continue
+                try:
+                    data = tomllib.loads(candidate.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                project = data.get("project", {})
+                version = str(project.get("version", "")).strip()
+                if version:
+                    return version
+        return "dev"
 
     def _apply_window_icon(self) -> None:
         ico_names = ("assets/pyesis.ico", "assets/Pyesis.ico")
@@ -206,8 +229,16 @@ class PyesisApp:
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(0, weight=1)
         ttk.Label(header, text="Observed Repositories").grid(row=0, column=0, sticky="w")
-        self.repo_list = tk.Listbox(sidebar, height=12, width=38)
+        self.repo_list = tk.Listbox(
+            sidebar,
+            height=12,
+            width=38,
+            exportselection=False,
+            activestyle="dotbox",
+            selectborderwidth=2,
+        )
         self.repo_list.grid(row=1, column=0, sticky="nsew", pady=(6, 12))
+        self.repo_list.bind("<<ListboxSelect>>", self._on_repo_selected)
         sidebar.rowconfigure(1, weight=1)
 
         ttk.Button(sidebar, text="Browse Repo", underline=0, command=self._browse_repo).grid(row=2, column=0, sticky="ew")
@@ -222,7 +253,8 @@ class PyesisApp:
         poll_row.columnconfigure(1, weight=1)
         ttk.Entry(poll_row, textvariable=self.poll_seconds_var, width=7).grid(row=0, column=0, sticky="w")
         ttk.Button(poll_row, text="Refresh", command=self.run_poll_once).grid(row=0, column=1, sticky="e", padx=(8, 0))
-        ttk.Button(sidebar, text="Add Repo", underline=0, command=self._add_repo).grid(row=9, column=0, sticky="ew")
+        self.repo_action_button = ttk.Button(sidebar, text="Add Repo", underline=0, command=self._add_or_update_repo)
+        self.repo_action_button.grid(row=9, column=0, sticky="ew")
         ttk.Button(sidebar, text="Remove Selected", underline=0, command=self._remove_selected_repo).grid(row=10, column=0, sticky="ew", pady=(6, 12))
 
         ttk.Label(sidebar, text="Week end day").grid(row=11, column=0, sticky="w")
@@ -320,7 +352,7 @@ class PyesisApp:
         self.root.bind_all("<F1>", self._on_shortcut_readme)
         self.root.bind_all("<Control-Shift-G>", self._on_shortcut_github)
         self.root.bind_all("<Alt-b>", lambda _e: self._browse_repo())
-        self.root.bind_all("<Alt-a>", lambda _e: self._add_repo())
+        self.root.bind_all("<Alt-a>", lambda _e: self._add_or_update_repo())
         self.root.bind_all("<Alt-r>", lambda _e: self._remove_selected_repo())
         self.root.bind_all("<Alt-c>", lambda _e: self.run_poll_once())
         self.root.bind_all("<Alt-e>", lambda _e: self._export_docx())
@@ -344,9 +376,36 @@ class PyesisApp:
         selected = filedialog.askdirectory(title="Select repository")
         if selected:
             self.repo_path_var.set(selected)
-            self.repo_label_var.set(Path(selected).name)
+            if not self.repo_label_var.get().strip():
+                self.repo_label_var.set(Path(selected).name)
 
-    def _add_repo(self) -> None:
+    def _on_repo_selected(self, _event: tk.Event) -> None:
+        selection = self.repo_list.curselection()
+        if not selection:
+            self._selected_repo_index = None
+            self._set_repo_action_button_text(False)
+            return
+
+        index = selection[0]
+        repo = self.config.repos[index]
+        self._selected_repo_index = index
+        self.repo_path_var.set(repo.path)
+        self.repo_label_var.set(repo.label)
+        self.poll_seconds_var.set(str(repo.poll_seconds))
+        self._set_repo_action_button_text(True)
+
+    def _selected_repo_index_from_selection(self) -> int | None:
+        selection = self.repo_list.curselection()
+        if selection:
+            return selection[0]
+
+        if self._selected_repo_index is None:
+            return None
+        if 0 <= self._selected_repo_index < len(self.config.repos):
+            return self._selected_repo_index
+        return None
+
+    def _add_or_update_repo(self) -> None:
         path = self.repo_path_var.get().strip()
         label = self.repo_label_var.get().strip() or Path(path).name
         try:
@@ -360,35 +419,84 @@ class PyesisApp:
             messagebox.showerror("Invalid repository", message)
             return
 
-        if any(repo.path == path for repo in self.config.repos):
-            messagebox.showinfo("Already added", "This repository is already being monitored.")
-            return
+        current_index = self._selected_repo_index_from_selection()
+        if current_index is None:
+            if any(repo.path == path for repo in self.config.repos):
+                messagebox.showinfo("Already added", "This repository is already being monitored.")
+                return
+            self.config.repos.append(RepoConfig(path=path, label=label, poll_seconds=poll_seconds))
+            status_text = f"Added {label}"
+            current_index = len(self.config.repos) - 1
+        else:
+            if any(index != current_index and repo.path == path for index, repo in enumerate(self.config.repos)):
+                messagebox.showinfo("Already added", "Another monitored repository already uses that path.")
+                return
 
-        self.config.repos.append(RepoConfig(path=path, label=label, poll_seconds=poll_seconds))
+            self.config.repos[current_index] = RepoConfig(path=path, label=label, poll_seconds=poll_seconds)
+            status_text = f"Updated {label}"
+
         self._persist()
         self._refresh_repo_list()
-        self.status_var.set(f"Added {label}")
+        self._clear_repo_form()
+        self.status_var.set(status_text)
 
     def _remove_selected_repo(self) -> None:
-        selection = self.repo_list.curselection()
-        if not selection:
+        index = self._selected_repo_index_from_selection()
+        if index is None:
             return
-        selected_label = self.repo_list.get(selection[0])
-        repo = self.repo_items.get(selected_label)
-        if repo is None:
-            return
-        self.config.repos = [item for item in self.config.repos if item.path != repo.path]
+        repo = self.config.repos[index]
+        self.config.repos.pop(index)
         self._persist()
         self._refresh_repo_list()
+        self._clear_repo_form()
         self.status_var.set(f"Removed {repo.label}")
 
-    def _refresh_repo_list(self) -> None:
+    def _refresh_repo_list(self, select_index: int | None = None) -> None:
         self.repo_items = {}
         self.repo_list.delete(0, tk.END)
         for repo in self.config.repos:
             label = f"{repo.label} ({repo.poll_seconds}s)"
             self.repo_items[label] = repo
             self.repo_list.insert(tk.END, label)
+
+        target_index = select_index if select_index is not None else self._selected_repo_index
+        if target_index is None:
+            return
+
+        if 0 <= target_index < len(self.config.repos):
+            self.repo_list.selection_set(target_index)
+            self.repo_list.activate(target_index)
+            self.repo_list.see(target_index)
+            self._selected_repo_index = target_index
+
+    def _sync_repo_row(self, index: int) -> None:
+        if index < 0 or index >= len(self.config.repos):
+            self._refresh_repo_list()
+            return
+
+        repo = self.config.repos[index]
+        label = f"{repo.label} ({repo.poll_seconds}s)"
+        self._selected_repo_index = index
+        self.repo_items[label] = repo
+        self.repo_list.delete(index)
+        self.repo_list.insert(index, label)
+        self.repo_list.selection_clear(0, tk.END)
+        self.repo_list.selection_set(index)
+        self.repo_list.activate(index)
+        self.repo_list.see(index)
+
+    def _clear_repo_form(self) -> None:
+        self._selected_repo_index = None
+        self.repo_list.selection_clear(0, tk.END)
+        self.repo_path_var.set("")
+        self.repo_label_var.set("")
+        self.poll_seconds_var.set("120")
+        self._set_repo_action_button_text(False)
+
+    def _set_repo_action_button_text(self, is_update_mode: bool) -> None:
+        if self.repo_action_button is None:
+            return
+        self.repo_action_button.configure(text="Update Repo" if is_update_mode else "Add Repo")
 
     def _migrate_entries(self) -> None:
         original_len = len(self.config.entries)

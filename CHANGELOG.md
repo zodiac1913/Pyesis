@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026.6.3.3 - 2026-06-03
+
+### Changed
+- Repo editing now resets the form after Add/Update and clears the selection.
+- Repo action button now toggles between Add Repo and Update Repo based on selection.
+
+### Fixed
+- Git subprocesses on Windows now run hidden so repo refresh no longer flashes consoles.
+
 ## 2026.6.3.2 - 2026-06-03
 
 ### Changed

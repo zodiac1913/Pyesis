@@ -77,6 +77,7 @@ python scripts/build_native.py --tag v2026.6.3.0
 Generated artifacts are written to `dist/`:
 
 - Windows: `Pyesis-vYYYY.M.D.x-windows-x64.exe`
+- Windows upload-friendly package: `Pyesis-vYYYY.M.D.x-windows-x64.zip` (contains the `.exe`)
 - macOS: `Pyesis-vYYYY.M.D.x-macos-{x64|arm64}.zip` containing `Pyesis.app`
 - Linux: `Pyesis-vYYYY.M.D.x-linux-{x64|arm64}.tar.gz`
 
