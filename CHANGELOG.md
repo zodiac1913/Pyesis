@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026.6.3.2 - 2026-06-03
+
+### Changed
+- Repo polling now runs in a background worker so git scans do not block UI input.
+- Poll cycle now avoids overlapping scans and reports scan-in-progress status.
+
+### Fixed
+- Heuristic fallback summaries now use context-aware phrasing to reduce repetitive duplicate wording.
+
 ## 2026.6.3.1 - 2026-06-03
 
 ### Fixed

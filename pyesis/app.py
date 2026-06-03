@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from html import escape
@@ -11,6 +12,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, ttk
@@ -23,13 +25,20 @@ from pyesis.ai_summary import build_summary
 from pyesis.config import AppConfig, EntryRecord, RepoConfig, dedupe_entries, default_export_directory, load_config, save_config
 from pyesis.diff_buffer import find_item, mark_as_shown, purge_old_daily_buffers, remember_diff
 from pyesis.document_formatter import export_docx, render_plain_text
-from pyesis.git_monitor import capture_snapshot, validate_repo
+from pyesis.git_monitor import DiffSnapshot, capture_snapshot, validate_repo
 
 
 DIFF_EXCERPT_LIMIT = 12_000
 NEAR_DUP_DIFF_SIMILARITY_THRESHOLD = 0.80
 WINDOWS_APP_ID = "rxjr.pyesis.app"
 PYESIS_GITHUB_URL = "https://github.com/cms-enterprise/Pyesis"
+
+
+@dataclass
+class SnapshotCaptureResult:
+    repo: RepoConfig
+    snapshot: DiffSnapshot | None
+    error: str = ""
 
 
 def _default_font_families() -> tuple[str, str]:
@@ -101,6 +110,9 @@ class PyesisApp:
         self.repo_label_var = tk.StringVar()
         self.poll_seconds_var = tk.StringVar(value="120")
         self.repo_items: dict[str, RepoConfig] = {}
+        self._poll_in_flight = False
+        self._poll_thread: threading.Thread | None = None
+        self._poll_results: list[SnapshotCaptureResult] = []
         self._buffer_day = datetime.now().strftime("%Y-%m-%d")
         purge_old_daily_buffers(7, self._buffer_day)
         self.style = ttk.Style(self.root)
@@ -131,6 +143,8 @@ class PyesisApp:
             bundle_root = Path(getattr(sys, "_MEIPASS", ""))
             if bundle_root:
                 roots.append(bundle_root)
+            exe_root = Path(sys.executable).resolve().parent
+            roots.append(exe_root)
         roots.append(Path.cwd())
         roots.append(Path(__file__).resolve().parent.parent)
         return roots
@@ -158,6 +172,13 @@ class PyesisApp:
                 return True
             except tk.TclError:
                 continue
+
+        if os.name == "nt" and getattr(sys, "frozen", False):
+            try:
+                self.root.iconbitmap(default=str(Path(sys.executable)))
+                return True
+            except tk.TclError:
+                pass
         return False
 
     def _try_apply_png_icon(self, names: tuple[str, ...]) -> bool:
@@ -959,6 +980,10 @@ class PyesisApp:
         if snapshot is None:
             return False
 
+        return self._capture_repo_snapshot_change(repo, snapshot)
+
+    def _capture_repo_snapshot_change(self, repo: RepoConfig, snapshot: DiffSnapshot) -> bool:
+
         summary_text, already_shown = self._resolve_summary_from_ledger(repo, snapshot.diff_text)
         if already_shown:
             return False
@@ -987,19 +1012,78 @@ class PyesisApp:
         mark_as_shown(repo.label, snapshot.diff_text, self._buffer_day)
         return True
 
-    def run_poll_once(self) -> None:
-        self.config.week_end_day = self.week_end_var.get()
-        self._ensure_active_buffer_day()
+    def _poll_worker(self, repos: list[RepoConfig]) -> None:
+        results: list[SnapshotCaptureResult] = []
+        for repo in repos:
+            try:
+                results.append(SnapshotCaptureResult(repo=repo, snapshot=capture_snapshot(repo)))
+            except Exception as exc:
+                results.append(SnapshotCaptureResult(repo=repo, snapshot=None, error=str(exc)))
+        self._poll_results = results
+
+    def _check_poll_worker(self) -> None:
+        if self._poll_thread is not None and self._poll_thread.is_alive():
+            self.root.after(100, self._check_poll_worker)
+            return
+        self._finish_poll()
+
+    def _repo_error_count_text(self, count: int) -> str:
+        return f"{count} repo error{'s' if count != 1 else ''}"
+
+    def _consume_poll_result(self, result: SnapshotCaptureResult, errors: list[str]) -> bool:
+        if result.error:
+            errors.append(f"{result.repo.label}: {result.error}")
+            return False
+        if result.snapshot is None:
+            return False
+        return self._capture_repo_snapshot_change(result.repo, result.snapshot)
+
+    def _reset_poll_state(self) -> None:
+        self._poll_in_flight = False
+        self._poll_thread = None
+        self._poll_results = []
+
+    def _finish_poll(self) -> None:
         captured = 0
-        for repo in self.config.repos:
-            if self._capture_repo_change(repo):
+        errors: list[str] = []
+
+        for result in self._poll_results:
+            if self._consume_poll_result(result, errors):
                 captured += 1
 
+        now_time = datetime.now().strftime('%H:%M:%S')
         if captured:
             self._persist()
-            self.status_var.set(f"Captured {captured} new change summary{'ies' if captured != 1 else ''} at {datetime.now().strftime('%H:%M:%S')}")
+            base = f"Captured {captured} new change summary{'ies' if captured != 1 else ''} at {now_time}"
+            if errors:
+                self.status_var.set(f"{base} ({self._repo_error_count_text(len(errors))})")
+            else:
+                self.status_var.set(base)
+        elif errors:
+            self.status_var.set(f"No new diffs; {self._repo_error_count_text(len(errors))} during scan")
         else:
-            self.status_var.set(f"No new diffs at {datetime.now().strftime('%H:%M:%S')}")
+            self.status_var.set(f"No new diffs at {now_time}")
+
+        self._reset_poll_state()
+
+    def run_poll_once(self) -> None:
+        if self._poll_in_flight:
+            self.status_var.set("Scan already running; waiting for completion")
+            return
+
+        self.config.week_end_day = self.week_end_var.get()
+        self._ensure_active_buffer_day()
+        repos = list(self.config.repos)
+        if not repos:
+            self.status_var.set("No repositories configured")
+            return
+
+        self._poll_in_flight = True
+        self._poll_results = []
+        self.status_var.set(f"Scanning {len(repos)} repos in background...")
+        self._poll_thread = threading.Thread(target=self._poll_worker, args=(repos,), daemon=True)
+        self._poll_thread.start()
+        self.root.after(100, self._check_poll_worker)
 
     def _export_docx(self) -> None:
         self.config.week_end_day = self.week_end_var.get()

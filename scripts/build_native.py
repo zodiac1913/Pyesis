@@ -34,6 +34,9 @@ def build_with_pyinstaller(current_platform: str) -> Path:
     # Use the current interpreter so PyInstaller resolves from the active environment.
     command = [sys.executable, "-m", "PyInstaller", "--clean", "--noconfirm", "--name", APP_NAME]
 
+    data_separator = ";" if current_platform == "windows" else ":"
+    command.extend(["--add-data", f"assets{data_separator}assets"])
+
     if current_platform == "windows":
         command.extend(["--onefile", "--windowed", "--icon", "assets/pyesis.ico"])
     elif current_platform == "macos":

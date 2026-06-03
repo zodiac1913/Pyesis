@@ -34,6 +34,8 @@ INTENT_PURPOSE_PREFIXES = {
     "changing ": "change ",
     "improving ": "improve ",
 }
+APP_FILENAME = "app.py"
+APP_PATH_SUFFIXES = (f"/{APP_FILENAME}", APP_FILENAME)
 
 
 @dataclass
@@ -64,7 +66,7 @@ def _robust_bulleted_summary(repo_label: str, changes: list[FileChangeSummary]) 
     top_paths = _path_rollup(changes)
     top_intents = _top_intents(changes, max_items=3)
     lines.append(f"I updated {repo_label} by changing {top_paths} in this capture window.")
-    lines.append(f"This work aimed to {_why_clause(top_intents)} through {_how_clause(changes, top_intents)}.")
+    lines.append(f"This work aimed to {_why_clause(top_intents, changes)} through {_how_clause(changes, top_intents)}.")
 
     ranked = sorted(
         changes,
@@ -77,9 +79,9 @@ def _robust_bulleted_summary(repo_label: str, changes: list[FileChangeSummary]) 
     return "\n".join(lines)
 
 
-def _why_clause(intents: list[str]) -> str:
+def _why_clause(intents: list[str], changes: list[FileChangeSummary]) -> str:
     if not intents or intents == [NO_INTENT_SENTINEL]:
-        return "improve code clarity and keep the implementation moving forward"
+        return _fallback_goal(changes)
 
     purpose_bits = [_intent_to_purpose(intent) for intent in intents[:2]]
     joined = _join_with_and(purpose_bits)
@@ -90,7 +92,39 @@ def _how_clause(changes: list[FileChangeSummary], intents: list[str]) -> str:
     file_count = _count_phrase(len(changes), "file")
     if intents and intents != [NO_INTENT_SENTINEL]:
         return f"edits across {file_count}, including {_join_with_and(intents[:2])}"
-    return f"edits across {file_count} with targeted code updates"
+    return f"{_action_rollup(changes)} across {file_count}"
+
+
+def _fallback_goal(changes: list[FileChangeSummary]) -> str:
+    path_l = [change.path.lower().replace("\\", "/") for change in changes]
+    if any(p.endswith(APP_PATH_SUFFIXES) for p in path_l):
+        return "improve application flow and user-facing behavior"
+    if any("config" in p or p.endswith(".json") for p in path_l):
+        return "improve configuration reliability"
+    if any(p.endswith(".md") for p in path_l):
+        return "improve documentation clarity"
+    return "advance implementation quality in the touched areas"
+
+
+def _action_rollup(changes: list[FileChangeSummary]) -> str:
+    created = sum(1 for c in changes if c.action == "created")
+    deleted = sum(1 for c in changes if c.action == "deleted")
+    renamed = sum(1 for c in changes if c.action == "renamed")
+    modified = sum(1 for c in changes if c.action == "modified")
+
+    action_bits: list[str] = []
+    if created:
+        action_bits.append(f"creating {_count_phrase(created, 'file')}")
+    if modified:
+        action_bits.append(f"refining {_count_phrase(modified, 'file')}")
+    if renamed:
+        action_bits.append(f"renaming {_count_phrase(renamed, 'file')}")
+    if deleted:
+        action_bits.append(f"removing {_count_phrase(deleted, 'file')}")
+
+    if not action_bits:
+        return "implementation updates"
+    return _join_with_and(action_bits)
 
 
 def _path_rollup(changes: list[FileChangeSummary], explicit_limit: int = 6) -> str:
@@ -324,7 +358,7 @@ def _file_phrase(change: FileChangeSummary) -> str:
 def _special_file_phrase(path: str, path_l: str, change: FileChangeSummary, intents: list[str]) -> str:
     path_name = Path(path).name.lower()
     path_stem = Path(path).stem.lower()
-    if path_l.endswith("app.py") or "/app." in path_l.replace("\\", "/"):
+    if path_l.endswith(APP_FILENAME) or "/app." in path_l.replace("\\", "/"):
         app_phrase = _app_change_phrase(change)
         if app_phrase:
             return app_phrase
@@ -377,7 +411,7 @@ def _to_past_tense(intent: str) -> str:
 
 def _file_priority(path: str) -> int:
     path_l = path.lower().replace("\\", "/")
-    if path_l.endswith("app.py"):
+    if path_l.endswith(APP_FILENAME):
         return 100
     if path_l.endswith("config.py"):
         return 80
