@@ -4,6 +4,7 @@ import argparse
 import platform
 import shutil
 import subprocess
+import sys
 import tarfile
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -30,7 +31,8 @@ def platform_name() -> str:
 
 
 def build_with_pyinstaller(current_platform: str) -> Path:
-    command = ["pyinstaller", "--clean", "--noconfirm", "--name", APP_NAME]
+    # Use the current interpreter so PyInstaller resolves from the active environment.
+    command = [sys.executable, "-m", "PyInstaller", "--clean", "--noconfirm", "--name", APP_NAME]
 
     if current_platform == "windows":
         command.extend(["--onefile", "--windowed", "--icon", "assets/pyesis.ico"])
