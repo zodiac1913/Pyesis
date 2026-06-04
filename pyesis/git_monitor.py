@@ -19,6 +19,7 @@ DEFAULT_EXCLUDES = [
     ".venv/**",
     "__pycache__/**",
 ]
+DIFF_CONTEXT_LINES = 20
 
 
 @dataclass
@@ -91,7 +92,7 @@ def capture_snapshot(repo: RepoConfig) -> DiffSnapshot | None:
 
 def _run_diff(repo_path: str, *prefix_args: str) -> str:
     exclude_args = [f":(exclude){pattern}" for pattern in DEFAULT_EXCLUDES]
-    return _run_git(repo_path, *prefix_args, "--", ".", *exclude_args)
+    return _run_git(repo_path, *prefix_args, f"-U{DIFF_CONTEXT_LINES}", "--", ".", *exclude_args)
 
 
 def has_snapshot_changed(snapshot: DiffSnapshot, existing_entries: list[EntryRecord]) -> bool:

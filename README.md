@@ -38,6 +38,24 @@ The same source tree is intended to run on Windows, macOS, and Linux. Use the pl
 
 The app works without an external model. By default it uses a local heuristic summarizer that rewrites git changes in first person.
 
+To use Ollama instead, set these environment variables before starting the app:
+
+```bash
+export PYESIS_AI_MODE="ollama"
+export PYESIS_OLLAMA_URL="http://localhost:11434/api/chat"
+export PYESIS_OLLAMA_MODEL="qwen3-coder:30b"
+export PYESIS_OLLAMA_KEEP_ALIVE="5m"
+```
+
+On Windows PowerShell:
+
+```powershell
+$env:PYESIS_AI_MODE = "ollama"
+$env:PYESIS_OLLAMA_URL = "http://localhost:11434/api/chat"
+$env:PYESIS_OLLAMA_MODEL = "qwen3-coder:30b"
+$env:PYESIS_OLLAMA_KEEP_ALIVE = "5m"
+```
+
 To use an OpenAI-compatible endpoint instead, set these environment variables before starting the app:
 
 ```bash

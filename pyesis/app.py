@@ -22,7 +22,7 @@ import ctypes
 
 import markdown
 
-from pyesis.ai_summary import build_summary
+from pyesis.ai_summary import AISummaryResult, build_summary
 from pyesis.config import AppConfig, EntryRecord, RepoConfig, dedupe_entries, default_export_directory, load_config, save_config
 from pyesis.diff_buffer import find_item, mark_as_shown, purge_old_daily_buffers, remember_diff
 from pyesis.document_formatter import export_docx, render_plain_text
@@ -99,10 +99,12 @@ class PyesisApp:
         self._editor_bg_canvas: tk.Canvas | None = None
         self._set_windows_app_id()
         self.root.title(self._window_title())
-        self.root.geometry("1180x760")
+        self._set_initial_window_size()
         self._apply_window_icon()
         self.config = load_config()
+        self._apply_ai_environment_defaults()
         self.status_var = tk.StringVar(value="Idle")
+        self.ai_status_var = tk.StringVar(value=self._initial_ai_status_text())
         self.week_end_var = tk.StringVar(value=self.config.week_end_day)
         self.theme_mode_var = tk.StringVar(value=self.config.theme_mode.capitalize())
         self.high_contrast_var = tk.BooleanVar(value=self.config.high_contrast)
@@ -116,6 +118,9 @@ class PyesisApp:
         self._poll_in_flight = False
         self._poll_thread: threading.Thread | None = None
         self._poll_results: list[SnapshotCaptureResult] = []
+        self._ai_backend_unavailable = False
+        self._ai_last_warning = ""
+        self._ai_status_severity = "ok"
         self._buffer_day = datetime.now().strftime("%Y-%m-%d")
         purge_old_daily_buffers(7, self._buffer_day)
         self.style = ttk.Style(self.root)
@@ -139,6 +144,34 @@ class PyesisApp:
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(WINDOWS_APP_ID)
         except Exception:
             return
+
+    def _set_initial_window_size(self) -> None:
+        # Open with a roomy layout now that the sidebar has additional controls.
+        min_width, min_height = 1180, 780
+        self.root.minsize(min_width, min_height)
+
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+
+        width = max(min_width, int(screen_w * 0.86))
+        height = max(min_height, int(screen_h * 0.84))
+
+        width = min(width, screen_w - 40)
+        height = min(height, screen_h - 80)
+
+        pos_x = max(0, (screen_w - width) // 2)
+        pos_y = max(0, (screen_h - height) // 3)
+        self.root.geometry(f"{width}x{height}+{pos_x}+{pos_y}")
+
+    def _apply_ai_environment_defaults(self) -> None:
+        if self.config.ai_mode:
+            os.environ.setdefault("PYESIS_AI_MODE", self.config.ai_mode)
+        if self.config.ai_ollama_url:
+            os.environ.setdefault("PYESIS_OLLAMA_URL", self.config.ai_ollama_url)
+        if self.config.ai_ollama_model:
+            os.environ.setdefault("PYESIS_OLLAMA_MODEL", self.config.ai_ollama_model)
+        if self.config.ai_ollama_keep_alive:
+            os.environ.setdefault("PYESIS_OLLAMA_KEEP_ALIVE", self.config.ai_ollama_keep_alive)
 
     def _asset_roots(self) -> list[Path]:
         roots: list[Path] = []
@@ -276,7 +309,9 @@ class PyesisApp:
         theme_box.bind("<<ComboboxSelected>>", self._on_theme_changed)
 
         ttk.Button(sidebar, text="Export DOCX", underline=0, command=self._export_docx).grid(row=15, column=0, sticky="ew", pady=(6, 0))
-        ttk.Label(sidebar, textvariable=self.status_var, wraplength=260).grid(row=16, column=0, sticky="ew", pady=(16, 0))
+        ttk.Label(sidebar, text="AI status").grid(row=16, column=0, sticky="w", pady=(12, 2))
+        ttk.Label(sidebar, textvariable=self.ai_status_var, style="AIStatus.TLabel", wraplength=260).grid(row=17, column=0, sticky="ew")
+        ttk.Label(sidebar, textvariable=self.status_var, wraplength=260).grid(row=18, column=0, sticky="ew", pady=(12, 0))
 
         editor_header = ttk.Frame(editor_area)
         editor_header.grid(row=0, column=0, sticky="ew")
@@ -504,7 +539,10 @@ class PyesisApp:
         deduped = dedupe_entries(filtered)
         rewritten = self._rewrite_legacy_summaries(deduped)
 
-        if len(rewritten) != original_len or any(a.summary != b.summary for a, b in zip(deduped, rewritten)):
+        if len(rewritten) != original_len or any(
+            (a.summary != b.summary) or (a.author != b.author)
+            for a, b in zip(deduped, rewritten)
+        ):
             self.config.entries = rewritten
             save_config(self.config)
 
@@ -565,8 +603,11 @@ class PyesisApp:
     def _rewrite_legacy_summaries(self, entries: list[EntryRecord]) -> list[EntryRecord]:
         rewritten: list[EntryRecord] = []
         for entry in entries:
-            if self._needs_summary_refresh(entry) and entry.diff_excerpt.strip():
-                refreshed = build_summary(entry.repo_label, entry.diff_excerpt).text
+            needs_refresh = self._needs_summary_refresh(entry)
+            is_backup = entry.author == "Backup"
+            if (needs_refresh or is_backup) and entry.diff_excerpt.strip():
+                refreshed = self._build_summary_heuristic(entry.repo_label, entry.diff_excerpt) if needs_refresh else entry.summary
+                next_author = "Backup" if is_backup else "AI"
                 rewritten.append(
                     EntryRecord(
                         repo_label=entry.repo_label,
@@ -577,11 +618,28 @@ class PyesisApp:
                         summary=refreshed,
                         diff_hash=entry.diff_hash,
                         diff_excerpt=entry.diff_excerpt,
+                        author=next_author,
                     )
                 )
             else:
                 rewritten.append(entry)
         return rewritten
+
+    def _build_summary_heuristic(self, repo_label: str, diff_excerpt: str) -> str:
+        previous_mode = os.environ.get("PYESIS_AI_MODE")
+        os.environ["PYESIS_AI_MODE"] = "heuristic"
+        try:
+            return build_summary(repo_label, diff_excerpt).text
+        finally:
+            if previous_mode is None:
+                os.environ.pop("PYESIS_AI_MODE", None)
+            else:
+                os.environ["PYESIS_AI_MODE"] = previous_mode
+
+    def _entry_author_from_source(self, source: str, current_is_backup: bool = True) -> str:
+        if source and source != "heuristic":
+            return "AI"
+        return "Backup" if current_is_backup else "AI"
 
     def _needs_summary_refresh(self, entry: EntryRecord) -> bool:
         text = entry.summary.lower()
@@ -813,6 +871,8 @@ class PyesisApp:
         self.style.configure(".", background=palette["bg"], foreground=palette["fg"])
         self.style.configure("TFrame", background=palette["bg"])
         self.style.configure("TLabel", background=palette["bg"], foreground=palette["fg"])
+        ai_fg = "#d13438" if self._ai_status_severity == "degraded" else "#107c10"
+        self.style.configure("AIStatus.TLabel", background=palette["bg"], foreground=ai_fg)
         self.style.configure("TButton", background=palette["surface"], foreground=palette["fg"])
         self.style.map(
             "TButton",
@@ -948,18 +1008,64 @@ class PyesisApp:
             self.status_var.set(f"{repo.label}: {exc}")
             return None
 
-    def _resolve_summary_from_ledger(self, repo: RepoConfig, diff_text: str) -> tuple[str, bool]:
+    def _resolve_summary_from_ledger(self, repo: RepoConfig, diff_text: str) -> tuple[str, bool, str]:
         existing = find_item(repo.label, diff_text, self._buffer_day)
         if existing is not None and existing["shown"]:
-            return "", True
+            return "", True, "Backup"
 
         summary_text = existing["gitDiffDescription"] if existing is not None else ""
+        author = existing.get("author", "Backup") if existing is not None else "Backup"
+
+        if summary_text.strip() and author == "Backup":
+            summary = build_summary(repo.label, diff_text)
+            self._handle_ai_health(summary, repo.label)
+            if summary.source != "heuristic":
+                summary_text = summary.text
+                author = "AI"
+
         if not summary_text.strip():
             summary = build_summary(repo.label, diff_text)
+            self._handle_ai_health(summary, repo.label)
             summary_text = summary.text
-        return summary_text, False
+            author = self._entry_author_from_source(summary.source, current_is_backup=True)
 
-    def _build_entry(self, repo: RepoConfig, snapshot, summary_text: str, diff_hash: str) -> EntryRecord:
+        return summary_text, False, author
+
+    def _initial_ai_status_text(self) -> str:
+        mode = os.getenv("PYESIS_AI_MODE", "heuristic").strip().lower()
+        if mode == "ollama":
+            return "[PENDING] Ollama waiting for first response"
+        if mode == "openai-compatible":
+            return "[PENDING] OpenAI-compatible waiting for first response"
+        return "[OK] Heuristic summaries active"
+
+    def _handle_ai_health(self, summary: AISummaryResult, repo_label: str) -> None:
+        warning = summary.warning.strip()
+        if warning:
+            self.status_var.set(f"AI unavailable for {repo_label}; using heuristic summary")
+            self._ai_status_severity = "degraded"
+            self.ai_status_var.set(f"//// AI DEGRADED //// {warning}")
+            self._apply_theme()
+            if not self._ai_backend_unavailable or warning != self._ai_last_warning:
+                self._ai_backend_unavailable = True
+                self._ai_last_warning = warning
+            return
+
+        if self._ai_backend_unavailable and summary.source != "heuristic":
+            self._ai_backend_unavailable = False
+            self._ai_last_warning = ""
+            self._ai_status_severity = "ok"
+            self.ai_status_var.set(f"[OK] Healthy: {summary.source} summaries active")
+            self._apply_theme()
+            self.status_var.set(f"AI recovered for {repo_label}; resumed {summary.source} summaries")
+            return
+
+        if summary.source != "heuristic":
+            self._ai_status_severity = "ok"
+            self.ai_status_var.set(f"[OK] Healthy: {summary.source} summaries active")
+            self._apply_theme()
+
+    def _build_entry(self, repo: RepoConfig, snapshot, summary_text: str, diff_hash: str, author: str) -> EntryRecord:
         created_at = snapshot.created_at
         week_start = (created_at - timedelta(days=created_at.weekday())).replace(
             hour=0,
@@ -976,6 +1082,7 @@ class PyesisApp:
             summary=summary_text,
             diff_hash=diff_hash,
             diff_excerpt=snapshot.diff_text[:DIFF_EXCERPT_LIMIT],
+            author=author,
         )
 
     def _entry_day_key(self, created_at_iso: str) -> str:
@@ -1092,15 +1199,21 @@ class PyesisApp:
 
     def _capture_repo_snapshot_change(self, repo: RepoConfig, snapshot: DiffSnapshot) -> bool:
 
-        summary_text, already_shown = self._resolve_summary_from_ledger(repo, snapshot.diff_text)
+        summary_text, already_shown, author = self._resolve_summary_from_ledger(repo, snapshot.diff_text)
         if already_shown:
             return False
 
-        ledger_item = remember_diff(repo.label, repo.path, snapshot.diff_text, summary_text, self._buffer_day)
+        ledger_item = remember_diff(repo.label, repo.path, snapshot.diff_text, summary_text, author, self._buffer_day)
         if ledger_item["shown"]:
             return False
 
-        new_entry = self._build_entry(repo, snapshot, summary_text, ledger_item["diffHash"] or snapshot.diff_hash)
+        new_entry = self._build_entry(
+            repo,
+            snapshot,
+            summary_text,
+            ledger_item["diffHash"] or snapshot.diff_hash,
+            ledger_item.get("author", author),
+        )
         if self._is_possible_duplicate_diff(new_entry):
             self.status_var.set(f"[POSSIBLE DUPLICATE] {repo.label}: duplicate git diff detected for this repo/day")
             mark_as_shown(repo.label, snapshot.diff_text, self._buffer_day)

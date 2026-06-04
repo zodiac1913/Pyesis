@@ -11,6 +11,7 @@ from typing import Any
 
 STATE_PATH = Path("pyesis_state.json")
 NEAR_DUP_DIFF_SIMILARITY_THRESHOLD = 0.80
+OLLAMA_DEFAULT_URL = "http://localhost:11434/api/chat"
 
 
 def default_export_directory() -> str:
@@ -36,6 +37,7 @@ class EntryRecord:
     summary: str
     diff_hash: str
     diff_excerpt: str
+    author: str = "Backup"
 
 
 @dataclass
@@ -47,6 +49,10 @@ class AppConfig:
     export_directory: str = field(default_factory=default_export_directory)
     auto_export_time: str = ""
     last_auto_export_date: str = ""
+    ai_mode: str = ""
+    ai_ollama_url: str = OLLAMA_DEFAULT_URL
+    ai_ollama_model: str = ""
+    ai_ollama_keep_alive: str = "30m"
     repos: list[RepoConfig] = field(default_factory=list)
     entries: list[EntryRecord] = field(default_factory=list)
 
@@ -271,6 +277,7 @@ def _decode_entry(item: dict[str, Any]) -> EntryRecord:
         day_name=item["day_name"],
         week_start_iso=item["week_start_iso"],
         summary=item["summary"],
+        author=str(item.get("author", "Backup")),
         diff_hash=item["diff_hash"],
         diff_excerpt=item.get("diff_excerpt", ""),
     )
@@ -295,9 +302,11 @@ def load_config() -> AppConfig:
     theme_mode = str(data.get("theme_mode", "system")).lower()
     if theme_mode not in {"system", "light", "dark"}:
         theme_mode = "system"
-    raw_entries = [_decode_entry(item) for item in data.get("entries", [])]
+    raw_entry_items = data.get("entries", [])
+    missing_entry_author = any(isinstance(item, dict) and "author" not in item for item in raw_entry_items)
+    raw_entries = [_decode_entry(item) for item in raw_entry_items]
     entries = dedupe_entries(raw_entries)
-    if len(entries) != len(raw_entries):
+    if len(entries) != len(raw_entries) or missing_entry_author:
         data["entries"] = [asdict(entry) for entry in entries]
         STATE_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
@@ -309,6 +318,10 @@ def load_config() -> AppConfig:
         export_directory=export_directory,
         auto_export_time=str(data.get("auto_export_time", "")),
         last_auto_export_date=str(data.get("last_auto_export_date", "")),
+        ai_mode=str(data.get("ai_mode", "")).strip().lower(),
+        ai_ollama_url=str(data.get("ai_ollama_url", OLLAMA_DEFAULT_URL)).strip() or OLLAMA_DEFAULT_URL,
+        ai_ollama_model=str(data.get("ai_ollama_model", "")).strip(),
+        ai_ollama_keep_alive=str(data.get("ai_ollama_keep_alive", "30m")).strip() or "30m",
         repos=[_decode_repo(item) for item in data.get("repos", [])],
         entries=entries,
     )
@@ -324,6 +337,10 @@ def save_config(config: AppConfig) -> None:
         "export_directory": config.export_directory,
         "auto_export_time": config.auto_export_time,
         "last_auto_export_date": config.last_auto_export_date,
+        "ai_mode": config.ai_mode,
+        "ai_ollama_url": config.ai_ollama_url,
+        "ai_ollama_model": config.ai_ollama_model,
+        "ai_ollama_keep_alive": config.ai_ollama_keep_alive,
         "repos": [asdict(repo) for repo in config.repos],
         "entries": [asdict(entry) for entry in config.entries],
     }

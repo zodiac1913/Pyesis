@@ -18,6 +18,7 @@ class DiffLedgerItem(TypedDict):
     shown: bool
     diffHash: str
     repoPath: str
+    author: str
 
 
 def _today_key() -> str:
@@ -69,6 +70,7 @@ def _read_items(path: Path) -> list[DiffLedgerItem]:
         shown = bool(raw.get("shown", False))
         diff_hash = str(raw.get("diffHash", ""))
         repo_path = str(raw.get("repoPath", ""))
+        author = str(raw.get("author", "Backup"))
         if not repo or not git_diff_text:
             continue
         items.append(
@@ -80,6 +82,7 @@ def _read_items(path: Path) -> list[DiffLedgerItem]:
                 "shown": shown,
                 "diffHash": diff_hash or hashlib.sha256(git_diff_text.encode("utf-8")).hexdigest(),
                 "repoPath": repo_path,
+                "author": author,
             }
         )
     return items
@@ -96,6 +99,7 @@ def _write_items(path: Path, items: list[DiffLedgerItem]) -> None:
             "shown": item["shown"],
             "diffHash": item["diffHash"],
             "repoPath": item["repoPath"],
+            "author": item["author"],
         }
         for item in items
     ]
@@ -120,6 +124,7 @@ def remember_diff(
     repo_path: str,
     diff_text: str,
     description: str,
+    author: str = "Backup",
     day_key: str | None = None,
 ) -> DiffLedgerItem:
     active_day = day_key or _today_key()
@@ -134,6 +139,8 @@ def remember_diff(
         if item["diffHash"] == diff_hash or item["gitDiffText"] == diff_text:
             if description.strip():
                 item["gitDiffDescription"] = description
+            if author:
+                item["author"] = author
             item["datetime"] = created_at
             item["repoPath"] = repo_path
             _write_items(path, items)
@@ -147,6 +154,7 @@ def remember_diff(
         "shown": False,
         "diffHash": diff_hash,
         "repoPath": repo_path,
+        "author": author,
     }
     items.append(new_item)
     _write_items(path, items)

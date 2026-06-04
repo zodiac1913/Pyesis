@@ -36,21 +36,36 @@ INTENT_PURPOSE_PREFIXES = {
 }
 APP_FILENAME = "app.py"
 APP_PATH_SUFFIXES = (f"/{APP_FILENAME}", APP_FILENAME)
+MARKDOWN_SUFFIXES = ("readme.md", ".md")
 
 
 @dataclass
 class AISummaryResult:
     text: str
     source: str
+    warning: str = ""
 
 
 def build_summary(repo_label: str, diff_text: str) -> AISummaryResult:
     mode = os.getenv("PYESIS_AI_MODE", "heuristic").strip().lower()
+    if mode == "ollama":
+        try:
+            return AISummaryResult(text=_ollama_summary(repo_label, diff_text), source="ollama")
+        except Exception as exc:
+            return AISummaryResult(
+                text=_heuristic_summary(repo_label, diff_text),
+                source="heuristic",
+                warning=f"Ollama summary failed: {exc}",
+            )
     if mode == "openai-compatible":
         try:
             return AISummaryResult(text=_openai_compatible_summary(repo_label, diff_text), source="openai-compatible")
-        except Exception:
-            pass
+        except Exception as exc:
+            return AISummaryResult(
+                text=_heuristic_summary(repo_label, diff_text),
+                source="heuristic",
+                warning=f"OpenAI-compatible summary failed: {exc}",
+            )
     return AISummaryResult(text=_heuristic_summary(repo_label, diff_text), source="heuristic")
 
 
@@ -63,18 +78,19 @@ def _heuristic_summary(repo_label: str, diff_text: str) -> str:
 
 def _robust_bulleted_summary(repo_label: str, changes: list[FileChangeSummary]) -> str:
     lines: list[str] = []
-    top_paths = _path_rollup(changes)
-    top_intents = _top_intents(changes, max_items=3)
-    lines.append(f"I updated {repo_label} by changing {top_paths} in this capture window.")
-    lines.append(f"This work aimed to {_why_clause(top_intents, changes)} through {_how_clause(changes, top_intents)}.")
+    lines.append(f"I worked on {repo_label} with file-focused updates:")
 
     ranked = sorted(
         changes,
         key=lambda c: (_file_priority(c.path), c.added_lines + c.removed_lines),
         reverse=True,
     )
-    for change in ranked[:6]:
+    for change in ranked[:10]:
         lines.append(_change_detail_line(change))
+
+    if len(ranked) > 10:
+        remainder = ", ".join(change.path for change in ranked[10:13])
+        lines.append(f"I also made targeted follow-up edits in {remainder}.")
 
     return "\n".join(lines)
 
@@ -89,10 +105,10 @@ def _why_clause(intents: list[str], changes: list[FileChangeSummary]) -> str:
 
 
 def _how_clause(changes: list[FileChangeSummary], intents: list[str]) -> str:
-    file_count = _count_phrase(len(changes), "file")
+    paths = _path_rollup(changes)
     if intents and intents != [NO_INTENT_SENTINEL]:
-        return f"edits across {file_count}, including {_join_with_and(intents[:2])}"
-    return f"{_action_rollup(changes)} across {file_count}"
+        return f"direct updates in {paths}, including {_join_with_and(intents[:2])}"
+    return f"direct updates in {paths}"
 
 
 def _fallback_goal(changes: list[FileChangeSummary]) -> str:
@@ -103,37 +119,15 @@ def _fallback_goal(changes: list[FileChangeSummary]) -> str:
         return "improve configuration reliability"
     if any(p.endswith(".md") for p in path_l):
         return "improve documentation clarity"
-    return "advance implementation quality in the touched areas"
+    return f"advance implementation quality in {_path_rollup(changes)}"
 
 
-def _action_rollup(changes: list[FileChangeSummary]) -> str:
-    created = sum(1 for c in changes if c.action == "created")
-    deleted = sum(1 for c in changes if c.action == "deleted")
-    renamed = sum(1 for c in changes if c.action == "renamed")
-    modified = sum(1 for c in changes if c.action == "modified")
-
-    action_bits: list[str] = []
-    if created:
-        action_bits.append(f"creating {_count_phrase(created, 'file')}")
-    if modified:
-        action_bits.append(f"refining {_count_phrase(modified, 'file')}")
-    if renamed:
-        action_bits.append(f"renaming {_count_phrase(renamed, 'file')}")
-    if deleted:
-        action_bits.append(f"removing {_count_phrase(deleted, 'file')}")
-
-    if not action_bits:
-        return "implementation updates"
-    return _join_with_and(action_bits)
-
-
-def _path_rollup(changes: list[FileChangeSummary], explicit_limit: int = 6) -> str:
-    paths = [change.path for change in changes]
-    if len(paths) <= explicit_limit:
-        return _join_with_and(paths)
-
-    shown = _join_with_and(paths[:explicit_limit])
-    return f"{shown}, plus {_count_phrase(len(paths) - explicit_limit, 'additional file')}"
+def _path_rollup(changes: list[FileChangeSummary]) -> str:
+    paths: list[str] = []
+    for change in changes:
+        if change.path not in paths:
+            paths.append(change.path)
+    return _join_with_and(paths)
 
 
 def _intent_to_purpose(intent: str) -> str:
@@ -145,24 +139,74 @@ def _intent_to_purpose(intent: str) -> str:
 
 
 def _change_detail_line(change: FileChangeSummary) -> str:
-    path = change.path
-    churn = f"{change.added_lines}+/{change.removed_lines}-"
     intents = _intents_for_change(change)
-    intent_text = _join_with_and([_to_past_tense(intent) for intent in intents[:2]]) if intents else "refined logic"
+    what_clause = _change_what_clause(change, intents)
+    why_clause = _change_why_clause(change, intents)
+    if _normalized_clause(what_clause) == _normalized_clause(why_clause):
+        why_clause = _fallback_reason_for_path(change.path)
+    return f"In {change.path}, I {what_clause} to {why_clause}."
 
+
+def _change_what_clause(change: FileChangeSummary, intents: list[str]) -> str:
     if change.action == "created":
-        base = f"Created {path} ({churn}) and {intent_text}."
-    elif change.action == "deleted":
-        base = f"Removed {path} ({churn}) while cleaning obsolete implementation."
-    elif change.action == "renamed":
-        base = f"Renamed {path} ({churn}) and updated dependent behavior."
-    else:
-        base = f"Updated {path} ({churn}) by {intent_text}."
+        return "created the file and added the initial implementation"
+    if change.action == "deleted":
+        return "removed obsolete code"
+    if change.action == "renamed":
+        return "renamed the file and adjusted references"
 
-    snippet = _best_sample_snippet(change)
-    if not snippet:
-        return base
-    return f"{base} Notable line: {snippet}."
+    high_signal = [intent for intent in intents if intent not in LOW_SIGNAL_INTENTS]
+    if high_signal:
+        return _join_with_and([_to_past_tense(intent) for intent in high_signal[:2]])
+
+    path_l = change.path.lower().replace("\\", "/")
+    if path_l.endswith(MARKDOWN_SUFFIXES):
+        return "updated documentation text"
+    if path_l.endswith((".yml", ".yaml")):
+        return "updated workflow automation"
+    if path_l.endswith("pyproject.toml"):
+        return "updated package metadata"
+    return "updated implementation details"
+
+
+def _change_why_clause(change: FileChangeSummary, intents: list[str]) -> str:
+    high_signal = [intent for intent in intents if intent not in LOW_SIGNAL_INTENTS]
+    if high_signal:
+        purposes = [_intent_to_purpose(intent) for intent in high_signal[:2]]
+        return _join_with_and(purposes)
+
+    return _fallback_reason_for_path(change.path)
+
+
+def _fallback_reason_for_path(path: str) -> str:
+    path_l = path.lower().replace("\\", "/")
+    if path_l.endswith(MARKDOWN_SUFFIXES):
+        return "make project behavior and usage clearer"
+    if path_l.endswith((".yml", ".yaml")):
+        return "keep release and CI behavior reliable"
+    if path_l.endswith("pyproject.toml"):
+        return "keep versioning and packaging aligned with the release"
+    if path_l.endswith("app.py"):
+        return "improve user-facing application behavior"
+    return "keep behavior aligned with the current implementation goals"
+
+
+def _normalized_clause(text: str) -> str:
+    normalized = text.lower().strip()
+    replacements = {
+        "added ": "add ",
+        "updated ": "update ",
+        "adjusted ": "adjust ",
+        "tightened ": "tighten ",
+        "changed ": "change ",
+        "removed ": "remove ",
+        "renamed ": "rename ",
+    }
+    for from_text, to_text in replacements.items():
+        normalized = normalized.replace(from_text, to_text)
+    normalized = re.sub(r"[^a-z0-9 ]+", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
 
 
 def _best_sample_snippet(change: FileChangeSummary) -> str:
@@ -370,7 +414,7 @@ def _special_file_phrase(path: str, path_l: str, change: FileChangeSummary, inte
         return f"improved summary generation in {path}"
     if path_l.endswith("document_formatter.py"):
         return f"improved log formatting in {path}"
-    if path_l.endswith(("readme.md", ".md")):
+    if path_l.endswith(MARKDOWN_SUFFIXES):
         return f"updated documentation in {path}"
     if path_name in {"config.py", "appsettings.json", "settings.json"} or path_stem.startswith("config"):
         setting_phrase = _config_setting_phrase(change)
@@ -419,7 +463,7 @@ def _file_priority(path: str) -> int:
         return 70
     if path_l.endswith("document_formatter.py"):
         return 60
-    if path_l.endswith(("readme.md", ".md")):
+    if path_l.endswith(MARKDOWN_SUFFIXES):
         return 20
     return 40
 
@@ -506,4 +550,47 @@ def _openai_compatible_summary(repo_label: str, diff_text: str) -> str:
         raise RuntimeError(str(exc)) from exc
 
     content = data["choices"][0]["message"]["content"].strip()
+    return content.splitlines()[0].lstrip("- ").strip()
+
+
+def _ollama_summary(repo_label: str, diff_text: str) -> str:
+    url = os.getenv("PYESIS_OLLAMA_URL", "http://localhost:11434/api/chat").strip()
+    model = os.getenv("PYESIS_OLLAMA_MODEL", "llama3.1:8b").strip()
+    keep_alive = os.getenv("PYESIS_OLLAMA_KEEP_ALIVE", "5m").strip()
+    if not url or not model:
+        raise RuntimeError("Missing Ollama configuration")
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"Repository: {repo_label}\n"
+                    "Describe this diff as one first-person sentence suitable for a weekly work log. "
+                    "Be specific about what changed and why.\n\n"
+                    f"{diff_text[:12000]}"
+                ),
+            },
+        ],
+        "stream": False,
+    }
+    if keep_alive:
+        payload["keep_alive"] = keep_alive
+
+    body = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+
+    req = request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with request.urlopen(req, timeout=45) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except error.URLError as exc:
+        raise RuntimeError(str(exc)) from exc
+
+    message = data.get("message", {})
+    content = str(message.get("content", "")).strip()
+    if not content:
+        raise RuntimeError("Empty Ollama response")
     return content.splitlines()[0].lstrip("- ").strip()
