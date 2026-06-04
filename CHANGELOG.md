@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026.6.4.1 - 2026-06-04
+
+### Changed
+- Release automation now publishes zipped native binaries for Windows, macOS, and Linux.
+- Native build script now emits `.zip` artifacts on Linux instead of `.tar.gz`.
+
 ## 2026.6.3.3 - 2026-06-03
 
 ### Changed

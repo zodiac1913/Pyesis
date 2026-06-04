@@ -5,7 +5,6 @@ import platform
 import shutil
 import subprocess
 import sys
-import tarfile
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
@@ -56,12 +55,12 @@ def build_with_pyinstaller(current_platform: str) -> Path:
 def archive_artifact(built_path: Path, tag: str, current_platform: str) -> Path:
     arch = platform.machine().lower().replace("x86_64", "x64").replace("amd64", "x64").replace("aarch64", "arm64")
     if current_platform == "windows":
+        zip_target = DIST_DIR / f"{APP_NAME}-{tag}-{current_platform}-{arch}.zip"
         versioned_exe = DIST_DIR / f"{APP_NAME}-{tag}-{current_platform}-{arch}.exe"
         shutil.copy2(built_path, versioned_exe)
-
-        zip_target = DIST_DIR / f"{APP_NAME}-{tag}-{current_platform}-{arch}.zip"
         with ZipFile(zip_target, "w", compression=ZIP_DEFLATED) as archive:
             archive.write(versioned_exe, versioned_exe.name)
+        versioned_exe.unlink(missing_ok=True)
         return zip_target
 
     if current_platform == "macos":
@@ -71,9 +70,9 @@ def archive_artifact(built_path: Path, tag: str, current_platform: str) -> Path:
                 archive.write(child, child.relative_to(DIST_DIR))
         return target
 
-    target = DIST_DIR / f"{APP_NAME}-{tag}-{current_platform}-{arch}.tar.gz"
-    with tarfile.open(target, "w:gz") as archive:
-        archive.add(built_path, arcname=built_path.name)
+    target = DIST_DIR / f"{APP_NAME}-{tag}-{current_platform}-{arch}.zip"
+    with ZipFile(target, "w", compression=ZIP_DEFLATED) as archive:
+        archive.write(built_path, built_path.name)
     return target
 
 
