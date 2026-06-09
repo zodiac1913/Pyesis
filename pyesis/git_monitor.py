@@ -13,13 +13,16 @@ from pyesis.config import EntryRecord, RepoConfig
 DIFF_START = "diff --git "
 PLUS_PATH_PREFIX = "+++ b/"
 MINUS_PATH_PREFIX = "--- a/"
+RENAME_TO_PREFIX = "rename to "
 DEFAULT_EXCLUDES = [
     "pyesis_state.json",
+    "diff_buffers/**",
     "exports/**",
     ".venv/**",
     "__pycache__/**",
 ]
 DIFF_CONTEXT_LINES = 20
+DIFF_SAMPLE_LIMIT = 12
 
 
 @dataclass
@@ -141,6 +144,47 @@ def summarize_file_changes(diff_text: str) -> list[FileChangeSummary]:
     return summaries
 
 
+def split_diff_by_file(diff_text: str) -> list[tuple[str, str]]:
+    chunks: list[tuple[str, str]] = []
+    current_lines: list[str] = []
+    current_path = ""
+
+    for line in diff_text.splitlines():
+        next_change = _parse_diff_header(line)
+        if next_change is not None:
+            _finalize_diff_chunk(chunks, current_path, current_lines)
+            current_lines = [line]
+            current_path = next_change.path
+            continue
+
+        if not current_lines:
+            continue
+
+        current_lines.append(line)
+        current_path = _updated_chunk_path(current_path, line)
+
+    _finalize_diff_chunk(chunks, current_path, current_lines)
+    return chunks
+
+
+def _updated_chunk_path(current_path: str, line: str) -> str:
+    if line.startswith(RENAME_TO_PREFIX):
+        return line.removeprefix(RENAME_TO_PREFIX).strip()
+    if line.startswith(PLUS_PATH_PREFIX):
+        path = line.removeprefix(PLUS_PATH_PREFIX).strip()
+        if path != "/dev/null":
+            return path
+    if line.startswith(MINUS_PATH_PREFIX) and current_path == "/dev/null":
+        return line.removeprefix(MINUS_PATH_PREFIX).strip()
+    return current_path
+
+
+def _finalize_diff_chunk(chunks: list[tuple[str, str]], path: str, lines: list[str]) -> None:
+    if not lines or not path or _is_excluded_path(path):
+        return
+    chunks.append((path, "\n".join(lines)))
+
+
 def _parse_diff_header(line: str) -> FileChangeSummary | None:
     if not line.startswith(DIFF_START):
         return None
@@ -164,8 +208,8 @@ def _apply_change_metadata(current: FileChangeSummary, line: str) -> bool:
     if line.startswith("deleted file mode "):
         current.action = "deleted"
         return True
-    if line.startswith("rename to "):
-        current.path = line.removeprefix("rename to ").strip()
+    if line.startswith(RENAME_TO_PREFIX):
+        current.path = line.removeprefix(RENAME_TO_PREFIX).strip()
         current.action = "renamed"
         return True
     return False
@@ -181,7 +225,7 @@ def _apply_path_metadata(current: FileChangeSummary, line: str) -> bool:
     return False
 
 
-def _collect_sample(target: list[str], text: str, limit: int = 6) -> None:
+def _collect_sample(target: list[str], text: str, limit: int = DIFF_SAMPLE_LIMIT) -> None:
     if len(target) >= limit:
         return
     snippet = text.strip()

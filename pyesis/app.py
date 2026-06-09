@@ -26,7 +26,7 @@ from pyesis.ai_summary import AISummaryResult, build_summary
 from pyesis.config import AppConfig, EntryRecord, RepoConfig, dedupe_entries, default_export_directory, load_config, save_config
 from pyesis.diff_buffer import find_item, mark_as_shown, purge_old_daily_buffers, remember_diff
 from pyesis.document_formatter import export_docx, render_plain_text
-from pyesis.git_monitor import DiffSnapshot, capture_snapshot, validate_repo
+from pyesis.git_monitor import DiffSnapshot, capture_snapshot, split_diff_by_file, validate_repo
 
 
 DIFF_EXCERPT_LIMIT = 12_000
@@ -606,7 +606,7 @@ class PyesisApp:
             needs_refresh = self._needs_summary_refresh(entry)
             is_backup = entry.author == "Backup"
             if (needs_refresh or is_backup) and entry.diff_excerpt.strip():
-                refreshed = self._build_summary_heuristic(entry.repo_label, entry.diff_excerpt) if needs_refresh else entry.summary
+                refreshed = self._build_summary_heuristic(entry.repo_label, entry.diff_excerpt, entry.repo_path) if needs_refresh else entry.summary
                 next_author = "Backup" if is_backup else "AI"
                 rewritten.append(
                     EntryRecord(
@@ -625,11 +625,11 @@ class PyesisApp:
                 rewritten.append(entry)
         return rewritten
 
-    def _build_summary_heuristic(self, repo_label: str, diff_excerpt: str) -> str:
+    def _build_summary_heuristic(self, repo_label: str, diff_excerpt: str, repo_path: str | None = None) -> str:
         previous_mode = os.environ.get("PYESIS_AI_MODE")
         os.environ["PYESIS_AI_MODE"] = "heuristic"
         try:
-            return build_summary(repo_label, diff_excerpt).text
+            return build_summary(repo_label, diff_excerpt, repo_path).text
         finally:
             if previous_mode is None:
                 os.environ.pop("PYESIS_AI_MODE", None)
@@ -643,10 +643,16 @@ class PyesisApp:
 
     def _needs_summary_refresh(self, entry: EntryRecord) -> bool:
         text = entry.summary.lower()
+        structured_labels = ("who:", "what:", "where:", "when:", "why:", "how:", "description:")
+        if all(label in text for label in structured_labels):
+            return False
+        if text.startswith("i ") and " to " in text and " by " in text:
+            return False
         return (
             text.startswith("who:")
             or text.startswith("what:")
             or text.startswith("where:")
+            or text.startswith("when:")
             or text.startswith("why:")
             or
             text.startswith("i worked on ")
@@ -1017,14 +1023,14 @@ class PyesisApp:
         author = existing.get("author", "Backup") if existing is not None else "Backup"
 
         if summary_text.strip() and author == "Backup":
-            summary = build_summary(repo.label, diff_text)
+            summary = build_summary(repo.label, diff_text, repo.path)
             self._handle_ai_health(summary, repo.label)
             if summary.source != "heuristic":
                 summary_text = summary.text
                 author = "AI"
 
         if not summary_text.strip():
-            summary = build_summary(repo.label, diff_text)
+            summary = build_summary(repo.label, diff_text, repo.path)
             self._handle_ai_health(summary, repo.label)
             summary_text = summary.text
             author = self._entry_author_from_source(summary.source, current_is_backup=True)
@@ -1065,8 +1071,7 @@ class PyesisApp:
             self.ai_status_var.set(f"[OK] Healthy: {summary.source} summaries active")
             self._apply_theme()
 
-    def _build_entry(self, repo: RepoConfig, snapshot, summary_text: str, diff_hash: str, author: str) -> EntryRecord:
-        created_at = snapshot.created_at
+    def _build_entry(self, repo: RepoConfig, created_at: datetime, summary_text: str, diff_text: str, diff_hash: str, author: str) -> EntryRecord:
         week_start = (created_at - timedelta(days=created_at.weekday())).replace(
             hour=0,
             minute=0,
@@ -1081,9 +1086,37 @@ class PyesisApp:
             week_start_iso=week_start.isoformat(),
             summary=summary_text,
             diff_hash=diff_hash,
-            diff_excerpt=snapshot.diff_text[:DIFF_EXCERPT_LIMIT],
+            diff_excerpt=diff_text[:DIFF_EXCERPT_LIMIT],
             author=author,
         )
+
+    def _merge_or_append_captured_entry(self, candidate: EntryRecord) -> None:
+        candidate_fp = self._entry_files_fingerprint(candidate)
+        if not candidate_fp:
+            self.config.entries.append(candidate)
+            return
+
+        for idx, existing in enumerate(self.config.entries):
+            if not self._should_merge_entries(existing, candidate):
+                continue
+            existing_fp = self._entry_files_fingerprint(existing)
+            if not self._fingerprint_overlap(candidate_fp, existing_fp):
+                continue
+
+            self.config.entries[idx] = EntryRecord(
+                repo_label=candidate.repo_label,
+                repo_path=candidate.repo_path,
+                created_at=existing.created_at,
+                day_name=existing.day_name,
+                week_start_iso=existing.week_start_iso,
+                summary=candidate.summary,
+                diff_hash=candidate.diff_hash,
+                diff_excerpt=candidate.diff_excerpt,
+                author=candidate.author,
+            )
+            return
+
+        self.config.entries.append(candidate)
 
     def _entry_day_key(self, created_at_iso: str) -> str:
         return created_at_iso[:10] if len(created_at_iso) >= 10 else ""
@@ -1198,40 +1231,45 @@ class PyesisApp:
         return self._capture_repo_snapshot_change(repo, snapshot)
 
     def _capture_repo_snapshot_change(self, repo: RepoConfig, snapshot: DiffSnapshot) -> bool:
+        captured = False
 
-        summary_text, already_shown, author = self._resolve_summary_from_ledger(repo, snapshot.diff_text)
-        if already_shown:
-            return False
+        for file_path, file_diff_text in split_diff_by_file(snapshot.diff_text):
+            summary_text, already_shown, author = self._resolve_summary_from_ledger(repo, file_diff_text)
+            if already_shown:
+                continue
 
-        ledger_item = remember_diff(repo.label, repo.path, snapshot.diff_text, summary_text, author, self._buffer_day)
-        if ledger_item["shown"]:
-            return False
+            ledger_item = remember_diff(repo.label, repo.path, file_diff_text, summary_text, author, self._buffer_day)
+            if ledger_item["shown"]:
+                continue
 
-        new_entry = self._build_entry(
-            repo,
-            snapshot,
-            summary_text,
-            ledger_item["diffHash"] or snapshot.diff_hash,
-            ledger_item.get("author", author),
-        )
-        if self._is_possible_duplicate_diff(new_entry):
-            self.status_var.set(f"[POSSIBLE DUPLICATE] {repo.label}: duplicate git diff detected for this repo/day")
-            mark_as_shown(repo.label, snapshot.diff_text, self._buffer_day)
-            return False
+            new_entry = self._build_entry(
+                repo,
+                snapshot.created_at,
+                summary_text,
+                file_diff_text,
+                ledger_item["diffHash"],
+                ledger_item.get("author", author),
+            )
+            if self._is_possible_duplicate_diff(new_entry):
+                self.status_var.set(f"[POSSIBLE DUPLICATE] {repo.label}: duplicate git diff detected for {file_path}")
+                mark_as_shown(repo.label, file_diff_text, self._buffer_day)
+                continue
 
-        if self._is_possible_carryover_duplicate(new_entry):
-            self.status_var.set(f"[POSSIBLE DUPLICATE] {repo.label}: carry-over git diff from previous day")
-            mark_as_shown(repo.label, snapshot.diff_text, self._buffer_day)
-            return False
+            if self._is_possible_carryover_duplicate(new_entry):
+                self.status_var.set(f"[POSSIBLE DUPLICATE] {repo.label}: carry-over git diff from previous day for {file_path}")
+                mark_as_shown(repo.label, file_diff_text, self._buffer_day)
+                continue
 
-        if any(self._is_duplicate_entry(entry, new_entry) for entry in self.config.entries):
-            self.status_var.set(f"[POSSIBLE DUPLICATE] {repo.label}: duplicate git diff detected")
-            mark_as_shown(repo.label, snapshot.diff_text, self._buffer_day)
-            return False
+            if any(self._is_duplicate_entry(entry, new_entry) for entry in self.config.entries):
+                self.status_var.set(f"[POSSIBLE DUPLICATE] {repo.label}: duplicate git diff detected for {file_path}")
+                mark_as_shown(repo.label, file_diff_text, self._buffer_day)
+                continue
 
-        self.config.entries.append(new_entry)
-        mark_as_shown(repo.label, snapshot.diff_text, self._buffer_day)
-        return True
+            self._merge_or_append_captured_entry(new_entry)
+            mark_as_shown(repo.label, file_diff_text, self._buffer_day)
+            captured = True
+
+        return captured
 
     def _poll_worker(self, repos: list[RepoConfig]) -> None:
         results: list[SnapshotCaptureResult] = []
