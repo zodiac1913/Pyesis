@@ -8,10 +8,28 @@ from pathlib import Path
 import re
 from typing import Any
 
+from pyesis.github_auth import (
+    GITHUB_DOTCOM_AUTH_MODE,
+    GITHUB_MODELS_CHAT_COMPLETIONS_URL,
+    normalize_github_auth_endpoint,
+    normalize_github_auth_mode,
+)
+
 
 STATE_PATH = Path("pyesis_state.json")
 NEAR_DUP_DIFF_SIMILARITY_THRESHOLD = 0.80
 OLLAMA_DEFAULT_URL = "http://localhost:11434/api/chat"
+SUPPORTED_AI_MODES = {"heuristic", "ollama", "openai-compatible", "github-gpt"}
+LEGACY_GITHUB_COPILOT_MODE = "github-copilot"
+GITHUB_GPT_DEFAULT_MODEL = "openai/gpt-5"
+GITHUB_GPT_MINI_MODEL = "openai/gpt-5-mini"
+GITHUB_GPT_DEFAULT_MODELS = (GITHUB_GPT_DEFAULT_MODEL, GITHUB_GPT_MINI_MODEL)
+LEGACY_GITHUB_GPT_MODEL_ALIASES = {
+    "gpt-5.4": GITHUB_GPT_DEFAULT_MODEL,
+    "gpt-5.4-mini": GITHUB_GPT_MINI_MODEL,
+    "gpt-5": GITHUB_GPT_DEFAULT_MODEL,
+    "gpt-5-mini": GITHUB_GPT_MINI_MODEL,
+}
 
 
 def default_export_directory() -> str:
@@ -37,6 +55,7 @@ class EntryRecord:
     summary: str
     diff_hash: str
     diff_excerpt: str
+    summary_source: str = ""
     author: str = "Backup"
 
 
@@ -49,10 +68,18 @@ class AppConfig:
     export_directory: str = field(default_factory=default_export_directory)
     auto_export_time: str = ""
     last_auto_export_date: str = ""
-    ai_mode: str = ""
+    ai_mode: str = "heuristic"
+    ai_fallback_enabled: bool = True
     ai_ollama_url: str = OLLAMA_DEFAULT_URL
     ai_ollama_model: str = ""
     ai_ollama_keep_alive: str = "30m"
+    ai_openai_url: str = ""
+    ai_openai_model: str = ""
+    ai_github_gpt_url: str = GITHUB_MODELS_CHAT_COMPLETIONS_URL
+    ai_github_gpt_model: str = GITHUB_GPT_DEFAULT_MODEL
+    github_auth_mode: str = GITHUB_DOTCOM_AUTH_MODE
+    github_auth_endpoint: str = ""
+    github_oauth_client_id: str = ""
     repos: list[RepoConfig] = field(default_factory=list)
     entries: list[EntryRecord] = field(default_factory=list)
 
@@ -277,10 +304,37 @@ def _decode_entry(item: dict[str, Any]) -> EntryRecord:
         day_name=item["day_name"],
         week_start_iso=item["week_start_iso"],
         summary=item["summary"],
+        summary_source=str(item.get("summary_source", "")).strip().lower(),
         author=str(item.get("author", "Backup")),
         diff_hash=item["diff_hash"],
         diff_excerpt=item.get("diff_excerpt", ""),
     )
+
+
+def _normalize_ai_mode(value: Any) -> str:
+    ai_mode = str(value or "heuristic").strip().lower() or "heuristic"
+    if ai_mode == LEGACY_GITHUB_COPILOT_MODE:
+        return "github-gpt"
+    if ai_mode not in SUPPORTED_AI_MODES:
+        return "heuristic"
+    return ai_mode
+
+
+def _normalize_github_gpt_model(value: Any) -> str:
+    raw_model = str(value or GITHUB_GPT_DEFAULT_MODEL).strip()
+    if not raw_model:
+        return GITHUB_GPT_DEFAULT_MODEL
+    return LEGACY_GITHUB_GPT_MODEL_ALIASES.get(raw_model.lower(), raw_model)
+
+
+def _should_rewrite_saved_entries(
+    raw_entries: list[EntryRecord],
+    entries: list[EntryRecord],
+    raw_entry_items: list[Any],
+) -> bool:
+    missing_entry_author = any(isinstance(item, dict) and "author" not in item for item in raw_entry_items)
+    missing_entry_source = any(isinstance(item, dict) and "summary_source" not in item for item in raw_entry_items)
+    return len(entries) != len(raw_entries) or missing_entry_author or missing_entry_source
 
 
 def load_config() -> AppConfig:
@@ -303,12 +357,13 @@ def load_config() -> AppConfig:
     if theme_mode not in {"system", "light", "dark"}:
         theme_mode = "system"
     raw_entry_items = data.get("entries", [])
-    missing_entry_author = any(isinstance(item, dict) and "author" not in item for item in raw_entry_items)
     raw_entries = [_decode_entry(item) for item in raw_entry_items]
     entries = dedupe_entries(raw_entries)
-    if len(entries) != len(raw_entries) or missing_entry_author:
+    if _should_rewrite_saved_entries(raw_entries, entries, raw_entry_items):
         data["entries"] = [asdict(entry) for entry in entries]
         STATE_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    ai_mode = _normalize_ai_mode(data.get("ai_mode", "heuristic"))
 
     return AppConfig(
         week_end_day=data.get("week_end_day", "Thursday"),
@@ -318,10 +373,21 @@ def load_config() -> AppConfig:
         export_directory=export_directory,
         auto_export_time=str(data.get("auto_export_time", "")),
         last_auto_export_date=str(data.get("last_auto_export_date", "")),
-        ai_mode=str(data.get("ai_mode", "")).strip().lower(),
+        ai_mode=ai_mode,
+        ai_fallback_enabled=bool(data.get("ai_fallback_enabled", True)),
         ai_ollama_url=str(data.get("ai_ollama_url", OLLAMA_DEFAULT_URL)).strip() or OLLAMA_DEFAULT_URL,
         ai_ollama_model=str(data.get("ai_ollama_model", "")).strip(),
         ai_ollama_keep_alive=str(data.get("ai_ollama_keep_alive", "30m")).strip() or "30m",
+        ai_openai_url=str(data.get("ai_openai_url", "")).strip(),
+        ai_openai_model=str(data.get("ai_openai_model", "")).strip(),
+        ai_github_gpt_url=str(data.get("ai_github_gpt_url", data.get("ai_github_copilot_url", GITHUB_MODELS_CHAT_COMPLETIONS_URL))).strip() or GITHUB_MODELS_CHAT_COMPLETIONS_URL,
+        ai_github_gpt_model=_normalize_github_gpt_model(data.get("ai_github_gpt_model", data.get("ai_github_copilot_model", GITHUB_GPT_DEFAULT_MODEL))),
+        github_auth_mode=normalize_github_auth_mode(data.get("github_auth_mode", GITHUB_DOTCOM_AUTH_MODE)),
+        github_auth_endpoint=normalize_github_auth_endpoint(
+            data.get("github_auth_mode", GITHUB_DOTCOM_AUTH_MODE),
+            data.get("github_auth_endpoint", ""),
+        ),
+        github_oauth_client_id=str(data.get("github_oauth_client_id", "")).strip(),
         repos=[_decode_repo(item) for item in data.get("repos", [])],
         entries=entries,
     )
@@ -338,9 +404,17 @@ def save_config(config: AppConfig) -> None:
         "auto_export_time": config.auto_export_time,
         "last_auto_export_date": config.last_auto_export_date,
         "ai_mode": config.ai_mode,
+        "ai_fallback_enabled": config.ai_fallback_enabled,
         "ai_ollama_url": config.ai_ollama_url,
         "ai_ollama_model": config.ai_ollama_model,
         "ai_ollama_keep_alive": config.ai_ollama_keep_alive,
+        "ai_openai_url": config.ai_openai_url,
+        "ai_openai_model": config.ai_openai_model,
+        "ai_github_gpt_url": config.ai_github_gpt_url,
+        "ai_github_gpt_model": config.ai_github_gpt_model,
+        "github_auth_mode": config.github_auth_mode,
+        "github_auth_endpoint": config.github_auth_endpoint,
+        "github_oauth_client_id": config.github_oauth_client_id,
         "repos": [asdict(repo) for repo in config.repos],
         "entries": [asdict(entry) for entry in config.entries],
     }

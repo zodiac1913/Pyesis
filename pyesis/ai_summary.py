@@ -13,11 +13,31 @@ from pyesis.git_monitor import FileChangeSummary, summarize_file_changes
 SYSTEM_PROMPT = (
     "Rewrite git diff activity as a short first-person work-log bullet. "
     "Use a single sentence, past tense, concrete wording, and no markdown bullet prefix. "
+    "Assume each diff is usually a single file change and name the file directly when the evidence supports it. "
     "Prefer explicit verbs like added, removed, renamed, refactored, and mention what changed. "
     "Avoid vague wording like updated or worked on unless details are unavailable. "
     "Never use filler phrases like 'updated implementation details', 'keep behavior aligned with the current implementation goals', or 'advance implementation quality'. "
+    "Do not describe the task mechanically. Explain the real code change and likely intent in plain engineering language. "
+    "If the diff mostly shows cleanup or reformatting, say that directly instead of inventing behavior changes. "
     "Prefer describing intent over line counts; only include numeric deltas as a fallback."
 )
+HEURISTIC_MODE = "heuristic"
+OLLAMA_MODE = "ollama"
+OPENAI_COMPATIBLE_MODE = "openai-compatible"
+GITHUB_GPT_MODE = "github-gpt"
+LEGACY_GITHUB_COPILOT_MODE = "github-copilot"
+SUPPORTED_AI_MODES = {
+    HEURISTIC_MODE,
+    OLLAMA_MODE,
+    OPENAI_COMPATIBLE_MODE,
+    GITHUB_GPT_MODE,
+}
+AI_PROVIDER_LABELS = {
+    HEURISTIC_MODE: "Heuristic",
+    OLLAMA_MODE: "Ollama",
+    OPENAI_COMPATIBLE_MODE: "OpenAI-compatible",
+    GITHUB_GPT_MODE: "GitHub GPT",
+}
 NO_INTENT_SENTINEL = "made updates"
 IMPORT_INTENT = "adding imports"
 LOW_SIGNAL_INTENTS = {IMPORT_INTENT, "adding follow-up notes"}
@@ -44,17 +64,32 @@ YAML_SUFFIXES = (".yml", ".yaml")
 DIFF_TIME_UNAVAILABLE = "Not available from the diff."
 SUMMARY_EXCLUDED_PATH_PREFIXES = ("diff_buffers/", "exports/", "__pycache__/")
 SUMMARY_EXCLUDED_PATHS = {"pyesis_state.json"}
+AI_DIFF_CHAR_LIMIT = 8000
 AI_CONTEXT_FILE_LIMIT = 3
 AI_CONTEXT_RADIUS = 20
 AI_CONTEXT_CHAR_LIMIT = 6000
 HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+GOOD_WRITING_EXAMPLES = (
+    "In Controllers/Configurer/ConfigurerController.cs, I hardened AppSec recovery by adding a null check around appSecDto, rebuilding appSec only when session data exists, and cleaning up the AppSec and role-handling flow so the code is easier to read.",
+    "In pyesis/app.py, I changed the capture flow to split diffs by file before summarizing them and tightened validation so write-ups are generated from cleaner per-file inputs.",
+)
+BAD_WRITING_EXAMPLES = (
+    "In wwwroot/js/Configurer/conjure.js, I refined logic to clarify configuration behavior by changing code around '//}'.",
+    "In wwwroot/js/Configurer/conjureTable.js, I updated logging to clarify configuration behavior by updated logging and changing code around 'import {'.",
+)
 
 
 @dataclass
 class AISummaryResult:
     text: str
     source: str
+    requested_source: str = ""
     warning: str = ""
+    fallback_source: str = ""
+
+    @property
+    def used_fallback(self) -> bool:
+        return bool(self.fallback_source)
 
 
 @dataclass
@@ -70,29 +105,71 @@ class StructuredSummary:
         return _compose_description(self)
 
 
-def build_summary(repo_label: str, diff_text: str, repo_path: str | None = None) -> AISummaryResult:
-    mode = os.getenv("PYESIS_AI_MODE", "heuristic").strip().lower()
-    if mode == "ollama":
-        try:
-            structured = _ollama_structured_summary(repo_label, diff_text, repo_path)
-            return AISummaryResult(text=structured.to_text(), source="ollama")
-        except Exception as exc:
+def build_summary(
+    repo_label: str,
+    diff_text: str,
+    repo_path: str | None = None,
+    mode: str | None = None,
+    allow_fallback: bool = True,
+) -> AISummaryResult:
+    selected_mode = _normalize_ai_mode(mode or os.getenv("PYESIS_AI_MODE", HEURISTIC_MODE))
+    if selected_mode == OLLAMA_MODE:
+        return _build_provider_summary(selected_mode, repo_label, diff_text, repo_path, _ollama_structured_summary, allow_fallback)
+    if selected_mode == OPENAI_COMPATIBLE_MODE:
+        return _build_provider_summary(selected_mode, repo_label, diff_text, repo_path, _openai_compatible_structured_summary, allow_fallback)
+    if selected_mode == GITHUB_GPT_MODE:
+        return _build_provider_summary(selected_mode, repo_label, diff_text, repo_path, _github_gpt_structured_summary, allow_fallback)
+
+    return AISummaryResult(
+        text=_heuristic_structured_summary(repo_label, diff_text).to_text(),
+        source=HEURISTIC_MODE,
+        requested_source=selected_mode,
+    )
+
+
+def _normalize_ai_mode(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized == LEGACY_GITHUB_COPILOT_MODE:
+        return GITHUB_GPT_MODE
+    if normalized in SUPPORTED_AI_MODES:
+        return normalized
+    return HEURISTIC_MODE
+
+
+def _ai_provider_label(mode: str) -> str:
+    return AI_PROVIDER_LABELS.get(mode, mode or "AI")
+
+
+def _build_provider_summary(
+    provider: str,
+    repo_label: str,
+    diff_text: str,
+    repo_path: str | None,
+    builder: callable,
+    allow_fallback: bool,
+) -> AISummaryResult:
+    try:
+        structured = builder(repo_label, diff_text, repo_path)
+        return AISummaryResult(
+            text=structured.to_text(),
+            source=provider,
+            requested_source=provider,
+        )
+    except Exception as exc:
+        if not allow_fallback:
             return AISummaryResult(
-                text=_heuristic_structured_summary(repo_label, diff_text).to_text(),
-                source="heuristic",
-                warning=f"Ollama summary failed: {exc}",
+                text="",
+                source=provider,
+                requested_source=provider,
+                warning=f"{_ai_provider_label(provider)} summary failed: {exc}",
             )
-    if mode == "openai-compatible":
-        try:
-            structured = _openai_compatible_structured_summary(repo_label, diff_text, repo_path)
-            return AISummaryResult(text=structured.to_text(), source="openai-compatible")
-        except Exception as exc:
-            return AISummaryResult(
-                text=_heuristic_structured_summary(repo_label, diff_text).to_text(),
-                source="heuristic",
-                warning=f"OpenAI-compatible summary failed: {exc}",
-            )
-    return AISummaryResult(text=_heuristic_structured_summary(repo_label, diff_text).to_text(), source="heuristic")
+        return AISummaryResult(
+            text=_heuristic_structured_summary(repo_label, diff_text).to_text(),
+            source=HEURISTIC_MODE,
+            requested_source=provider,
+            warning=f"{_ai_provider_label(provider)} summary failed: {exc}",
+            fallback_source=HEURISTIC_MODE,
+        )
 
 
 def _heuristic_structured_summary(repo_label: str, diff_text: str) -> StructuredSummary:
@@ -437,20 +514,51 @@ def _parse_ai_json_payload(content: str) -> object:
 
 
 def _build_ai_user_prompt(repo_label: str, diff_text: str, repo_path: str | None) -> str:
+    raw_changes = _coalesce_changes(summarize_file_changes(diff_text))
+    changes = _summary_relevant_changes(raw_changes) or raw_changes
+    preferred_paths = ", ".join(change.path for change in changes[:3]) or DIFF_TIME_UNAVAILABLE
+    signal_digest = _build_ai_change_digest(changes)
     prompt = (
         f"Repository: {repo_label}\n"
+        f"Likely changed files: {preferred_paths}\n"
         "Review this diff and answer with JSON only. "
         "Use keys who, what, where, when, why, and how. "
         "Do not omit any key. If the diff does not provide a field, say 'Not available from the diff.' "
         "Keep values concise and concrete, and make 'what' a first-person summary of the code changes. "
-        "If the diff is ambiguous, use the supplied code context to infer intent, but do not invent behavior that is not supported by the diff or code context.\n\n"
+        "Prefer concrete wording like 'added a null check', 'restored legacy script cleanup', or 'rewired the page to expose appSec earlier'. "
+        "Do not mention line counts, generic implementation-quality phrases, or wording like 'changing code around'. "
+        "If the diff is ambiguous, use the supplied code context and change digest to infer intent, but do not invent behavior that is not supported by the diff or code context.\n\n"
+        "Good style examples:\n"
+        f"- {GOOD_WRITING_EXAMPLES[0]}\n"
+        f"- {GOOD_WRITING_EXAMPLES[1]}\n\n"
+        "Bad style examples to avoid:\n"
+        f"- {BAD_WRITING_EXAMPLES[0]}\n"
+        f"- {BAD_WRITING_EXAMPLES[1]}\n\n"
+        "Change digest:\n"
+        f"{signal_digest}\n\n"
         "Diff:\n"
-        f"{diff_text[:12000]}"
+        f"{diff_text[:AI_DIFF_CHAR_LIMIT]}"
     )
     code_context = _build_ai_code_context(repo_path, diff_text)
     if code_context:
         prompt += f"\n\nSupplemental code context:\n{code_context}"
     return prompt
+
+
+def _build_ai_change_digest(changes: list[FileChangeSummary]) -> str:
+    if not changes:
+        return "- No structured change hints were available."
+
+    lines: list[str] = []
+    for change in changes[:3]:
+        intents = [intent for intent in _intents_for_change(change) if intent not in LOW_SIGNAL_INTENTS]
+        intent_text = _join_with_and(intents[:2]) if intents else "no strong intent detected"
+        sample = _best_sample_snippet(change)
+        sample_text = f"; anchor: {sample}" if sample else ""
+        lines.append(
+            f"- {change.path}: action={change.action}, likely_intent={intent_text}, added={change.added_lines}, removed={change.removed_lines}{sample_text}"
+        )
+    return "\n".join(lines)
 
 
 def _build_ai_code_context(repo_path: str | None, diff_text: str) -> str:
@@ -914,6 +1022,7 @@ def _intents_for_change(change: FileChangeSummary) -> list[str]:
 
 def _intent_rules(added: str, removed: str, combined: str) -> list[tuple[str, bool]]:
     return [
+        ("hardening null recovery", (("if (" in added or "if " in added) and "null" in added and "appsec" in combined)),
         ("adding null checks", ("if (" in added or "if " in added) and "null" in added),
         ("adding exception handling", "throw new" in added),
         ("updating logging", any(token in combined for token in ("logger", "log.", "console."))),
@@ -921,29 +1030,38 @@ def _intent_rules(added: str, removed: str, combined: str) -> list[tuple[str, bo
         ("updating mapping logic", "map(" in combined or "mapper" in combined),
         ("tightening validation", "validate" in combined or "validator" in combined),
         ("changing async flow", "await " in combined or "async " in combined),
+        ("cleaning up code layout", any(token in combined for token in ("/// <summary>", "public ", "function ", "class ")) and abs(len(added.splitlines()) - len(removed.splitlines())) <= 6),
+        ("rewiring page state", any(token in added for token in ("window.appsec", "window.cso", "leviathan", "levi="))),
+        ("restoring legacy script cleanup", "removelegacyscripts" in combined),
+        ("tightening role rendering", "rolescomponent" in combined and "currentrole" in combined),
+        ("expanding styling", any(token in combined for token in (".tab-content", ".nav-tabs", "background expansion", "padding:"))),
         ("adding imports", "using " in added or "import " in added),
         ("adding follow-up notes", "todo" in added or "fixme" in added),
     ]
 
 
-def _openai_compatible_structured_summary(repo_label: str, diff_text: str, repo_path: str | None = None) -> StructuredSummary:
-    url = os.getenv("PYESIS_AI_URL", "").strip()
-    model = os.getenv("PYESIS_AI_MODEL", "").strip()
-    api_key = os.getenv("PYESIS_AI_API_KEY", "").strip()
+def _chat_completions_structured_summary(
+    repo_label: str,
+    diff_text: str,
+    repo_path: str | None,
+    *,
+    url: str,
+    model: str,
+    api_key: str,
+    timeout: int,
+    missing_error: str,
+) -> StructuredSummary:
     if not url or not model:
-        raise RuntimeError("Missing AI endpoint configuration")
+        raise RuntimeError(missing_error)
 
     changes = _summary_relevant_changes(_coalesce_changes(summarize_file_changes(diff_text)))
-
     payload = {
         "model": model,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {
                 "role": "user",
-                "content": (
-                    _build_ai_user_prompt(repo_label, diff_text, repo_path)
-                ),
+                "content": _build_ai_user_prompt(repo_label, diff_text, repo_path),
             },
         ],
         "temperature": 0.2,
@@ -955,13 +1073,39 @@ def _openai_compatible_structured_summary(repo_label: str, diff_text: str, repo_
 
     req = request.Request(url, data=body, headers=headers, method="POST")
     try:
-        with request.urlopen(req, timeout=30) as response:
+        with request.urlopen(req, timeout=timeout) as response:
             data = json.loads(response.read().decode("utf-8"))
     except error.URLError as exc:
         raise RuntimeError(str(exc)) from exc
 
     content = data["choices"][0]["message"]["content"].strip()
     return _structured_summary_from_json(_parse_ai_json_payload(content), changes, repo_label)
+
+
+def _openai_compatible_structured_summary(repo_label: str, diff_text: str, repo_path: str | None = None) -> StructuredSummary:
+    return _chat_completions_structured_summary(
+        repo_label,
+        diff_text,
+        repo_path,
+        url=os.getenv("PYESIS_AI_URL", "").strip(),
+        model=os.getenv("PYESIS_AI_MODEL", "").strip(),
+        api_key=os.getenv("PYESIS_AI_API_KEY", "").strip(),
+        timeout=30,
+        missing_error="Missing AI endpoint configuration",
+    )
+
+
+def _github_gpt_structured_summary(repo_label: str, diff_text: str, repo_path: str | None = None) -> StructuredSummary:
+    return _chat_completions_structured_summary(
+        repo_label,
+        diff_text,
+        repo_path,
+        url=os.getenv("PYESIS_GITHUB_GPT_URL", os.getenv("PYESIS_GITHUB_COPILOT_URL", "")).strip(),
+        model=os.getenv("PYESIS_GITHUB_GPT_MODEL", os.getenv("PYESIS_GITHUB_COPILOT_MODEL", "")).strip(),
+        api_key=os.getenv("PYESIS_GITHUB_GPT_API_KEY", os.getenv("PYESIS_GITHUB_COPILOT_API_KEY", "")).strip(),
+        timeout=30,
+        missing_error="Missing GitHub GPT configuration",
+    )
 
 
 def _ollama_structured_summary(repo_label: str, diff_text: str, repo_path: str | None = None) -> StructuredSummary:

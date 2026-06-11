@@ -5,7 +5,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from html import escape
+import json
 import hashlib
+import shutil
 import tomllib
 import os
 from pathlib import Path
@@ -17,15 +19,49 @@ import threading
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, ttk
+from urllib import error as urlerror, parse as urlparse, request as urlrequest
 import webbrowser
 import ctypes
 
 import markdown
 
-from pyesis.ai_summary import AISummaryResult, build_summary
-from pyesis.config import AppConfig, EntryRecord, RepoConfig, dedupe_entries, default_export_directory, load_config, save_config
+from pyesis.ai_summary import (
+    AI_PROVIDER_LABELS,
+    AISummaryResult,
+    GITHUB_GPT_MODE,
+    HEURISTIC_MODE,
+    OLLAMA_MODE,
+    OPENAI_COMPATIBLE_MODE,
+    build_summary,
+)
+from pyesis.config import (
+    AppConfig,
+    EntryRecord,
+    GITHUB_GPT_DEFAULT_MODELS,
+    RepoConfig,
+    dedupe_entries,
+    default_export_directory,
+    load_config,
+    save_config,
+)
 from pyesis.diff_buffer import find_item, mark_as_shown, purge_old_daily_buffers, remember_diff
 from pyesis.document_formatter import export_docx, render_plain_text
+from pyesis.github_auth import (
+    GITHUB_DOTCOM_AUTH_MODE,
+    GITHUB_ENTERPRISE_AUTH_MODE,
+    GitHubDeviceLogin,
+    GitHubAuthStatus,
+    GitHubUserIdentity,
+    clear_github_auth_token,
+    describe_github_auth,
+    fetch_github_user_identity,
+    load_github_auth_token,
+    normalize_github_auth_endpoint,
+    normalize_github_auth_mode,
+    poll_github_device_login_token,
+    start_github_device_login,
+    store_github_auth_token,
+)
 from pyesis.git_monitor import DiffSnapshot, capture_snapshot, split_diff_by_file, validate_repo
 
 
@@ -33,6 +69,30 @@ DIFF_EXCERPT_LIMIT = 12_000
 NEAR_DUP_DIFF_SIMILARITY_THRESHOLD = 0.80
 WINDOWS_APP_ID = "rxjr.pyesis.app"
 PYESIS_GITHUB_URL = "https://github.com/cms-enterprise/Pyesis"
+MOUSEWHEEL_EVENT = "<MouseWheel>"
+
+
+def _ollama_tags_url(base_url: str) -> str:
+    text = base_url.strip()
+    if not text:
+        text = "http://localhost:11434/api/chat"
+
+    parsed = urlparse.urlsplit(text)
+    scheme = parsed.scheme or "http"
+    netloc = parsed.netloc or parsed.path
+    path = parsed.path if parsed.netloc else ""
+    clean_path = path.rstrip("/")
+
+    if not clean_path or clean_path == "/":
+        tags_path = "/api/tags"
+    elif clean_path.startswith("/api/"):
+        segments = [segment for segment in clean_path.split("/") if segment]
+        segments[-1] = "tags"
+        tags_path = "/" + "/".join(segments)
+    else:
+        tags_path = "/api/tags"
+
+    return urlparse.urlunsplit((scheme, netloc, tags_path, "", ""))
 
 
 @dataclass
@@ -40,6 +100,48 @@ class SnapshotCaptureResult:
     repo: RepoConfig
     snapshot: DiffSnapshot | None
     error: str = ""
+
+
+@dataclass(frozen=True)
+class SettingsValues:
+    export_directory: str
+    auto_export_time: str
+    ai_mode: str
+    ai_fallback_enabled: bool
+    ai_ollama_url: str
+    ai_ollama_model: str
+    ai_ollama_keep_alive: str
+    ai_openai_url: str
+    ai_openai_model: str
+    github_auth_mode: str
+    github_auth_endpoint: str
+    github_oauth_client_id: str
+    ai_github_gpt_url: str
+    ai_github_gpt_model: str
+    high_contrast_enabled: bool
+    ui_font_size: int
+
+
+@dataclass(frozen=True)
+class SettingsDialogState:
+    time_var: tk.StringVar
+    export_dir_var: tk.StringVar
+    high_contrast_var: tk.BooleanVar
+    font_size_var: tk.IntVar
+    ai_mode_var: tk.StringVar
+    ai_fallback_var: tk.BooleanVar
+    ollama_url_var: tk.StringVar
+    ollama_model_var: tk.StringVar
+    ollama_keep_alive_var: tk.StringVar
+    openai_url_var: tk.StringVar
+    openai_model_var: tk.StringVar
+    github_auth_mode_var: tk.StringVar
+    github_auth_endpoint_var: tk.StringVar
+    github_oauth_client_id_var: tk.StringVar
+    github_auth_token_var: tk.StringVar
+    github_auth_clear_var: tk.BooleanVar
+    github_gpt_url_var: tk.StringVar
+    github_gpt_model_var: tk.StringVar
 
 
 def _default_font_families() -> tuple[str, str]:
@@ -104,6 +206,7 @@ class PyesisApp:
         self.config = load_config()
         self._apply_ai_environment_defaults()
         self.status_var = tk.StringVar(value="Idle")
+        self._ai_status_severity = self._initial_ai_status_severity()
         self.ai_status_var = tk.StringVar(value=self._initial_ai_status_text())
         self.week_end_var = tk.StringVar(value=self.config.week_end_day)
         self.theme_mode_var = tk.StringVar(value=self.config.theme_mode.capitalize())
@@ -120,7 +223,6 @@ class PyesisApp:
         self._poll_results: list[SnapshotCaptureResult] = []
         self._ai_backend_unavailable = False
         self._ai_last_warning = ""
-        self._ai_status_severity = "ok"
         self._buffer_day = datetime.now().strftime("%Y-%m-%d")
         purge_old_daily_buffers(7, self._buffer_day)
         self.style = ttk.Style(self.root)
@@ -164,14 +266,135 @@ class PyesisApp:
         self.root.geometry(f"{width}x{height}+{pos_x}+{pos_y}")
 
     def _apply_ai_environment_defaults(self) -> None:
-        if self.config.ai_mode:
-            os.environ.setdefault("PYESIS_AI_MODE", self.config.ai_mode)
-        if self.config.ai_ollama_url:
-            os.environ.setdefault("PYESIS_OLLAMA_URL", self.config.ai_ollama_url)
-        if self.config.ai_ollama_model:
-            os.environ.setdefault("PYESIS_OLLAMA_MODEL", self.config.ai_ollama_model)
-        if self.config.ai_ollama_keep_alive:
-            os.environ.setdefault("PYESIS_OLLAMA_KEEP_ALIVE", self.config.ai_ollama_keep_alive)
+        env_pairs = {
+            "PYESIS_AI_MODE": self.config.ai_mode,
+            "PYESIS_OLLAMA_URL": self.config.ai_ollama_url,
+            "PYESIS_OLLAMA_MODEL": self.config.ai_ollama_model,
+            "PYESIS_OLLAMA_KEEP_ALIVE": self.config.ai_ollama_keep_alive,
+            "PYESIS_AI_URL": self.config.ai_openai_url,
+            "PYESIS_AI_MODEL": self.config.ai_openai_model,
+            "PYESIS_GITHUB_GPT_URL": self.config.ai_github_gpt_url,
+            "PYESIS_GITHUB_GPT_MODEL": self.config.ai_github_gpt_model,
+        }
+        for key, value in env_pairs.items():
+            if value:
+                os.environ[key] = value
+            else:
+                os.environ.pop(key, None)
+        legacy_github_env = {
+            "PYESIS_GITHUB_COPILOT_URL": self.config.ai_github_gpt_url,
+            "PYESIS_GITHUB_COPILOT_MODEL": self.config.ai_github_gpt_model,
+        }
+        for key, value in legacy_github_env.items():
+            if value:
+                os.environ[key] = value
+            else:
+                os.environ.pop(key, None)
+        github_auth_mode = normalize_github_auth_mode(self.config.github_auth_mode)
+        github_auth_endpoint = normalize_github_auth_endpoint(github_auth_mode, self.config.github_auth_endpoint)
+        os.environ["PYESIS_GITHUB_AUTH_MODE"] = github_auth_mode
+        if github_auth_endpoint:
+            os.environ["PYESIS_GITHUB_AUTH_ENDPOINT"] = github_auth_endpoint
+        else:
+            os.environ.pop("PYESIS_GITHUB_AUTH_ENDPOINT", None)
+
+        github_token, _ = load_github_auth_token(github_auth_mode, github_auth_endpoint)
+        secure_env_pairs = {
+            "PYESIS_GITHUB_GPT_API_KEY": github_token,
+            "PYESIS_GITHUB_COPILOT_API_KEY": github_token,
+        }
+        for key, value in secure_env_pairs.items():
+            if value:
+                os.environ[key] = value
+            else:
+                os.environ.pop(key, None)
+
+    def _current_ai_mode(self) -> str:
+        mode = self.config.ai_mode.strip().lower()
+        if mode in {HEURISTIC_MODE, OLLAMA_MODE, OPENAI_COMPATIBLE_MODE, GITHUB_GPT_MODE}:
+            return mode
+        return HEURISTIC_MODE
+
+    def _has_github_gpt_config(self) -> bool:
+        return bool(
+            self.config.ai_github_gpt_model.strip()
+            or self._github_auth_status().has_token
+        )
+
+    def _detect_ollama_presence(self) -> bool:
+        return bool(shutil.which("ollama"))
+
+    def _preferred_ai_mode_for_settings(self) -> str:
+        current_mode = self._current_ai_mode()
+        if current_mode != HEURISTIC_MODE:
+            return current_mode
+        ollama_present = self._detect_ollama_presence()
+        if ollama_present:
+            return OLLAMA_MODE
+        if current_mode == HEURISTIC_MODE:
+            return GITHUB_GPT_MODE
+        return current_mode
+
+    def _summary_mode_or_default(self, summary_source: str, author: str) -> str:
+        normalized = summary_source.strip().lower()
+        if normalized:
+            return normalized
+        if author == "Backup":
+            return HEURISTIC_MODE
+        return self._current_ai_mode()
+
+    def _ai_provider_label(self, mode: str) -> str:
+        return AI_PROVIDER_LABELS.get(mode, mode or "AI")
+
+    def _github_auth_status(self) -> GitHubAuthStatus:
+        return describe_github_auth(self.config.github_auth_mode, self.config.github_auth_endpoint)
+
+    def _initial_ai_status_severity(self) -> str:
+        mode = self._current_ai_mode()
+        if mode == GITHUB_GPT_MODE and not self._github_auth_status().has_token:
+            return "degraded"
+        return "ok"
+
+    def _normalize_github_auth_settings_or_show_error(self, mode: str, endpoint: str) -> tuple[str, str] | None:
+        normalized_mode = normalize_github_auth_mode(mode)
+        normalized_endpoint = normalize_github_auth_endpoint(normalized_mode, endpoint)
+        if normalized_mode == GITHUB_ENTERPRISE_AUTH_MODE and not normalized_endpoint:
+            messagebox.showerror("GitHub Enterprise required", "Enter the GitHub Enterprise host, for example github.company.com.")
+            return None
+        return normalized_mode, normalized_endpoint
+
+    def _store_github_auth_token_or_show_error(
+        self,
+        mode: str,
+        endpoint: str,
+        token: str,
+        clear_token: bool,
+    ) -> bool:
+        if clear_token:
+            ok, message = clear_github_auth_token(mode, endpoint)
+        elif token.strip():
+            ok, message = store_github_auth_token(mode, endpoint, token)
+        else:
+            return True
+
+        if ok:
+            return True
+        messagebox.showerror("GitHub token storage failed", message or "Could not update the stored GitHub token.")
+        return False
+
+    def _build_summary_with_current_provider(
+        self,
+        repo_label: str,
+        diff_excerpt: str,
+        repo_path: str | None = None,
+    ) -> AISummaryResult:
+        return build_summary(
+            repo_label,
+            diff_excerpt,
+            repo_path,
+            mode=self._current_ai_mode(),
+            allow_fallback=self.config.ai_fallback_enabled,
+        )
 
     def _asset_roots(self) -> list[Path]:
         roots: list[Path] = []
@@ -375,7 +598,7 @@ class PyesisApp:
         self._editor_bg_canvas.create_image(0, 0, anchor="nw", image=self._editor_bg_image, tags=("watermark",))
         self._editor_bg_canvas.lower("watermark")
         self._editor_bg_canvas.bind("<Button-1>", lambda _e: self.editor.focus_set())
-        self._editor_bg_canvas.bind("<MouseWheel>", self._forward_editor_scroll)
+        self._editor_bg_canvas.bind(MOUSEWHEEL_EVENT, self._forward_editor_scroll)
 
     def _forward_editor_scroll(self, event: tk.Event) -> str:
         if event.delta:
@@ -604,10 +827,13 @@ class PyesisApp:
         rewritten: list[EntryRecord] = []
         for entry in entries:
             needs_refresh = self._needs_summary_refresh(entry)
-            is_backup = entry.author == "Backup"
-            if (needs_refresh or is_backup) and entry.diff_excerpt.strip():
-                refreshed = self._build_summary_heuristic(entry.repo_label, entry.diff_excerpt, entry.repo_path) if needs_refresh else entry.summary
-                next_author = "Backup" if is_backup else "AI"
+            summary_source = self._summary_mode_or_default(entry.summary_source, entry.author)
+            should_retry_ai = summary_source == HEURISTIC_MODE and self._current_ai_mode() != HEURISTIC_MODE
+            if (needs_refresh or should_retry_ai) and entry.diff_excerpt.strip():
+                refreshed = self._build_summary_with_current_provider(entry.repo_label, entry.diff_excerpt, entry.repo_path)
+                next_summary = refreshed.text.strip() or entry.summary
+                next_source = refreshed.source if refreshed.text.strip() else summary_source
+                next_author = self._entry_author_from_source(next_source, current_is_backup=(summary_source == HEURISTIC_MODE))
                 rewritten.append(
                     EntryRecord(
                         repo_label=entry.repo_label,
@@ -615,7 +841,8 @@ class PyesisApp:
                         created_at=entry.created_at,
                         day_name=entry.day_name,
                         week_start_iso=entry.week_start_iso,
-                        summary=refreshed,
+                        summary=next_summary,
+                        summary_source=next_source,
                         diff_hash=entry.diff_hash,
                         diff_excerpt=entry.diff_excerpt,
                         author=next_author,
@@ -626,18 +853,10 @@ class PyesisApp:
         return rewritten
 
     def _build_summary_heuristic(self, repo_label: str, diff_excerpt: str, repo_path: str | None = None) -> str:
-        previous_mode = os.environ.get("PYESIS_AI_MODE")
-        os.environ["PYESIS_AI_MODE"] = "heuristic"
-        try:
-            return build_summary(repo_label, diff_excerpt, repo_path).text
-        finally:
-            if previous_mode is None:
-                os.environ.pop("PYESIS_AI_MODE", None)
-            else:
-                os.environ["PYESIS_AI_MODE"] = previous_mode
+        return build_summary(repo_label, diff_excerpt, repo_path, mode=HEURISTIC_MODE).text
 
     def _entry_author_from_source(self, source: str, current_is_backup: bool = True) -> str:
-        if source and source != "heuristic":
+        if source and source != HEURISTIC_MODE:
             return "AI"
         return "Backup" if current_is_backup else "AI"
 
@@ -675,29 +894,392 @@ class PyesisApp:
         save_config(self.config)
         self._refresh_editor()
 
+    def _normalize_auto_export_time_or_show_error(self, raw_time: str) -> str | None:
+        if not raw_time:
+            return ""
+        try:
+            return self._normalize_time(raw_time)
+        except ValueError:
+            messagebox.showerror("Invalid time", "Use 24-hour HH:MM format, for example 17:30.")
+            return None
+
+    def _browse_export_directory(self, export_dir_var: tk.StringVar) -> None:
+        selected = filedialog.askdirectory(
+            title="Select DOCX export folder",
+            initialdir=export_dir_var.get().strip() or str(Path.cwd()),
+            mustexist=False,
+        )
+        if selected:
+            export_dir_var.set(selected)
+
+    def _collect_settings_values_or_show_error(self, state: SettingsDialogState) -> SettingsValues | None:
+        export_directory = state.export_dir_var.get().strip() or default_export_directory()
+        normalized_time = self._normalize_auto_export_time_or_show_error(state.time_var.get().strip())
+        if normalized_time is None:
+            return None
+
+        normalized_github_auth = self._normalize_github_auth_settings_or_show_error(
+            state.github_auth_mode_var.get(),
+            state.github_auth_endpoint_var.get(),
+        )
+        if normalized_github_auth is None:
+            return None
+        github_auth_mode, github_auth_endpoint = normalized_github_auth
+
+        if not self._store_github_auth_token_or_show_error(
+            github_auth_mode,
+            github_auth_endpoint,
+            state.github_auth_token_var.get(),
+            bool(state.github_auth_clear_var.get()),
+        ):
+            return None
+
+        return SettingsValues(
+            export_directory=export_directory,
+            auto_export_time=normalized_time,
+            ai_mode=state.ai_mode_var.get().strip().lower() or HEURISTIC_MODE,
+            ai_fallback_enabled=bool(state.ai_fallback_var.get()),
+            ai_ollama_url=state.ollama_url_var.get().strip(),
+            ai_ollama_model=state.ollama_model_var.get().strip(),
+            ai_ollama_keep_alive=state.ollama_keep_alive_var.get().strip() or "30m",
+            ai_openai_url=state.openai_url_var.get().strip(),
+            ai_openai_model=state.openai_model_var.get().strip(),
+            github_auth_mode=github_auth_mode,
+            github_auth_endpoint=github_auth_endpoint,
+            github_oauth_client_id=state.github_oauth_client_id_var.get().strip(),
+            ai_github_gpt_url=state.github_gpt_url_var.get().strip(),
+            ai_github_gpt_model=state.github_gpt_model_var.get().strip() or GITHUB_GPT_DEFAULT_MODELS[0],
+            high_contrast_enabled=bool(state.high_contrast_var.get()),
+            ui_font_size=int(state.font_size_var.get()),
+        )
+
+    def _apply_settings_changes(self, settings: SettingsValues) -> None:
+        self.config.auto_export_time = settings.auto_export_time
+        self.config.export_directory = settings.export_directory
+        self.config.ai_mode = settings.ai_mode
+        self.config.ai_fallback_enabled = settings.ai_fallback_enabled
+        self.config.ai_ollama_url = settings.ai_ollama_url
+        self.config.ai_ollama_model = settings.ai_ollama_model
+        self.config.ai_ollama_keep_alive = settings.ai_ollama_keep_alive
+        self.config.ai_openai_url = settings.ai_openai_url
+        self.config.ai_openai_model = settings.ai_openai_model
+        self.config.github_auth_mode = settings.github_auth_mode
+        self.config.github_auth_endpoint = settings.github_auth_endpoint
+        self.config.github_oauth_client_id = settings.github_oauth_client_id
+        self.config.ai_github_gpt_url = settings.ai_github_gpt_url
+        self.config.ai_github_gpt_model = settings.ai_github_gpt_model
+        self._apply_ai_environment_defaults()
+        self._ai_backend_unavailable = False
+        self._ai_last_warning = ""
+        self._ai_status_severity = self._initial_ai_status_severity()
+        self.ai_status_var.set(self._initial_ai_status_text())
+        self.high_contrast_var.set(settings.high_contrast_enabled)
+        self.ui_font_size_var.set(max(10, min(20, settings.ui_font_size)))
+        self._apply_fonts()
+        self._apply_theme()
+        self._persist()
+
+    def _save_settings_dialog(self, dialog: tk.Toplevel, state: SettingsDialogState) -> None:
+        settings = self._collect_settings_values_or_show_error(state)
+        if settings is None:
+            return
+
+        self._apply_settings_changes(settings)
+        auto_export_state = self.config.auto_export_time or "disabled"
+        provider = self._ai_provider_label(self._current_ai_mode())
+        self.status_var.set(
+            f"Auto-export time set to {auto_export_state}; DOCX folder set to {self.config.export_directory}; summary provider set to {provider}"
+        )
+        dialog.destroy()
+
+    def _persist_github_auth_settings(self, mode: str, endpoint: str, client_id: str) -> None:
+        self.config.github_auth_mode = mode
+        self.config.github_auth_endpoint = endpoint
+        self.config.github_oauth_client_id = client_id.strip()
+        self._apply_ai_environment_defaults()
+        save_config(self.config)
+
+    def _run_github_device_login(
+        self,
+        mode: str,
+        endpoint: str,
+        client_id: str,
+        status_var: tk.StringVar,
+    ) -> None:
+        try:
+            device_login = start_github_device_login(mode, endpoint, client_id)
+        except Exception as exc:
+            self.root.after(0, lambda: status_var.set(f"GitHub sign-in failed: {exc}"))
+            return
+
+        def show_pending(login: GitHubDeviceLogin) -> None:
+            status_var.set(f"Open the browser and enter code {login.user_code} at {login.verification_uri}.")
+
+        self.root.after(0, lambda: show_pending(device_login))
+        webbrowser.open(device_login.verification_uri)
+
+        try:
+            token = poll_github_device_login_token(
+                mode,
+                endpoint,
+                client_id,
+                device_login.device_code,
+                device_login.expires_in,
+                device_login.interval,
+            )
+            identity = fetch_github_user_identity(mode, endpoint, token)
+            ok, message = store_github_auth_token(mode, endpoint, token)
+            if not ok:
+                raise RuntimeError(message or "Could not save the GitHub token.")
+        except Exception as exc:
+            self.root.after(0, lambda: status_var.set(f"GitHub sign-in failed: {exc}"))
+            return
+
+        def on_success(user: GitHubUserIdentity) -> None:
+            self._persist_github_auth_settings(mode, endpoint, client_id)
+            user_label = user.name or user.login or "GitHub user"
+            status_var.set(f"Signed in as {user_label}. Token saved to macOS Keychain.")
+            self._ai_status_severity = self._initial_ai_status_severity()
+            self.ai_status_var.set(self._initial_ai_status_text())
+
+        self.root.after(0, lambda: on_success(identity))
+
+    def _start_github_device_login(
+        self,
+        mode_var: tk.StringVar,
+        endpoint_var: tk.StringVar,
+        client_id_var: tk.StringVar,
+        status_var: tk.StringVar,
+    ) -> None:
+        normalized = self._normalize_github_auth_settings_or_show_error(mode_var.get(), endpoint_var.get())
+        if normalized is None:
+            status_var.set("Enter a GitHub Enterprise host before starting sign-in.")
+            return
+        mode, endpoint = normalized
+        client_id = client_id_var.get().strip()
+        if not client_id:
+            status_var.set("Enter a GitHub OAuth client ID before starting sign-in.")
+            messagebox.showerror(
+                "GitHub OAuth client ID required",
+                "Enter the OAuth app client ID for Pyesis before starting GitHub sign-in.",
+            )
+            return
+
+        status_var.set("Requesting GitHub device code...")
+        worker = threading.Thread(
+            target=self._run_github_device_login,
+            args=(mode, endpoint, client_id, status_var),
+            daemon=True,
+        )
+        worker.start()
+
+    def _fetch_ollama_model_names(self, base_url: str) -> list[str]:
+        req = urlrequest.Request(
+            _ollama_tags_url(base_url),
+            headers={"Accept": "application/json"},
+            method="GET",
+        )
+        try:
+            with urlrequest.urlopen(req, timeout=5) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except (urlerror.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Could not load Ollama models: {exc}") from exc
+
+        raw_models = payload.get("models")
+        if not isinstance(raw_models, list):
+            raise RuntimeError("Could not load Ollama models: unexpected response payload")
+
+        names: list[str] = []
+        for item in raw_models:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("model") or item.get("name") or "").strip()
+            if name and name not in names:
+                names.append(name)
+        return names
+
+    def _ollama_model_refresh_message(self, model_names: tuple[str, ...], current_model: str) -> str:
+        if model_names and current_model and current_model not in model_names:
+            return f"Loaded {len(model_names)} installed Ollama models. Current selection is not installed."
+        if model_names:
+            return f"Loaded {len(model_names)} installed Ollama models."
+        if current_model:
+            return "No installed Ollama models were reported. Keeping the saved model selection."
+        return "No installed Ollama models were reported."
+
+    def _apply_ollama_model_choices(
+        self,
+        names: list[str],
+        model_var: tk.StringVar,
+        combobox: ttk.Combobox,
+        status_var: tk.StringVar,
+        refresh_button: ttk.Button,
+        current_model: str,
+    ) -> None:
+        if not combobox.winfo_exists():
+            return
+
+        refresh_button.configure(state="normal")
+        model_names = tuple(names)
+        combobox.configure(values=model_names)
+        if model_names and not model_var.get().strip():
+            model_var.set(model_names[0])
+        status_var.set(self._ollama_model_refresh_message(model_names, current_model))
+
+    def _show_ollama_model_refresh_error(
+        self,
+        combobox: ttk.Combobox,
+        status_var: tk.StringVar,
+        refresh_button: ttk.Button,
+        message: str,
+    ) -> None:
+        if not combobox.winfo_exists():
+            return
+
+        refresh_button.configure(state="normal")
+        status_var.set(message)
+
+    def _refresh_ollama_model_choices(
+        self,
+        url_var: tk.StringVar,
+        model_var: tk.StringVar,
+        combobox: ttk.Combobox,
+        status_var: tk.StringVar,
+        refresh_button: ttk.Button,
+    ) -> None:
+        base_url = url_var.get().strip()
+        current_model = model_var.get().strip()
+        status_var.set("Loading installed Ollama models...")
+        refresh_button.configure(state="disabled")
+
+        def worker() -> None:
+            try:
+                names = self._fetch_ollama_model_names(base_url)
+            except Exception as exc:
+                self.root.after(
+                    0,
+                    lambda: self._show_ollama_model_refresh_error(
+                        combobox,
+                        status_var,
+                        refresh_button,
+                        str(exc),
+                    ),
+                )
+                return
+            self.root.after(
+                0,
+                lambda: self._apply_ollama_model_choices(
+                    names,
+                    model_var,
+                    combobox,
+                    status_var,
+                    refresh_button,
+                    current_model,
+                ),
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _open_settings(self) -> None:
+        ollama_present = self._detect_ollama_presence()
+        preferred_ai_mode = self._preferred_ai_mode_for_settings()
+
         dialog = tk.Toplevel(self.root)
         dialog.title("Settings")
         dialog.transient(self.root)
         dialog.grab_set()
-        dialog.resizable(False, False)
+        dialog.resizable(True, True)
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(0, weight=1)
 
-        frame = ttk.Frame(dialog, padding=12)
-        frame.grid(row=0, column=0, sticky="nsew")
+        screen_w = dialog.winfo_screenwidth()
+        screen_h = dialog.winfo_screenheight()
+        width = min(max(700, int(screen_w * 0.5)), screen_w - 120)
+        height = min(max(760, int(screen_h * 0.78)), screen_h - 120)
+        dialog.geometry(f"{width}x{height}")
+        dialog.minsize(640, 620)
+
+        shell = ttk.Frame(dialog, padding=12)
+        shell.grid(row=0, column=0, sticky="nsew")
+        shell.columnconfigure(0, weight=1)
+        shell.rowconfigure(0, weight=1)
+
+        canvas = tk.Canvas(shell, highlightthickness=0, borderwidth=0)
+        scrollbar = ttk.Scrollbar(shell, orient="vertical", command=canvas.yview)
+        frame = ttk.Frame(canvas, padding=2)
+        frame.columnconfigure(0, weight=1)
+
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns", padx=(8, 0))
+
+        frame_window = canvas.create_window((0, 0), window=frame, anchor="nw")
+
+        def sync_scroll_region(_event: tk.Event | None = None) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def sync_frame_width(event: tk.Event) -> None:
+            canvas.itemconfigure(frame_window, width=event.width)
+
+        def on_mousewheel(event: tk.Event) -> str:
+            if event.delta:
+                canvas.yview_scroll(-1 * int(event.delta / 120), "units")
+            return "break"
+
+        def bind_mousewheel(_event: tk.Event) -> None:
+            canvas.bind_all(MOUSEWHEEL_EVENT, on_mousewheel)
+
+        def unbind_mousewheel(_event: tk.Event) -> None:
+            canvas.unbind_all(MOUSEWHEEL_EVENT)
+
+        frame.bind("<Configure>", sync_scroll_region)
+        canvas.bind("<Configure>", sync_frame_width)
+        canvas.bind("<Enter>", bind_mousewheel)
+        canvas.bind("<Leave>", unbind_mousewheel)
 
         time_var = tk.StringVar(value=self.config.auto_export_time)
         export_dir_var = tk.StringVar(value=self.config.export_directory or default_export_directory())
         high_contrast_var = tk.BooleanVar(value=self.config.high_contrast)
         font_size_var = tk.IntVar(value=self.config.ui_font_size)
+        ai_mode_var = tk.StringVar(value=preferred_ai_mode)
+        ai_fallback_var = tk.BooleanVar(value=self.config.ai_fallback_enabled)
+        ollama_url_var = tk.StringVar(value=self.config.ai_ollama_url)
+        ollama_model_var = tk.StringVar(value=self.config.ai_ollama_model)
+        ollama_model_status_var = tk.StringVar(value="Refresh to load installed Ollama models.")
+        ollama_keep_alive_var = tk.StringVar(value=self.config.ai_ollama_keep_alive)
+        openai_url_var = tk.StringVar(value=self.config.ai_openai_url)
+        openai_model_var = tk.StringVar(value=self.config.ai_openai_model)
+        github_auth_status = self._github_auth_status()
+        github_auth_status_var = tk.StringVar(value=github_auth_status.detail)
+        github_auth_mode_var = tk.StringVar(value=normalize_github_auth_mode(self.config.github_auth_mode))
+        github_auth_endpoint_var = tk.StringVar(value=self.config.github_auth_endpoint)
+        github_oauth_client_id_var = tk.StringVar(value=self.config.github_oauth_client_id)
+        github_login_help_var = tk.StringVar()
+        github_auth_token_var = tk.StringVar(value="")
+        github_auth_clear_var = tk.BooleanVar(value=False)
+        github_gpt_url_var = tk.StringVar(value=self.config.ai_github_gpt_url)
+        github_gpt_model_var = tk.StringVar(value=self.config.ai_github_gpt_model or GITHUB_GPT_DEFAULT_MODELS[0])
 
-        def browse_export_directory() -> None:
-            selected = filedialog.askdirectory(
-                title="Select DOCX export folder",
-                initialdir=export_dir_var.get().strip() or str(Path.cwd()),
-                mustexist=False,
-            )
-            if selected:
-                export_dir_var.set(selected)
+        state = SettingsDialogState(
+            time_var=time_var,
+            export_dir_var=export_dir_var,
+            high_contrast_var=high_contrast_var,
+            font_size_var=font_size_var,
+            ai_mode_var=ai_mode_var,
+            ai_fallback_var=ai_fallback_var,
+            ollama_url_var=ollama_url_var,
+            ollama_model_var=ollama_model_var,
+            ollama_keep_alive_var=ollama_keep_alive_var,
+            openai_url_var=openai_url_var,
+            openai_model_var=openai_model_var,
+            github_auth_mode_var=github_auth_mode_var,
+            github_auth_endpoint_var=github_auth_endpoint_var,
+            github_oauth_client_id_var=github_oauth_client_id_var,
+            github_auth_token_var=github_auth_token_var,
+            github_auth_clear_var=github_auth_clear_var,
+            github_gpt_url_var=github_gpt_url_var,
+            github_gpt_model_var=github_gpt_model_var,
+        )
 
         ttk.Label(frame, text="Daily DOCX export time (24h HH:MM)").grid(row=0, column=0, sticky="w")
         ttk.Entry(frame, textvariable=time_var, width=12).grid(row=1, column=0, sticky="w", pady=(6, 0))
@@ -708,7 +1290,7 @@ class PyesisApp:
         export_row.grid(row=4, column=0, sticky="ew", pady=(6, 12))
         export_row.columnconfigure(0, weight=1)
         ttk.Entry(export_row, textvariable=export_dir_var, width=42).grid(row=0, column=0, sticky="ew")
-        ttk.Button(export_row, text="Browse", command=browse_export_directory).grid(row=0, column=1, padx=(6, 0))
+        ttk.Button(export_row, text="Browse", command=lambda: self._browse_export_directory(export_dir_var)).grid(row=0, column=1, padx=(6, 0))
 
         ttk.Label(frame, text="Accessibility").grid(row=5, column=0, sticky="w")
         ttk.Checkbutton(frame, text="High contrast mode", variable=high_contrast_var).grid(row=6, column=0, sticky="w", pady=(6, 0))
@@ -716,32 +1298,129 @@ class PyesisApp:
         ttk.Spinbox(frame, from_=10, to=20, textvariable=font_size_var, width=6).grid(row=8, column=0, sticky="w")
         ttk.Label(frame, text="Tip: Keyboard shortcuts include Alt+B/A/R/C/E/S/I/G").grid(row=9, column=0, sticky="w", pady=(6, 12))
 
-        controls = ttk.Frame(frame)
-        controls.grid(row=10, column=0, sticky="e")
+        ttk.Label(frame, text="AI provider").grid(row=10, column=0, sticky="w")
+        ttk.Combobox(
+            frame,
+            textvariable=ai_mode_var,
+            values=[OLLAMA_MODE, GITHUB_GPT_MODE, OPENAI_COMPATIBLE_MODE, HEURISTIC_MODE],
+            state="readonly",
+        ).grid(row=11, column=0, sticky="ew", pady=(6, 6))
+        ttk.Checkbutton(frame, text="Use heuristic fallback when AI fails", variable=ai_fallback_var).grid(row=12, column=0, sticky="w")
+        ollama_status = "detected on this machine" if ollama_present else "not detected; defaulting to GitHub GPT"
+        ttk.Label(frame, text=f"Ollama status: {ollama_status}").grid(row=13, column=0, sticky="w", pady=(6, 2))
+        ttk.Label(frame, text="GitHub tokens can come from the environment or be stored securely in macOS Keychain below.").grid(row=14, column=0, sticky="w", pady=(0, 12))
 
-        def save_and_close() -> None:
-            raw_time = time_var.get().strip()
-            export_directory = export_dir_var.get().strip() or default_export_directory()
-            if raw_time:
-                try:
-                    self.config.auto_export_time = self._normalize_time(raw_time)
-                except ValueError:
-                    messagebox.showerror("Invalid time", "Use 24-hour HH:MM format, for example 17:30.")
-                    return
-            else:
-                self.config.auto_export_time = ""
-            self.config.export_directory = export_directory
-            self.high_contrast_var.set(high_contrast_var.get())
-            self.ui_font_size_var.set(max(10, min(20, int(font_size_var.get()))))
-            self._apply_fonts()
-            self._apply_theme()
-            self._persist()
-            state = self.config.auto_export_time or "disabled"
-            self.status_var.set(f"Auto-export time set to {state}; DOCX folder set to {self.config.export_directory}")
-            dialog.destroy()
+        ttk.Label(frame, text="Ollama URL").grid(row=15, column=0, sticky="w")
+        ttk.Entry(frame, textvariable=ollama_url_var, width=42).grid(row=16, column=0, sticky="ew", pady=(4, 6))
+        ttk.Label(frame, text="Ollama model").grid(row=17, column=0, sticky="w")
+        ollama_model_row = ttk.Frame(frame)
+        ollama_model_row.grid(row=18, column=0, sticky="ew", pady=(4, 4))
+        ollama_model_row.columnconfigure(0, weight=1)
+        ollama_model_box = ttk.Combobox(
+            ollama_model_row,
+            textvariable=ollama_model_var,
+            values=(ollama_model_var.get().strip(),) if ollama_model_var.get().strip() else (),
+            state="readonly",
+        )
+        ollama_model_box.grid(row=0, column=0, sticky="ew")
+        ollama_refresh_button = ttk.Button(
+            ollama_model_row,
+            text="Refresh",
+            command=lambda: self._refresh_ollama_model_choices(
+                ollama_url_var,
+                ollama_model_var,
+                ollama_model_box,
+                ollama_model_status_var,
+                ollama_refresh_button,
+            ),
+        )
+        ollama_refresh_button.grid(row=0, column=1, padx=(6, 0))
+        ttk.Label(frame, textvariable=ollama_model_status_var, wraplength=560, justify="left").grid(row=19, column=0, sticky="w", pady=(0, 6))
+        ttk.Label(frame, text="Ollama keep alive").grid(row=20, column=0, sticky="w")
+        ttk.Entry(frame, textvariable=ollama_keep_alive_var, width=18).grid(row=21, column=0, sticky="w", pady=(4, 12))
+
+        ttk.Label(frame, text="OpenAI-compatible URL").grid(row=22, column=0, sticky="w")
+        ttk.Entry(frame, textvariable=openai_url_var, width=42).grid(row=23, column=0, sticky="ew", pady=(4, 6))
+        ttk.Label(frame, text="OpenAI-compatible model").grid(row=24, column=0, sticky="w")
+        ttk.Entry(frame, textvariable=openai_model_var, width=42).grid(row=25, column=0, sticky="ew", pady=(4, 12))
+
+        ttk.Label(frame, text="GitHub account type").grid(row=26, column=0, sticky="w")
+        ttk.Combobox(
+            frame,
+            textvariable=github_auth_mode_var,
+            values=[GITHUB_DOTCOM_AUTH_MODE, GITHUB_ENTERPRISE_AUTH_MODE],
+            state="readonly",
+        ).grid(row=27, column=0, sticky="ew", pady=(4, 6))
+        ttk.Label(frame, text="GitHub Enterprise host (used only for Enterprise sign-in)").grid(row=28, column=0, sticky="w")
+        ttk.Entry(frame, textvariable=github_auth_endpoint_var, width=42).grid(row=29, column=0, sticky="ew", pady=(4, 6))
+        ttk.Label(frame, textvariable=github_auth_status_var, wraplength=560, justify="left").grid(row=30, column=0, sticky="w")
+        ttk.Label(frame, text="GitHub OAuth client ID").grid(row=31, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(frame, textvariable=github_oauth_client_id_var, width=42).grid(row=32, column=0, sticky="ew", pady=(4, 6))
+        ttk.Label(
+            frame,
+            textvariable=github_login_help_var,
+            wraplength=560,
+            justify="left",
+        ).grid(row=33, column=0, sticky="w")
+        auth_actions = ttk.Frame(frame)
+        auth_actions.grid(row=34, column=0, sticky="w", pady=(8, 8))
+        sign_in_button = ttk.Button(
+            auth_actions,
+            text="Sign in with GitHub",
+            command=lambda: self._start_github_device_login(
+                github_auth_mode_var,
+                github_auth_endpoint_var,
+                github_oauth_client_id_var,
+                github_auth_status_var,
+            ),
+        )
+        sign_in_button.grid(row=0, column=0, padx=(0, 8))
+        ttk.Label(auth_actions, text="Uses OAuth device flow and opens the browser for verification.").grid(row=0, column=1, sticky="w")
+
+        def refresh_github_login_controls(*_args: object) -> None:
+            has_client_id = bool(github_oauth_client_id_var.get().strip())
+            if has_client_id:
+                github_login_help_var.set(
+                    "Pyesis can open GitHub sign-in in the browser because a registered OAuth app client ID is configured."
+                )
+                sign_in_button.configure(state="normal")
+                return
+
+            github_login_help_var.set(
+                "GitHub Desktop works because it ships with its own registered OAuth app. Pyesis needs a configured client ID before browser sign-in can work."
+            )
+            sign_in_button.configure(state="disabled")
+
+        github_oauth_client_id_var.trace_add("write", refresh_github_login_controls)
+        refresh_github_login_controls()
+
+        ttk.Label(frame, text="Or store or replace a token manually").grid(row=35, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(frame, textvariable=github_auth_token_var, width=42, show="*").grid(row=36, column=0, sticky="ew", pady=(4, 6))
+        ttk.Checkbutton(frame, text="Clear stored GitHub token on save", variable=github_auth_clear_var).grid(row=37, column=0, sticky="w", pady=(0, 12))
+
+        ttk.Label(frame, text="GitHub GPT URL").grid(row=38, column=0, sticky="w")
+        ttk.Entry(frame, textvariable=github_gpt_url_var, width=42).grid(row=39, column=0, sticky="ew", pady=(4, 6))
+        ttk.Label(frame, text="GitHub GPT model").grid(row=40, column=0, sticky="w")
+        ttk.Combobox(
+            frame,
+            textvariable=github_gpt_model_var,
+            values=list(GITHUB_GPT_DEFAULT_MODELS),
+            state="readonly",
+        ).grid(row=41, column=0, sticky="ew", pady=(4, 12))
+
+        self._refresh_ollama_model_choices(
+            ollama_url_var,
+            ollama_model_var,
+            ollama_model_box,
+            ollama_model_status_var,
+            ollama_refresh_button,
+        )
+
+        controls = ttk.Frame(shell)
+        controls.grid(row=1, column=0, columnspan=2, sticky="e", pady=(12, 0))
 
         ttk.Button(controls, text="Cancel", command=dialog.destroy).grid(row=0, column=0, padx=(0, 6))
-        ttk.Button(controls, text="Save", command=save_and_close).grid(row=0, column=1)
+        ttk.Button(controls, text="Save", command=lambda: self._save_settings_dialog(dialog, state)).grid(row=0, column=1)
 
     def _open_readme_view(self) -> None:
         readme_path = Path("README.md")
@@ -1014,41 +1693,50 @@ class PyesisApp:
             self.status_var.set(f"{repo.label}: {exc}")
             return None
 
-    def _resolve_summary_from_ledger(self, repo: RepoConfig, diff_text: str) -> tuple[str, bool, str]:
+    def _resolve_summary_from_ledger(self, repo: RepoConfig, diff_text: str) -> tuple[str, bool, str, str]:
         existing = find_item(repo.label, diff_text, self._buffer_day)
         if existing is not None and existing["shown"]:
-            return "", True, "Backup"
+            return "", True, "Backup", HEURISTIC_MODE
 
         summary_text = existing["gitDiffDescription"] if existing is not None else ""
         author = existing.get("author", "Backup") if existing is not None else "Backup"
+        summary_source = self._summary_mode_or_default(existing.get("summarySource", "") if existing is not None else "", author)
 
-        if summary_text.strip() and author == "Backup":
-            summary = build_summary(repo.label, diff_text, repo.path)
+        if summary_text.strip() and summary_source == HEURISTIC_MODE and self._current_ai_mode() != HEURISTIC_MODE:
+            summary = self._build_summary_with_current_provider(repo.label, diff_text, repo.path)
             self._handle_ai_health(summary, repo.label)
-            if summary.source != "heuristic":
+            if summary.text.strip() and summary.source != HEURISTIC_MODE:
                 summary_text = summary.text
                 author = "AI"
+                summary_source = summary.source
 
         if not summary_text.strip():
-            summary = build_summary(repo.label, diff_text, repo.path)
+            summary = self._build_summary_with_current_provider(repo.label, diff_text, repo.path)
             self._handle_ai_health(summary, repo.label)
-            summary_text = summary.text
+            summary_text = summary.text or self._build_summary_heuristic(repo.label, diff_text, repo.path)
             author = self._entry_author_from_source(summary.source, current_is_backup=True)
+            summary_source = summary.source if summary.text.strip() else HEURISTIC_MODE
 
-        return summary_text, False, author
+        return summary_text, False, author, summary_source
 
     def _initial_ai_status_text(self) -> str:
-        mode = os.getenv("PYESIS_AI_MODE", "heuristic").strip().lower()
-        if mode == "ollama":
-            return "[PENDING] Ollama waiting for first response"
-        if mode == "openai-compatible":
-            return "[PENDING] OpenAI-compatible waiting for first response"
-        return "[OK] Heuristic summaries active"
+        mode = self._current_ai_mode()
+        if mode == HEURISTIC_MODE:
+            return "[OK] Heuristic summaries active"
+        provider = self._ai_provider_label(mode)
+        fallback_note = " with heuristic fallback" if self.config.ai_fallback_enabled else " without fallback"
+        if mode == GITHUB_GPT_MODE:
+            github_auth_status = self._github_auth_status()
+            if not github_auth_status.has_token:
+                return f"[SETUP] {provider} selected; {github_auth_status.detail}"
+        return f"[PENDING] {provider} waiting for first response{fallback_note}"
 
     def _handle_ai_health(self, summary: AISummaryResult, repo_label: str) -> None:
         warning = summary.warning.strip()
         if warning:
-            self.status_var.set(f"AI unavailable for {repo_label}; using heuristic summary")
+            provider = self._ai_provider_label(summary.requested_source or summary.source)
+            fallback_note = "using heuristic fallback" if summary.used_fallback else "no fallback available"
+            self.status_var.set(f"{provider} unavailable for {repo_label}; {fallback_note}")
             self._ai_status_severity = "degraded"
             self.ai_status_var.set(f"//// AI DEGRADED //// {warning}")
             self._apply_theme()
@@ -1057,21 +1745,31 @@ class PyesisApp:
                 self._ai_last_warning = warning
             return
 
-        if self._ai_backend_unavailable and summary.source != "heuristic":
+        if self._ai_backend_unavailable and summary.source != HEURISTIC_MODE:
             self._ai_backend_unavailable = False
             self._ai_last_warning = ""
             self._ai_status_severity = "ok"
-            self.ai_status_var.set(f"[OK] Healthy: {summary.source} summaries active")
+            provider = self._ai_provider_label(summary.source)
+            self.ai_status_var.set(f"[OK] Healthy: {provider} summaries active")
             self._apply_theme()
-            self.status_var.set(f"AI recovered for {repo_label}; resumed {summary.source} summaries")
+            self.status_var.set(f"AI recovered for {repo_label}; resumed {provider} summaries")
             return
 
-        if summary.source != "heuristic":
+        if summary.source != HEURISTIC_MODE:
             self._ai_status_severity = "ok"
-            self.ai_status_var.set(f"[OK] Healthy: {summary.source} summaries active")
+            self.ai_status_var.set(f"[OK] Healthy: {self._ai_provider_label(summary.source)} summaries active")
             self._apply_theme()
 
-    def _build_entry(self, repo: RepoConfig, created_at: datetime, summary_text: str, diff_text: str, diff_hash: str, author: str) -> EntryRecord:
+    def _build_entry(
+        self,
+        repo: RepoConfig,
+        created_at: datetime,
+        summary_text: str,
+        diff_text: str,
+        diff_hash: str,
+        author: str,
+        summary_source: str,
+    ) -> EntryRecord:
         week_start = (created_at - timedelta(days=created_at.weekday())).replace(
             hour=0,
             minute=0,
@@ -1085,6 +1783,7 @@ class PyesisApp:
             day_name=created_at.strftime("%A"),
             week_start_iso=week_start.isoformat(),
             summary=summary_text,
+            summary_source=summary_source,
             diff_hash=diff_hash,
             diff_excerpt=diff_text[:DIFF_EXCERPT_LIMIT],
             author=author,
@@ -1110,6 +1809,7 @@ class PyesisApp:
                 day_name=existing.day_name,
                 week_start_iso=existing.week_start_iso,
                 summary=candidate.summary,
+                summary_source=candidate.summary_source,
                 diff_hash=candidate.diff_hash,
                 diff_excerpt=candidate.diff_excerpt,
                 author=candidate.author,
@@ -1234,11 +1934,11 @@ class PyesisApp:
         captured = False
 
         for file_path, file_diff_text in split_diff_by_file(snapshot.diff_text):
-            summary_text, already_shown, author = self._resolve_summary_from_ledger(repo, file_diff_text)
+            summary_text, already_shown, author, summary_source = self._resolve_summary_from_ledger(repo, file_diff_text)
             if already_shown:
                 continue
 
-            ledger_item = remember_diff(repo.label, repo.path, file_diff_text, summary_text, author, self._buffer_day)
+            ledger_item = remember_diff(repo.label, repo.path, file_diff_text, summary_text, author, summary_source, self._buffer_day)
             if ledger_item["shown"]:
                 continue
 
@@ -1249,6 +1949,7 @@ class PyesisApp:
                 file_diff_text,
                 ledger_item["diffHash"],
                 ledger_item.get("author", author),
+                self._summary_mode_or_default(ledger_item.get("summarySource", ""), ledger_item.get("author", author)),
             )
             if self._is_possible_duplicate_diff(new_entry):
                 self.status_var.set(f"[POSSIBLE DUPLICATE] {repo.label}: duplicate git diff detected for {file_path}")
