@@ -234,7 +234,7 @@ class PyesisApp:
         self._bind_shortcuts()
         self._apply_fonts()
         self._apply_theme()
-        self._migrate_entries()
+        self._migrate_entries(allow_ai_rewrite=False)
         self._refresh_repo_list()
         self._refresh_editor()
         self._maybe_auto_export_daily()
@@ -757,18 +757,78 @@ class PyesisApp:
             return
         self.repo_action_button.configure(text="Update Repo" if is_update_mode else "Add Repo")
 
-    def _migrate_entries(self) -> None:
-        original_len = len(self.config.entries)
-        filtered = self._remove_noise_entries(self.config.entries)
+    def _migrate_entries(self, allow_ai_rewrite: bool = False) -> None:
+        original_entries = list(self.config.entries)
+        normalized = self._normalize_entry_calendar_fields(original_entries)
+        filtered = self._remove_noise_entries(normalized)
         deduped = dedupe_entries(filtered)
-        rewritten = self._rewrite_legacy_summaries(deduped)
+        rewritten = self._rewrite_legacy_summaries(deduped) if allow_ai_rewrite else deduped
 
-        if len(rewritten) != original_len or any(
-            (a.summary != b.summary) or (a.author != b.author)
-            for a, b in zip(deduped, rewritten)
-        ):
+        if rewritten != original_entries:
             self.config.entries = rewritten
             save_config(self.config)
+
+    def _week_day_names(self) -> list[str]:
+        return ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+    def _week_end_day_index(self) -> int:
+        week_days = self._week_day_names()
+        configured = self.week_end_var.get().strip() or self.config.week_end_day
+        try:
+            return week_days.index(configured)
+        except ValueError:
+            return week_days.index("Thursday")
+
+    def _week_start_for_datetime(self, moment: datetime) -> datetime:
+        end_index = self._week_end_day_index()
+        week_end = (moment + timedelta(days=(end_index - moment.weekday()) % 7)).replace(
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        return week_end - timedelta(days=6)
+
+    def _entry_datetime(self, entry: EntryRecord) -> datetime | None:
+        try:
+            return datetime.fromisoformat(entry.created_at)
+        except ValueError:
+            return None
+
+    def _entry_day_name(self, entry: EntryRecord) -> str:
+        entry_dt = self._entry_datetime(entry)
+        if entry_dt is None:
+            return entry.day_name
+        return entry_dt.strftime("%A")
+
+    def _entry_week_start_iso(self, entry: EntryRecord) -> str:
+        entry_dt = self._entry_datetime(entry)
+        if entry_dt is None:
+            return entry.week_start_iso
+        return self._week_start_for_datetime(entry_dt).isoformat()
+
+    def _normalize_entry_calendar_fields(self, entries: list[EntryRecord]) -> list[EntryRecord]:
+        normalized: list[EntryRecord] = []
+        for entry in entries:
+            entry_dt = self._entry_datetime(entry)
+            if entry_dt is None:
+                normalized.append(entry)
+                continue
+            normalized.append(
+                EntryRecord(
+                    repo_label=entry.repo_label,
+                    repo_path=entry.repo_path,
+                    created_at=entry.created_at,
+                    day_name=entry_dt.strftime("%A"),
+                    week_start_iso=self._week_start_for_datetime(entry_dt).isoformat(),
+                    summary=entry.summary,
+                    summary_source=entry.summary_source,
+                    diff_hash=entry.diff_hash,
+                    diff_excerpt=entry.diff_excerpt,
+                    author=entry.author,
+                )
+            )
+        return normalized
 
     def _remove_noise_entries(self, entries: list[EntryRecord]) -> list[EntryRecord]:
         cleaned: list[EntryRecord] = []
@@ -783,7 +843,9 @@ class PyesisApp:
     def _should_merge_entries(self, previous: EntryRecord, current: EntryRecord) -> bool:
         if previous.repo_path != current.repo_path:
             return False
-        if previous.day_name != current.day_name or previous.week_start_iso != current.week_start_iso:
+        if self._entry_day_name(previous) != self._entry_day_name(current):
+            return False
+        if self._entry_week_start_iso(previous) != self._entry_week_start_iso(current):
             return False
 
         try:
@@ -803,8 +865,8 @@ class PyesisApp:
             return existing.diff_hash == candidate.diff_hash
 
         same_scope = (
-            existing.week_start_iso == candidate.week_start_iso
-            and existing.day_name == candidate.day_name
+            self._entry_week_start_iso(existing) == self._entry_week_start_iso(candidate)
+            and self._entry_day_name(existing) == self._entry_day_name(candidate)
         )
         if not same_scope:
             return False
@@ -1795,12 +1857,7 @@ class PyesisApp:
         author: str,
         summary_source: str,
     ) -> EntryRecord:
-        week_start = (created_at - timedelta(days=created_at.weekday())).replace(
-            hour=0,
-            minute=0,
-            second=0,
-            microsecond=0,
-        )
+        week_start = self._week_start_for_datetime(created_at)
         return EntryRecord(
             repo_label=repo.label,
             repo_path=repo.path,
@@ -1831,8 +1888,8 @@ class PyesisApp:
                 repo_label=candidate.repo_label,
                 repo_path=candidate.repo_path,
                 created_at=existing.created_at,
-                day_name=existing.day_name,
-                week_start_iso=existing.week_start_iso,
+                day_name=self._entry_day_name(existing),
+                week_start_iso=self._entry_week_start_iso(existing),
                 summary=candidate.summary,
                 summary_source=candidate.summary_source,
                 diff_hash=candidate.diff_hash,
@@ -1926,10 +1983,11 @@ class PyesisApp:
             return False
 
         candidate_day = self._entry_day_key(candidate.created_at)
+        candidate_week_start = self._entry_week_start_iso(candidate)
         for existing in reversed(self.config.entries):
             if existing.repo_path != candidate.repo_path:
                 continue
-            if existing.week_start_iso != candidate.week_start_iso:
+            if self._entry_week_start_iso(existing) != candidate_week_start:
                 continue
 
             existing_day = self._entry_day_key(existing.created_at)
