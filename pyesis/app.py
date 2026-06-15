@@ -70,6 +70,7 @@ NEAR_DUP_DIFF_SIMILARITY_THRESHOLD = 0.80
 WINDOWS_APP_ID = "rxjr.pyesis.app"
 PYESIS_GITHUB_URL = "https://github.com/cms-enterprise/Pyesis"
 MOUSEWHEEL_EVENT = "<MouseWheel>"
+VSCODE_OLLAMA_AUTOCODER_MODEL_SETTING = "ollama-autocoder.model"
 
 
 def _ollama_tags_url(base_url: str) -> str:
@@ -827,13 +828,8 @@ class PyesisApp:
         rewritten: list[EntryRecord] = []
         for entry in entries:
             needs_refresh = self._needs_summary_refresh(entry)
-            summary_source = self._summary_mode_or_default(entry.summary_source, entry.author)
-            should_retry_ai = summary_source == HEURISTIC_MODE and self._current_ai_mode() != HEURISTIC_MODE
-            if (needs_refresh or should_retry_ai) and entry.diff_excerpt.strip():
-                refreshed = self._build_summary_with_current_provider(entry.repo_label, entry.diff_excerpt, entry.repo_path)
-                next_summary = refreshed.text.strip() or entry.summary
-                next_source = refreshed.source if refreshed.text.strip() else summary_source
-                next_author = self._entry_author_from_source(next_source, current_is_backup=(summary_source == HEURISTIC_MODE))
+            if needs_refresh and entry.diff_excerpt.strip():
+                next_summary = self._build_summary_heuristic(entry.repo_label, entry.diff_excerpt, entry.repo_path).strip() or entry.summary
                 rewritten.append(
                     EntryRecord(
                         repo_label=entry.repo_label,
@@ -842,10 +838,10 @@ class PyesisApp:
                         day_name=entry.day_name,
                         week_start_iso=entry.week_start_iso,
                         summary=next_summary,
-                        summary_source=next_source,
+                        summary_source=HEURISTIC_MODE,
                         diff_hash=entry.diff_hash,
                         diff_excerpt=entry.diff_excerpt,
-                        author=next_author,
+                        author="Backup",
                     )
                 )
             else:
@@ -893,6 +889,34 @@ class PyesisApp:
         self.config.ui_font_size = max(10, min(20, int(self.ui_font_size_var.get())))
         save_config(self.config)
         self._refresh_editor()
+
+    def _workspace_settings_path(self) -> Path:
+        return Path.cwd() / ".vscode" / "settings.json"
+
+    def _sync_workspace_ollama_model_setting(self) -> None:
+        model_name = self.config.ai_ollama_model.strip()
+        if not model_name:
+            return
+
+        settings_path = self._workspace_settings_path()
+        existing_settings: object = {}
+        if settings_path.exists():
+            try:
+                existing_settings = json.loads(settings_path.read_text(encoding="utf-8"))
+            except Exception:
+                return
+
+        if not isinstance(existing_settings, dict):
+            return
+
+        current_model = str(existing_settings.get(VSCODE_OLLAMA_AUTOCODER_MODEL_SETTING, "")).strip()
+        if current_model == model_name:
+            return
+
+        updated_settings = dict(existing_settings)
+        updated_settings[VSCODE_OLLAMA_AUTOCODER_MODEL_SETTING] = model_name
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        settings_path.write_text(json.dumps(updated_settings, indent=4), encoding="utf-8")
 
     def _normalize_auto_export_time_or_show_error(self, raw_time: str) -> str | None:
         if not raw_time:
@@ -969,6 +993,7 @@ class PyesisApp:
         self.config.ai_github_gpt_url = settings.ai_github_gpt_url
         self.config.ai_github_gpt_model = settings.ai_github_gpt_model
         self._apply_ai_environment_defaults()
+        self._sync_workspace_ollama_model_setting()
         self._ai_backend_unavailable = False
         self._ai_last_warning = ""
         self._ai_status_severity = self._initial_ai_status_severity()
@@ -2059,7 +2084,10 @@ class PyesisApp:
             if sys.platform == "win32":
                 os.startfile(str(target_dir))
             elif sys.platform == "darwin":
-                subprocess.run(["open", str(target_dir)], check=False)
+                open_cmd = shutil.which("open") or "/usr/bin/open"
+                completed = subprocess.run([open_cmd, str(target_dir)], check=False)
+                if completed.returncode != 0:
+                    webbrowser.open(target_dir.as_uri())
             else:
                 completed = subprocess.run(["xdg-open", str(target_dir)], check=False)
                 if completed.returncode != 0:
@@ -2079,6 +2107,35 @@ def launch() -> None:
     app = PyesisApp(root)
     root.minsize(980, 640)
     app.status_var.set("Ready")
+    if sys.platform == "darwin":
+        root.update_idletasks()
+        root.deiconify()
+        root.lift()
+        try:
+            root.focus_force()
+        except tk.TclError:
+            pass
+        try:
+            root.attributes("-topmost", True)
+            root.after(250, lambda: root.attributes("-topmost", False))
+        except tk.TclError:
+            pass
+        try:
+            subprocess.run(
+                [
+                    "osascript",
+                    "-e",
+                    (
+                        'tell application "System Events" '
+                        f'to set frontmost of the first application process whose unix id is {os.getpid()} to true'
+                    ),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except Exception:
+            pass
     root.mainloop()
 
 

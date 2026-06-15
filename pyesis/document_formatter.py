@@ -20,6 +20,11 @@ DAY_ORDER = [
 ]
 
 
+def _active_week_start(now: datetime | None = None) -> datetime:
+    reference = now or datetime.now()
+    return (reference - timedelta(days=reference.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+
+
 def _week_end_date(week_start: datetime, week_end_day: str) -> datetime:
     end_index = DAY_ORDER.index(week_end_day)
     return week_start + timedelta(days=end_index)
@@ -30,6 +35,12 @@ def _group_entries(entries: list[EntryRecord]) -> dict[str, dict[str, list[Entry
     for entry in sorted(entries, key=lambda item: item.created_at):
         grouped[entry.week_start_iso][entry.day_name].append(entry)
     return grouped
+
+
+def _active_week_entries(entries: list[EntryRecord], now: datetime | None = None) -> tuple[str, dict[str, list[EntryRecord]]]:
+    active_week_start_iso = _active_week_start(now).isoformat()
+    grouped = _group_entries(entries)
+    return active_week_start_iso, grouped.get(active_week_start_iso, {})
 
 
 def _group_entries_by_repo(entries: list[EntryRecord]) -> dict[str, list[EntryRecord]]:
@@ -43,12 +54,12 @@ def _group_entries_by_repo(entries: list[EntryRecord]) -> dict[str, list[EntryRe
 
 
 def render_plain_text(config: AppConfig) -> str:
-    grouped = _group_entries(config.entries)
+    active_week_start_iso, active_week_entries = _active_week_entries(config.entries)
     blocks: list[str] = []
 
-    for week_start_iso in sorted(grouped.keys()):
-        _append_week_header(blocks, week_start_iso, config.week_end_day)
-        _append_week_entries(blocks, grouped[week_start_iso])
+    _append_week_header(blocks, active_week_start_iso, config.week_end_day)
+    if active_week_entries:
+        _append_week_entries(blocks, active_week_entries)
 
     return "\n".join(blocks).strip() + "\n"
 
@@ -83,10 +94,8 @@ def _append_day_repo_entries(blocks: list[str], entries: list[EntryRecord]) -> N
 def export_docx(config: AppConfig, output_dir: Path, file_name: str | None = None) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     document = Document()
-    grouped = _group_entries(config.entries)
-
-    for week_start_iso in sorted(grouped.keys()):
-        _write_week_block(document, week_start_iso, grouped[week_start_iso], config.week_end_day)
+    active_week_start_iso, active_week_entries = _active_week_entries(config.entries)
+    _write_week_block(document, active_week_start_iso, active_week_entries, config.week_end_day)
 
     if file_name:
         target = output_dir / file_name
