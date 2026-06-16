@@ -63,6 +63,7 @@ from pyesis.github_auth import (
     store_github_auth_token,
 )
 from pyesis.git_monitor import DiffSnapshot, capture_snapshot, split_diff_by_file, validate_repo
+from pyesis.summary_enhancer import run_periodic_enhancer
 
 
 DIFF_EXCERPT_LIMIT = 12_000
@@ -71,6 +72,7 @@ WINDOWS_APP_ID = "rxjr.pyesis.app"
 PYESIS_GITHUB_URL = "https://github.com/cms-enterprise/Pyesis"
 MOUSEWHEEL_EVENT = "<MouseWheel>"
 VSCODE_OLLAMA_AUTOCODER_MODEL_SETTING = "ollama-autocoder.model"
+DEFAULT_OLLAMA_SUMMARY_MODEL = "qwen3-coder:30b"
 
 
 def _ollama_tags_url(base_url: str) -> str:
@@ -222,6 +224,8 @@ class PyesisApp:
         self._poll_in_flight = False
         self._poll_thread: threading.Thread | None = None
         self._poll_results: list[SnapshotCaptureResult] = []
+        self._poll_captured_count = 0
+        self._poll_errors: list[str] = []
         self._ai_backend_unavailable = False
         self._ai_last_warning = ""
         self._buffer_day = datetime.now().strftime("%Y-%m-%d")
@@ -239,6 +243,7 @@ class PyesisApp:
         self._refresh_editor()
         self._maybe_auto_export_daily()
         self._schedule_poll()
+        self._schedule_enhancer_tick()
 
     def _set_windows_app_id(self) -> None:
         if os.name != "nt":
@@ -267,10 +272,11 @@ class PyesisApp:
         self.root.geometry(f"{width}x{height}+{pos_x}+{pos_y}")
 
     def _apply_ai_environment_defaults(self) -> None:
+        ollama_model = self.config.ai_ollama_model.strip() or DEFAULT_OLLAMA_SUMMARY_MODEL
         env_pairs = {
             "PYESIS_AI_MODE": self.config.ai_mode,
             "PYESIS_OLLAMA_URL": self.config.ai_ollama_url,
-            "PYESIS_OLLAMA_MODEL": self.config.ai_ollama_model,
+            "PYESIS_OLLAMA_MODEL": ollama_model,
             "PYESIS_OLLAMA_KEEP_ALIVE": self.config.ai_ollama_keep_alive,
             "PYESIS_AI_URL": self.config.ai_openai_url,
             "PYESIS_AI_MODEL": self.config.ai_openai_model,
@@ -344,6 +350,25 @@ class PyesisApp:
             return HEURISTIC_MODE
         return self._current_ai_mode()
 
+    def _preferred_summary_modes(self) -> list[str]:
+        modes: list[str] = []
+
+        if self._github_auth_status().has_token:
+            modes.append(GITHUB_GPT_MODE)
+
+        current_mode = self._current_ai_mode()
+        if current_mode != HEURISTIC_MODE and current_mode not in modes:
+            modes.append(current_mode)
+
+        if self.config.ai_ollama_url.strip() and OLLAMA_MODE not in modes:
+            modes.append(OLLAMA_MODE)
+
+        if self.config.ai_openai_url.strip() and os.getenv("PYESIS_AI_API_KEY", "").strip() and OPENAI_COMPATIBLE_MODE not in modes:
+            modes.append(OPENAI_COMPATIBLE_MODE)
+
+        modes.append(HEURISTIC_MODE)
+        return modes
+
     def _ai_provider_label(self, mode: str) -> str:
         return AI_PROVIDER_LABELS.get(mode, mode or "AI")
 
@@ -389,13 +414,43 @@ class PyesisApp:
         diff_excerpt: str,
         repo_path: str | None = None,
     ) -> AISummaryResult:
+        return self._build_summary_with_priority_modes(repo_label, diff_excerpt, repo_path)
+
+    def _build_summary_for_mode(self, repo_label: str, diff_excerpt: str, repo_path: str | None, mode: str) -> AISummaryResult:
+        allow_fallback = mode == HEURISTIC_MODE and self.config.ai_fallback_enabled
         return build_summary(
             repo_label,
             diff_excerpt,
             repo_path,
-            mode=self._current_ai_mode(),
-            allow_fallback=self.config.ai_fallback_enabled,
+            mode=mode,
+            allow_fallback=allow_fallback,
         )
+
+    def _accept_summary_result(self, result: AISummaryResult, requested_mode: str) -> bool:
+        return bool(result.text.strip()) and (result.source != HEURISTIC_MODE or requested_mode == HEURISTIC_MODE)
+
+    def _attach_warnings(self, result: AISummaryResult, warnings: list[str]) -> AISummaryResult:
+        if warnings and not result.warning.strip():
+            result.warning = "; ".join(warnings)
+        return result
+
+    def _build_summary_with_priority_modes(self, repo_label: str, diff_excerpt: str, repo_path: str | None = None) -> AISummaryResult:
+        last_result: AISummaryResult | None = None
+        warnings: list[str] = []
+
+        for mode in self._preferred_summary_modes():
+            result = self._build_summary_for_mode(repo_label, diff_excerpt, repo_path, mode)
+            if result.warning.strip():
+                warnings.append(result.warning.strip())
+            if self._accept_summary_result(result, mode):
+                return self._attach_warnings(result, warnings)
+            last_result = result
+
+        if last_result is not None:
+            return self._attach_warnings(last_result, warnings)
+
+        fallback_result = self._build_summary_for_mode(repo_label, diff_excerpt, repo_path, HEURISTIC_MODE)
+        return self._attach_warnings(fallback_result, warnings)
 
     def _asset_roots(self) -> list[Path]:
         roots: list[Path] = []
@@ -533,9 +588,10 @@ class PyesisApp:
         theme_box.bind("<<ComboboxSelected>>", self._on_theme_changed)
 
         ttk.Button(sidebar, text="Export DOCX", underline=0, command=self._export_docx).grid(row=15, column=0, sticky="ew", pady=(6, 0))
-        ttk.Label(sidebar, text="AI status").grid(row=16, column=0, sticky="w", pady=(12, 2))
-        ttk.Label(sidebar, textvariable=self.ai_status_var, style="AIStatus.TLabel", wraplength=260).grid(row=17, column=0, sticky="ew")
-        ttk.Label(sidebar, textvariable=self.status_var, wraplength=260).grid(row=18, column=0, sticky="ew", pady=(12, 0))
+        ttk.Button(sidebar, text="Edit Entry", underline=0, command=self._open_entry_editor).grid(row=16, column=0, sticky="ew", pady=(6, 0))
+        ttk.Label(sidebar, text="AI status").grid(row=17, column=0, sticky="w", pady=(12, 2))
+        ttk.Label(sidebar, textvariable=self.ai_status_var, style="AIStatus.TLabel", wraplength=260).grid(row=18, column=0, sticky="ew")
+        ttk.Label(sidebar, textvariable=self.status_var, wraplength=260).grid(row=19, column=0, sticky="ew", pady=(12, 0))
 
         editor_header = ttk.Frame(editor_area)
         editor_header.grid(row=0, column=0, sticky="ew")
@@ -615,6 +671,7 @@ class PyesisApp:
         self.root.bind_all("<Alt-r>", lambda _e: self._remove_selected_repo())
         self.root.bind_all("<Alt-c>", lambda _e: self.run_poll_once())
         self.root.bind_all("<Alt-e>", lambda _e: self._export_docx())
+        self.root.bind_all("<Alt-d>", lambda _e: self._open_entry_editor())
         self.root.bind_all("<Alt-s>", lambda _e: self._open_settings())
         self.root.bind_all("<Alt-i>", lambda _e: self._open_readme_view())
         self.root.bind_all("<Alt-g>", lambda _e: self._open_github_repo())
@@ -842,6 +899,8 @@ class PyesisApp:
                         diff_hash=entry.diff_hash,
                         diff_excerpt=entry.diff_excerpt,
                         author="Backup",
+                        rewritten_by=entry.rewritten_by,
+                        rewritten_at=entry.rewritten_at,
                     )
                 )
             else:
@@ -1269,7 +1328,7 @@ class PyesisApp:
         ai_mode_var = tk.StringVar(value=preferred_ai_mode)
         ai_fallback_var = tk.BooleanVar(value=self.config.ai_fallback_enabled)
         ollama_url_var = tk.StringVar(value=self.config.ai_ollama_url)
-        ollama_model_var = tk.StringVar(value=self.config.ai_ollama_model)
+        ollama_model_var = tk.StringVar(value=self.config.ai_ollama_model or DEFAULT_OLLAMA_SUMMARY_MODEL)
         ollama_model_status_var = tk.StringVar(value="Refresh to load installed Ollama models.")
         ollama_keep_alive_var = tk.StringVar(value=self.config.ai_ollama_keep_alive)
         openai_url_var = tk.StringVar(value=self.config.ai_openai_url)
@@ -1321,7 +1380,7 @@ class PyesisApp:
         ttk.Checkbutton(frame, text="High contrast mode", variable=high_contrast_var).grid(row=6, column=0, sticky="w", pady=(6, 0))
         ttk.Label(frame, text="UI font size").grid(row=7, column=0, sticky="w", pady=(8, 2))
         ttk.Spinbox(frame, from_=10, to=20, textvariable=font_size_var, width=6).grid(row=8, column=0, sticky="w")
-        ttk.Label(frame, text="Tip: Keyboard shortcuts include Alt+B/A/R/C/E/S/I/G").grid(row=9, column=0, sticky="w", pady=(6, 12))
+        ttk.Label(frame, text="Tip: Keyboard shortcuts include Alt+B/A/R/C/E/D/S/I/G").grid(row=9, column=0, sticky="w", pady=(6, 12))
 
         ttk.Label(frame, text="AI provider").grid(row=10, column=0, sticky="w")
         ttk.Combobox(
@@ -1330,22 +1389,23 @@ class PyesisApp:
             values=[OLLAMA_MODE, GITHUB_GPT_MODE, OPENAI_COMPATIBLE_MODE, HEURISTIC_MODE],
             state="readonly",
         ).grid(row=11, column=0, sticky="ew", pady=(6, 6))
-        ttk.Checkbutton(frame, text="Use heuristic fallback when AI fails", variable=ai_fallback_var).grid(row=12, column=0, sticky="w")
+        ttk.Label(frame, text="Pick provider and model per machine; heavier models can be slower or memory-intensive.").grid(row=12, column=0, sticky="w")
+        ttk.Checkbutton(frame, text="Use heuristic fallback when AI fails", variable=ai_fallback_var).grid(row=13, column=0, sticky="w")
         ollama_status = "detected on this machine" if ollama_present else "not detected; defaulting to GitHub GPT"
-        ttk.Label(frame, text=f"Ollama status: {ollama_status}").grid(row=13, column=0, sticky="w", pady=(6, 2))
-        ttk.Label(frame, text="GitHub tokens can come from the environment or be stored securely in macOS Keychain below.").grid(row=14, column=0, sticky="w", pady=(0, 12))
+        ttk.Label(frame, text=f"Ollama status: {ollama_status}").grid(row=14, column=0, sticky="w", pady=(6, 2))
+        ttk.Label(frame, text="GitHub tokens can come from the environment or be stored securely in macOS Keychain below.").grid(row=15, column=0, sticky="w", pady=(0, 12))
 
-        ttk.Label(frame, text="Ollama URL").grid(row=15, column=0, sticky="w")
-        ttk.Entry(frame, textvariable=ollama_url_var, width=42).grid(row=16, column=0, sticky="ew", pady=(4, 6))
-        ttk.Label(frame, text="Ollama model").grid(row=17, column=0, sticky="w")
+        ttk.Label(frame, text="Ollama URL").grid(row=16, column=0, sticky="w")
+        ttk.Entry(frame, textvariable=ollama_url_var, width=42).grid(row=17, column=0, sticky="ew", pady=(4, 6))
+        ttk.Label(frame, text="Ollama model").grid(row=18, column=0, sticky="w")
         ollama_model_row = ttk.Frame(frame)
-        ollama_model_row.grid(row=18, column=0, sticky="ew", pady=(4, 4))
+        ollama_model_row.grid(row=19, column=0, sticky="ew", pady=(4, 4))
         ollama_model_row.columnconfigure(0, weight=1)
         ollama_model_box = ttk.Combobox(
             ollama_model_row,
             textvariable=ollama_model_var,
             values=(ollama_model_var.get().strip(),) if ollama_model_var.get().strip() else (),
-            state="readonly",
+            state="normal",
         )
         ollama_model_box.grid(row=0, column=0, sticky="ew")
         ollama_refresh_button = ttk.Button(
@@ -1360,35 +1420,35 @@ class PyesisApp:
             ),
         )
         ollama_refresh_button.grid(row=0, column=1, padx=(6, 0))
-        ttk.Label(frame, textvariable=ollama_model_status_var, wraplength=560, justify="left").grid(row=19, column=0, sticky="w", pady=(0, 6))
-        ttk.Label(frame, text="Ollama keep alive").grid(row=20, column=0, sticky="w")
-        ttk.Entry(frame, textvariable=ollama_keep_alive_var, width=18).grid(row=21, column=0, sticky="w", pady=(4, 12))
+        ttk.Label(frame, textvariable=ollama_model_status_var, wraplength=560, justify="left").grid(row=20, column=0, sticky="w", pady=(0, 6))
+        ttk.Label(frame, text="Ollama keep alive").grid(row=21, column=0, sticky="w")
+        ttk.Entry(frame, textvariable=ollama_keep_alive_var, width=18).grid(row=22, column=0, sticky="w", pady=(4, 12))
 
-        ttk.Label(frame, text="OpenAI-compatible URL").grid(row=22, column=0, sticky="w")
-        ttk.Entry(frame, textvariable=openai_url_var, width=42).grid(row=23, column=0, sticky="ew", pady=(4, 6))
-        ttk.Label(frame, text="OpenAI-compatible model").grid(row=24, column=0, sticky="w")
-        ttk.Entry(frame, textvariable=openai_model_var, width=42).grid(row=25, column=0, sticky="ew", pady=(4, 12))
+        ttk.Label(frame, text="OpenAI-compatible URL").grid(row=23, column=0, sticky="w")
+        ttk.Entry(frame, textvariable=openai_url_var, width=42).grid(row=24, column=0, sticky="ew", pady=(4, 6))
+        ttk.Label(frame, text="OpenAI-compatible model").grid(row=25, column=0, sticky="w")
+        ttk.Entry(frame, textvariable=openai_model_var, width=42).grid(row=26, column=0, sticky="ew", pady=(4, 12))
 
-        ttk.Label(frame, text="GitHub account type").grid(row=26, column=0, sticky="w")
+        ttk.Label(frame, text="GitHub account type").grid(row=27, column=0, sticky="w")
         ttk.Combobox(
             frame,
             textvariable=github_auth_mode_var,
             values=[GITHUB_DOTCOM_AUTH_MODE, GITHUB_ENTERPRISE_AUTH_MODE],
             state="readonly",
-        ).grid(row=27, column=0, sticky="ew", pady=(4, 6))
-        ttk.Label(frame, text="GitHub Enterprise host (used only for Enterprise sign-in)").grid(row=28, column=0, sticky="w")
-        ttk.Entry(frame, textvariable=github_auth_endpoint_var, width=42).grid(row=29, column=0, sticky="ew", pady=(4, 6))
-        ttk.Label(frame, textvariable=github_auth_status_var, wraplength=560, justify="left").grid(row=30, column=0, sticky="w")
-        ttk.Label(frame, text="GitHub OAuth client ID").grid(row=31, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(frame, textvariable=github_oauth_client_id_var, width=42).grid(row=32, column=0, sticky="ew", pady=(4, 6))
+        ).grid(row=28, column=0, sticky="ew", pady=(4, 6))
+        ttk.Label(frame, text="GitHub Enterprise host (used only for Enterprise sign-in)").grid(row=29, column=0, sticky="w")
+        ttk.Entry(frame, textvariable=github_auth_endpoint_var, width=42).grid(row=30, column=0, sticky="ew", pady=(4, 6))
+        ttk.Label(frame, textvariable=github_auth_status_var, wraplength=560, justify="left").grid(row=31, column=0, sticky="w")
+        ttk.Label(frame, text="GitHub OAuth client ID").grid(row=32, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(frame, textvariable=github_oauth_client_id_var, width=42).grid(row=33, column=0, sticky="ew", pady=(4, 6))
         ttk.Label(
             frame,
             textvariable=github_login_help_var,
             wraplength=560,
             justify="left",
-        ).grid(row=33, column=0, sticky="w")
+        ).grid(row=34, column=0, sticky="w")
         auth_actions = ttk.Frame(frame)
-        auth_actions.grid(row=34, column=0, sticky="w", pady=(8, 8))
+        auth_actions.grid(row=35, column=0, sticky="w", pady=(8, 8))
         sign_in_button = ttk.Button(
             auth_actions,
             text="Sign in with GitHub",
@@ -1419,19 +1479,19 @@ class PyesisApp:
         github_oauth_client_id_var.trace_add("write", refresh_github_login_controls)
         refresh_github_login_controls()
 
-        ttk.Label(frame, text="Or store or replace a token manually").grid(row=35, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(frame, textvariable=github_auth_token_var, width=42, show="*").grid(row=36, column=0, sticky="ew", pady=(4, 6))
-        ttk.Checkbutton(frame, text="Clear stored GitHub token on save", variable=github_auth_clear_var).grid(row=37, column=0, sticky="w", pady=(0, 12))
+        ttk.Label(frame, text="Or store or replace a token manually").grid(row=36, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(frame, textvariable=github_auth_token_var, width=42, show="*").grid(row=37, column=0, sticky="ew", pady=(4, 6))
+        ttk.Checkbutton(frame, text="Clear stored GitHub token on save", variable=github_auth_clear_var).grid(row=38, column=0, sticky="w", pady=(0, 12))
 
-        ttk.Label(frame, text="GitHub GPT URL").grid(row=38, column=0, sticky="w")
-        ttk.Entry(frame, textvariable=github_gpt_url_var, width=42).grid(row=39, column=0, sticky="ew", pady=(4, 6))
-        ttk.Label(frame, text="GitHub GPT model").grid(row=40, column=0, sticky="w")
+        ttk.Label(frame, text="GitHub GPT URL").grid(row=39, column=0, sticky="w")
+        ttk.Entry(frame, textvariable=github_gpt_url_var, width=42).grid(row=40, column=0, sticky="ew", pady=(4, 6))
+        ttk.Label(frame, text="GitHub GPT model").grid(row=41, column=0, sticky="w")
         ttk.Combobox(
             frame,
             textvariable=github_gpt_model_var,
             values=list(GITHUB_GPT_DEFAULT_MODELS),
             state="readonly",
-        ).grid(row=41, column=0, sticky="ew", pady=(4, 12))
+        ).grid(row=42, column=0, sticky="ew", pady=(4, 12))
 
         self._refresh_ollama_model_choices(
             ollama_url_var,
@@ -1693,12 +1753,153 @@ class PyesisApp:
         if hasattr(self, "editor"):
             self.editor.configure(font=(DEFAULT_EDITOR_FONT_FAMILY, size))
 
+    def _editable_entries(self) -> list[tuple[int, EntryRecord]]:
+        indexed_entries = list(enumerate(self.config.entries))
+        indexed_entries.sort(key=lambda item: item[1].created_at, reverse=True)
+        return indexed_entries
+
+    def _entry_picker_label(self, entry: EntryRecord) -> str:
+        stamp = entry.created_at.replace("T", " ")[:16]
+        one_line = re.sub(r"\s+", " ", entry.summary.strip())
+        excerpt = one_line[:72] + ("..." if len(one_line) > 72 else "")
+        if not excerpt:
+            excerpt = "(empty summary)"
+        return f"{stamp} | {entry.repo_label} | {excerpt}"
+
+    def _open_entry_editor(self) -> None:
+        indexed_entries = self._editable_entries()
+        if not indexed_entries:
+            messagebox.showinfo("No entries", "There are no captured entries to edit yet.")
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Edit Entry")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(True, True)
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(0, weight=1)
+
+        shell = ttk.Frame(dialog, padding=12)
+        shell.grid(row=0, column=0, sticky="nsew")
+        shell.columnconfigure(0, weight=1)
+        shell.rowconfigure(2, weight=1)
+
+        ttk.Label(shell, text="Select one entry to edit").grid(row=0, column=0, sticky="w")
+
+        selector_row = ttk.Frame(shell)
+        selector_row.grid(row=1, column=0, sticky="nsew", pady=(6, 8))
+        selector_row.columnconfigure(0, weight=1)
+        selector_row.rowconfigure(0, weight=1)
+
+        listbox = tk.Listbox(selector_row, exportselection=False, height=7)
+        listbox.grid(row=0, column=0, sticky="nsew")
+        list_scroll = ttk.Scrollbar(selector_row, orient="vertical", command=listbox.yview)
+        list_scroll.grid(row=0, column=1, sticky="ns")
+        listbox.configure(yscrollcommand=list_scroll.set)
+
+        labels = [self._entry_picker_label(entry) for _, entry in indexed_entries]
+        for label in labels:
+            listbox.insert(tk.END, label)
+
+        metadata_var = tk.StringVar(value="")
+        ttk.Label(shell, textvariable=metadata_var, wraplength=760).grid(row=3, column=0, sticky="w", pady=(0, 4))
+
+        editor = tk.Text(shell, wrap="word", height=12)
+        editor.grid(row=4, column=0, sticky="nsew")
+        shell.rowconfigure(4, weight=1)
+
+        editor_scroll = ttk.Scrollbar(shell, orient="vertical", command=editor.yview)
+        editor_scroll.grid(row=4, column=1, sticky="ns", padx=(6, 0))
+        editor.configure(yscrollcommand=editor_scroll.set)
+
+        state = {"position": 0}
+
+        def load_position(position: int) -> None:
+            if position < 0 or position >= len(indexed_entries):
+                return
+            state["position"] = position
+            listbox.selection_clear(0, tk.END)
+            listbox.selection_set(position)
+            listbox.activate(position)
+            listbox.see(position)
+
+            _, entry = indexed_entries[position]
+            metadata_var.set(f"{entry.day_name} | {entry.created_at} | {entry.repo_label}")
+            editor.delete("1.0", tk.END)
+            editor.insert("1.0", entry.summary)
+
+        def on_listbox_select(_event: tk.Event) -> None:
+            selection = listbox.curselection()
+            if not selection:
+                return
+            load_position(selection[0])
+
+        def save_current_entry() -> None:
+            new_summary = editor.get("1.0", "end-1c").strip()
+            if not new_summary:
+                messagebox.showerror("Invalid summary", "Entry summary cannot be empty.")
+                return
+
+            pos = state["position"]
+            config_index, current_entry = indexed_entries[pos]
+            updated_entry = EntryRecord(
+                repo_label=current_entry.repo_label,
+                repo_path=current_entry.repo_path,
+                created_at=current_entry.created_at,
+                day_name=current_entry.day_name,
+                week_start_iso=current_entry.week_start_iso,
+                summary=new_summary,
+                diff_hash=current_entry.diff_hash,
+                diff_excerpt=current_entry.diff_excerpt,
+                summary_source=current_entry.summary_source,
+                author=current_entry.author,
+                rewritten_by=current_entry.rewritten_by,
+                rewritten_at=current_entry.rewritten_at,
+            )
+            self.config.entries[config_index] = updated_entry
+            indexed_entries[pos] = (config_index, updated_entry)
+
+            labels[pos] = self._entry_picker_label(updated_entry)
+            listbox.delete(pos)
+            listbox.insert(pos, labels[pos])
+            listbox.selection_clear(0, tk.END)
+            listbox.selection_set(pos)
+
+            self._persist()
+            self.status_var.set(f"Updated 1 entry for {updated_entry.repo_label}")
+
+        def go_previous() -> None:
+            load_position(state["position"] - 1)
+
+        def go_next() -> None:
+            load_position(state["position"] + 1)
+
+        listbox.bind("<<ListboxSelect>>", on_listbox_select)
+
+        controls = ttk.Frame(shell)
+        controls.grid(row=5, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        ttk.Button(controls, text="Previous", command=go_previous).grid(row=0, column=0, padx=(0, 6))
+        ttk.Button(controls, text="Next", command=go_next).grid(row=0, column=1, padx=(0, 12))
+        ttk.Button(controls, text="Cancel", command=dialog.destroy).grid(row=0, column=2, padx=(0, 6))
+        ttk.Button(controls, text="Save", command=save_current_entry).grid(row=0, column=3)
+
+        load_position(0)
+        editor.focus_set()
+
     def _refresh_editor(self) -> None:
         self.editor.delete("1.0", tk.END)
         self.editor.insert("1.0", render_plain_text(self.config) if self.config.entries else "")
 
     def _schedule_poll(self) -> None:
         self.root.after(self._next_poll_interval_ms(), self._scheduled_poll)
+
+    def _schedule_enhancer_tick(self) -> None:
+        self.root.after(60_000, self._scheduled_enhancer_tick)
+
+    def _scheduled_enhancer_tick(self) -> None:
+        self._run_periodic_summary_enhancer()
+        self._schedule_enhancer_tick()
 
     def _next_poll_interval_ms(self) -> int:
         if not self.config.repos:
@@ -1727,22 +1928,51 @@ class PyesisApp:
         author = existing.get("author", "Backup") if existing is not None else "Backup"
         summary_source = self._summary_mode_or_default(existing.get("summarySource", "") if existing is not None else "", author)
 
-        if summary_text.strip() and summary_source == HEURISTIC_MODE and self._current_ai_mode() != HEURISTIC_MODE:
-            summary = self._build_summary_with_current_provider(repo.label, diff_text, repo.path)
-            self._handle_ai_health(summary, repo.label)
-            if summary.text.strip() and summary.source != HEURISTIC_MODE:
-                summary_text = summary.text
-                author = "AI"
-                summary_source = summary.source
+        if summary_text.strip() and summary_source == GITHUB_GPT_MODE:
+            return summary_text, False, author, summary_source
 
-        if not summary_text.strip():
-            summary = self._build_summary_with_current_provider(repo.label, diff_text, repo.path)
-            self._handle_ai_health(summary, repo.label)
-            summary_text = summary.text or self._build_summary_heuristic(repo.label, diff_text, repo.path)
-            author = self._entry_author_from_source(summary.source, current_is_backup=True)
-            summary_source = summary.source if summary.text.strip() else HEURISTIC_MODE
+        summary_text, author, summary_source = self._upgrade_or_create_summary(
+            repo,
+            diff_text,
+            summary_text,
+            author,
+            summary_source,
+        )
 
         return summary_text, False, author, summary_source
+
+    def _upgrade_or_create_summary(
+        self,
+        repo: RepoConfig,
+        diff_text: str,
+        summary_text: str,
+        author: str,
+        summary_source: str,
+    ) -> tuple[str, str, str]:
+        if summary_text.strip() and summary_source == HEURISTIC_MODE and self._current_ai_mode() != HEURISTIC_MODE:
+            upgraded = self._try_upgrade_heuristic_summary(repo, diff_text)
+            if upgraded is not None:
+                return upgraded
+
+        if summary_text.strip():
+            return summary_text, author, summary_source
+
+        return self._create_summary_for_diff(repo, diff_text)
+
+    def _try_upgrade_heuristic_summary(self, repo: RepoConfig, diff_text: str) -> tuple[str, str, str] | None:
+        summary = self._build_summary_with_current_provider(repo.label, diff_text, repo.path)
+        self._handle_ai_health(summary, repo.label)
+        if summary.text.strip() and summary.source != HEURISTIC_MODE:
+            return summary.text, "AI", summary.source
+        return None
+
+    def _create_summary_for_diff(self, repo: RepoConfig, diff_text: str) -> tuple[str, str, str]:
+        summary = self._build_summary_with_current_provider(repo.label, diff_text, repo.path)
+        self._handle_ai_health(summary, repo.label)
+        summary_text = summary.text or self._build_summary_heuristic(repo.label, diff_text, repo.path)
+        author = self._entry_author_from_source(summary.source, current_is_backup=True)
+        summary_source = summary.source if summary.text.strip() else HEURISTIC_MODE
+        return summary_text, author, summary_source
 
     def _initial_ai_status_text(self) -> str:
         mode = self._current_ai_mode()
@@ -1812,6 +2042,8 @@ class PyesisApp:
             diff_hash=diff_hash,
             diff_excerpt=diff_text[:DIFF_EXCERPT_LIMIT],
             author=author,
+            rewritten_by="",
+            rewritten_at="",
         )
 
     def _merge_or_append_captured_entry(self, candidate: EntryRecord) -> None:
@@ -1838,6 +2070,8 @@ class PyesisApp:
                 diff_hash=candidate.diff_hash,
                 diff_excerpt=candidate.diff_excerpt,
                 author=candidate.author,
+                rewritten_by=candidate.rewritten_by,
+                rewritten_at=candidate.rewritten_at,
             )
             return
 
@@ -1955,6 +2189,34 @@ class PyesisApp:
 
         return self._capture_repo_snapshot_change(repo, snapshot)
 
+    def _set_possible_duplicate_status(self, message: str) -> None:
+        if threading.current_thread() is threading.main_thread():
+            self.status_var.set(message)
+
+    def _should_skip_captured_entry(
+        self,
+        repo: RepoConfig,
+        file_path: str,
+        file_diff_text: str,
+        new_entry: EntryRecord,
+    ) -> bool:
+        if self._is_possible_duplicate_diff(new_entry):
+            self._set_possible_duplicate_status(f"[POSSIBLE DUPLICATE] {repo.label}: duplicate git diff detected for {file_path}")
+            mark_as_shown(repo.label, file_diff_text, self._buffer_day)
+            return True
+
+        if self._is_possible_carryover_duplicate(new_entry):
+            self._set_possible_duplicate_status(f"[POSSIBLE DUPLICATE] {repo.label}: carry-over git diff from previous day for {file_path}")
+            mark_as_shown(repo.label, file_diff_text, self._buffer_day)
+            return True
+
+        if any(self._is_duplicate_entry(entry, new_entry) for entry in self.config.entries):
+            self._set_possible_duplicate_status(f"[POSSIBLE DUPLICATE] {repo.label}: duplicate git diff detected for {file_path}")
+            mark_as_shown(repo.label, file_diff_text, self._buffer_day)
+            return True
+
+        return False
+
     def _capture_repo_snapshot_change(self, repo: RepoConfig, snapshot: DiffSnapshot) -> bool:
         captured = False
 
@@ -1976,19 +2238,7 @@ class PyesisApp:
                 ledger_item.get("author", author),
                 self._summary_mode_or_default(ledger_item.get("summarySource", ""), ledger_item.get("author", author)),
             )
-            if self._is_possible_duplicate_diff(new_entry):
-                self.status_var.set(f"[POSSIBLE DUPLICATE] {repo.label}: duplicate git diff detected for {file_path}")
-                mark_as_shown(repo.label, file_diff_text, self._buffer_day)
-                continue
-
-            if self._is_possible_carryover_duplicate(new_entry):
-                self.status_var.set(f"[POSSIBLE DUPLICATE] {repo.label}: carry-over git diff from previous day for {file_path}")
-                mark_as_shown(repo.label, file_diff_text, self._buffer_day)
-                continue
-
-            if any(self._is_duplicate_entry(entry, new_entry) for entry in self.config.entries):
-                self.status_var.set(f"[POSSIBLE DUPLICATE] {repo.label}: duplicate git diff detected for {file_path}")
-                mark_as_shown(repo.label, file_diff_text, self._buffer_day)
+            if self._should_skip_captured_entry(repo, file_path, file_diff_text, new_entry):
                 continue
 
             self._merge_or_append_captured_entry(new_entry)
@@ -1998,13 +2248,20 @@ class PyesisApp:
         return captured
 
     def _poll_worker(self, repos: list[RepoConfig]) -> None:
-        results: list[SnapshotCaptureResult] = []
+        captured = 0
+        errors: list[str] = []
         for repo in repos:
             try:
-                results.append(SnapshotCaptureResult(repo=repo, snapshot=capture_snapshot(repo)))
+                snapshot = capture_snapshot(repo)
             except Exception as exc:
-                results.append(SnapshotCaptureResult(repo=repo, snapshot=None, error=str(exc)))
-        self._poll_results = results
+                errors.append(f"{repo.label}: {exc}")
+                continue
+
+            if self._capture_repo_snapshot_change(repo, snapshot):
+                captured += 1
+
+        self._poll_captured_count = captured
+        self._poll_errors = errors
 
     def _check_poll_worker(self) -> None:
         if self._poll_thread is not None and self._poll_thread.is_alive():
@@ -2027,14 +2284,12 @@ class PyesisApp:
         self._poll_in_flight = False
         self._poll_thread = None
         self._poll_results = []
+        self._poll_captured_count = 0
+        self._poll_errors = []
 
     def _finish_poll(self) -> None:
-        captured = 0
-        errors: list[str] = []
-
-        for result in self._poll_results:
-            if self._consume_poll_result(result, errors):
-                captured += 1
+        captured = self._poll_captured_count
+        errors = list(self._poll_errors)
 
         now_time = datetime.now().strftime('%H:%M:%S')
         if captured:
@@ -2049,7 +2304,21 @@ class PyesisApp:
         else:
             self.status_var.set(f"No new diffs at {now_time}")
 
+        self._run_periodic_summary_enhancer()
+
         self._reset_poll_state()
+
+    def _run_periodic_summary_enhancer(self) -> None:
+        report = run_periodic_enhancer(self.config)
+        if not report.ran:
+            return
+        if report.total_rewritten:
+            mode_label = "dry-run" if report.dry_run else "live"
+            self._refresh_editor()
+            self.status_var.set(
+                f"Summary enhancer ({mode_label}) rewrote {report.total_rewritten} entries "
+                f"(state={report.rewritten_state}, buffer={report.rewritten_buffer})"
+            )
 
     def run_poll_once(self) -> None:
         if self._poll_in_flight:

@@ -13,7 +13,9 @@ Desktop tool for monitoring `git diff` activity across multiple repositories and
 - Add and remove repositories to monitor.
 - Periodically check for changed `git diff` output.
 - Generate first-person summaries through a pluggable AI hook.
+- Choose AI provider and model per machine in Settings (for example, lighter or heavier Ollama models based on local hardware).
 - Group entries by day with `@DayName` markers and then by repository name (alphabetical).
+- Edit one saved summary entry at a time when you need to correct wording or add detail.
 - Start each Monday with blank spacing and a weekly header.
 - Export the current log to `.docx`.
 - Optional daily auto-export at a configured time from Settings, saved as `YYYYMMMddPyesis.docx`.
@@ -45,6 +47,9 @@ export PYESIS_AI_MODE="ollama"
 export PYESIS_OLLAMA_URL="http://localhost:11434/api/chat"
 export PYESIS_OLLAMA_MODEL="qwen3-coder:30b"
 export PYESIS_OLLAMA_KEEP_ALIVE="5m"
+# Optional: force broader repository context on or off for AI summaries.
+# Default behavior: enabled in Ollama mode, disabled otherwise.
+export PYESIS_AI_INCLUDE_REPO_CONTEXT="true"
 ```
 
 On Windows PowerShell:
@@ -99,3 +104,21 @@ Generated artifacts are written to `dist/`:
 - Linux: `Pyesis-vYYYY.M.D.x-linux-{x64|arm64}.zip`
 
 The macOS app bundle produced by CI is unsigned. It runs locally, but distribution outside your own machine will require the usual Apple signing and notarization work.
+
+# For Extra Smart write ups build an agent to help:
+
+Build a periodic summary enhancer in Pyesis that:
+
+scans new entries in diff_buffers and pyesis_state
+rewrites weak gitDiffDescription or summary fields into high-quality rationale
+updates only description fields, never gitDiffText or diff hash
+tags rewritten entries with rewrittenBy and rewrittenAt
+skips entries already marked human-authored
+supports dry-run mode and safe logging
+Ask Copilot to implement it in small steps:
+config flags
+selection logic
+prompt builder
+writer with field-level updates
+scheduler hook
+tests

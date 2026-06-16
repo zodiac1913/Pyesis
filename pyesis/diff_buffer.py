@@ -20,6 +20,8 @@ class DiffLedgerItem(TypedDict):
     repoPath: str
     author: str
     summarySource: str
+    rewrittenBy: str
+    rewrittenAt: str
 
 
 def _today_key() -> str:
@@ -73,6 +75,8 @@ def _read_items(path: Path) -> list[DiffLedgerItem]:
         repo_path = str(raw.get("repoPath", ""))
         author = str(raw.get("author", "Backup"))
         summary_source = str(raw.get("summarySource", "")).strip().lower()
+        rewritten_by = str(raw.get("rewrittenBy", "")).strip()
+        rewritten_at = str(raw.get("rewrittenAt", "")).strip()
         if not repo or not git_diff_text:
             continue
         items.append(
@@ -86,6 +90,8 @@ def _read_items(path: Path) -> list[DiffLedgerItem]:
                 "repoPath": repo_path,
                 "author": author,
                 "summarySource": summary_source,
+                "rewrittenBy": rewritten_by,
+                "rewrittenAt": rewritten_at,
             }
         )
     return items
@@ -104,6 +110,8 @@ def _write_items(path: Path, items: list[DiffLedgerItem]) -> None:
             "repoPath": item["repoPath"],
             "author": item["author"],
             "summarySource": item["summarySource"],
+            "rewrittenBy": item["rewrittenBy"],
+            "rewrittenAt": item["rewrittenAt"],
         }
         for item in items
     ]
@@ -187,6 +195,8 @@ def remember_diff(
         "repoPath": repo_path,
         "author": author,
         "summarySource": summary_source,
+        "rewrittenBy": "",
+        "rewrittenAt": "",
     }
     items.append(new_item)
     _write_items(path, items)

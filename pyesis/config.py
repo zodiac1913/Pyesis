@@ -57,6 +57,8 @@ class EntryRecord:
     diff_excerpt: str
     summary_source: str = ""
     author: str = "Backup"
+    rewritten_by: str = ""
+    rewritten_at: str = ""
 
 
 @dataclass
@@ -80,6 +82,12 @@ class AppConfig:
     github_auth_mode: str = GITHUB_DOTCOM_AUTH_MODE
     github_auth_endpoint: str = ""
     github_oauth_client_id: str = ""
+    summary_enhancer_enabled: bool = True
+    summary_enhancer_interval_minutes: int = 1
+    summary_enhancer_dry_run: bool = True
+    summary_enhancer_aggressive_prodding: bool = False
+    summary_enhancer_last_run_at: str = ""
+    summary_enhancer_rewritten_by: str = "PyesisSummaryEnhancer"
     repos: list[RepoConfig] = field(default_factory=list)
     entries: list[EntryRecord] = field(default_factory=list)
 
@@ -306,6 +314,8 @@ def _decode_entry(item: dict[str, Any]) -> EntryRecord:
         summary=item["summary"],
         summary_source=str(item.get("summary_source", "")).strip().lower(),
         author=str(item.get("author", "Backup")),
+        rewritten_by=str(item.get("rewritten_by", "")).strip(),
+        rewritten_at=str(item.get("rewritten_at", "")).strip(),
         diff_hash=item["diff_hash"],
         diff_excerpt=item.get("diff_excerpt", ""),
     )
@@ -388,12 +398,18 @@ def load_config() -> AppConfig:
             data.get("github_auth_endpoint", ""),
         ),
         github_oauth_client_id=str(data.get("github_oauth_client_id", "")).strip(),
+        summary_enhancer_enabled=bool(data.get("summary_enhancer_enabled", True)),
+        summary_enhancer_interval_minutes=max(1, int(data.get("summary_enhancer_interval_minutes", 1))),
+        summary_enhancer_dry_run=bool(data.get("summary_enhancer_dry_run", True)),
+        summary_enhancer_aggressive_prodding=bool(data.get("summary_enhancer_aggressive_prodding", False)),
+        summary_enhancer_last_run_at=str(data.get("summary_enhancer_last_run_at", "")).strip(),
+        summary_enhancer_rewritten_by=str(data.get("summary_enhancer_rewritten_by", "PyesisSummaryEnhancer")).strip() or "PyesisSummaryEnhancer",
         repos=[_decode_repo(item) for item in data.get("repos", [])],
         entries=entries,
     )
 
 
-def save_config(config: AppConfig) -> None:
+def save_config(config: AppConfig, state_path: Path = STATE_PATH) -> None:
     config.entries = dedupe_entries(config.entries)
     payload = {
         "week_end_day": config.week_end_day,
@@ -415,7 +431,13 @@ def save_config(config: AppConfig) -> None:
         "github_auth_mode": config.github_auth_mode,
         "github_auth_endpoint": config.github_auth_endpoint,
         "github_oauth_client_id": config.github_oauth_client_id,
+        "summary_enhancer_enabled": config.summary_enhancer_enabled,
+        "summary_enhancer_interval_minutes": config.summary_enhancer_interval_minutes,
+        "summary_enhancer_dry_run": config.summary_enhancer_dry_run,
+        "summary_enhancer_aggressive_prodding": config.summary_enhancer_aggressive_prodding,
+        "summary_enhancer_last_run_at": config.summary_enhancer_last_run_at,
+        "summary_enhancer_rewritten_by": config.summary_enhancer_rewritten_by,
         "repos": [asdict(repo) for repo in config.repos],
         "entries": [asdict(entry) for entry in config.entries],
     }
-    STATE_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    state_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
