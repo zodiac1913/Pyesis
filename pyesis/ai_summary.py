@@ -93,7 +93,7 @@ GOOD_WRITING_EXAMPLES = (
     "In pyesis/app.py, I changed the capture flow to split diffs by file before summarizing them and tightened validation so write-ups are generated from cleaner per-file inputs.",
 )
 BAD_WRITING_EXAMPLES = (
-    "In wwwroot/js/Configurer/conjure.js, I refined logic to clarify configuration behavior by changing code around '//}'.",
+    "In wwwroot/js/Configurer/conjure.js, I refined logic to clarify configuration behavior by changing code around}'.",
     "In wwwroot/js/Configurer/conjureTable.js, I updated logging to clarify configuration behavior by updated logging and changing code around 'import {'.",
     "In pyesis/app.py, I refined application flow to improve the user-facing app flow.",
     "I changed async flow.",
@@ -718,10 +718,9 @@ def _build_ai_user_prompt(repo_label: str, diff_text: str, repo_path: str | None
         f"Repository: {repo_label}\n"
         f"Likely changed files: {preferred_paths}\n"
         "Review this diff and answer with JSON only. "
-        "Use keys who, what, where, when, why, and how. "
+        "Use key thoughts of who, what, where, when, why, and how. "
         "Do not omit any key. If the diff does not provide a field, say 'Not available from the diff.' "
-        "Keep values concise and concrete, and make 'what' a first-person summary of the code changes. "
-        "Prefer concrete wording like 'added a null check', 'restored legacy script cleanup', or 'rewired the page to expose appSec earlier'. "
+        "Keep values concise but detailed to the level given, and make 'what' a first-person summary of the code changes. "
         "In the 'what' field, name at least one concrete anchor from the diff when available: a function, class, field, import, config key, path, route, selector, or literal label. "
         "If the change digest shows an anchor, reuse that anchor explicitly instead of paraphrasing it away. "
         "Do not mention line counts, generic implementation-quality phrases, or wording like 'changing code around'. "

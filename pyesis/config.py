@@ -83,7 +83,7 @@ class AppConfig:
     github_auth_endpoint: str = ""
     github_oauth_client_id: str = ""
     summary_enhancer_enabled: bool = True
-    summary_enhancer_interval_minutes: int = 1
+    summary_enhancer_interval_minutes: int = 5
     summary_enhancer_dry_run: bool = True
     summary_enhancer_aggressive_prodding: bool = False
     summary_enhancer_last_run_at: str = ""

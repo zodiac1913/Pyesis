@@ -226,6 +226,7 @@ class PyesisApp:
         self._poll_results: list[SnapshotCaptureResult] = []
         self._poll_captured_count = 0
         self._poll_errors: list[str] = []
+        self._enhancer_in_flight = False
         self._ai_backend_unavailable = False
         self._ai_last_warning = ""
         self._buffer_day = datetime.now().strftime("%Y-%m-%d")
@@ -1895,7 +1896,8 @@ class PyesisApp:
         self.root.after(self._next_poll_interval_ms(), self._scheduled_poll)
 
     def _schedule_enhancer_tick(self) -> None:
-        self.root.after(60_000, self._scheduled_enhancer_tick)
+        interval_minutes = max(5, int(self.config.summary_enhancer_interval_minutes))
+        self.root.after(interval_minutes * 60_000, self._scheduled_enhancer_tick)
 
     def _scheduled_enhancer_tick(self) -> None:
         self._run_periodic_summary_enhancer()
@@ -2217,10 +2219,17 @@ class PyesisApp:
 
         return False
 
-    def _capture_repo_snapshot_change(self, repo: RepoConfig, snapshot: DiffSnapshot) -> bool:
+    def _capture_repo_snapshot_change(self, repo: RepoConfig, snapshot: DiffSnapshot | None) -> bool:
+        if snapshot is None:
+            return False
+
+        diff_text = snapshot.diff_text.strip()
+        if not diff_text:
+            return False
+
         captured = False
 
-        for file_path, file_diff_text in split_diff_by_file(snapshot.diff_text):
+        for file_path, file_diff_text in split_diff_by_file(diff_text):
             summary_text, already_shown, author, summary_source = self._resolve_summary_from_ledger(repo, file_diff_text)
             if already_shown:
                 continue
@@ -2257,8 +2266,15 @@ class PyesisApp:
                 errors.append(f"{repo.label}: {exc}")
                 continue
 
-            if self._capture_repo_snapshot_change(repo, snapshot):
-                captured += 1
+            if snapshot is None:
+                continue
+
+            try:
+                if self._capture_repo_snapshot_change(repo, snapshot):
+                    captured += 1
+            except Exception as exc:
+                errors.append(f"{repo.label}: capture failed: {exc}")
+                continue
 
         self._poll_captured_count = captured
         self._poll_errors = errors
@@ -2304,12 +2320,21 @@ class PyesisApp:
         else:
             self.status_var.set(f"No new diffs at {now_time}")
 
-        self._run_periodic_summary_enhancer()
-
         self._reset_poll_state()
 
     def _run_periodic_summary_enhancer(self) -> None:
-        report = run_periodic_enhancer(self.config)
+        if self._enhancer_in_flight:
+            return
+
+        self._enhancer_in_flight = True
+        try:
+            report = run_periodic_enhancer(self.config)
+        except Exception as exc:
+            self.status_var.set(f"Summary enhancer error: {exc}")
+            return
+        finally:
+            self._enhancer_in_flight = False
+
         if not report.ran:
             return
         if report.total_rewritten:
