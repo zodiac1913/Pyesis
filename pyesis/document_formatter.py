@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -18,6 +19,12 @@ DAY_ORDER = [
     "Saturday",
     "Sunday",
 ]
+
+
+@dataclass(frozen=True)
+class RenderedTextChunk:
+    text: str
+    tag: str = ""
 
 
 def _active_week_start(now: datetime | None = None) -> datetime:
@@ -54,41 +61,53 @@ def _group_entries_by_repo(entries: list[EntryRecord]) -> dict[str, list[EntryRe
 
 
 def render_plain_text(config: AppConfig) -> str:
+    return "".join(chunk.text for chunk in render_text_chunks(config)).rstrip("\n") + "\n"
+
+
+def render_text_chunks(config: AppConfig) -> list[RenderedTextChunk]:
     active_week_start_iso, active_week_entries = _active_week_entries(config.entries)
-    blocks: list[str] = []
+    chunks: list[RenderedTextChunk] = []
 
-    _append_week_header(blocks, active_week_start_iso, config.week_end_day)
+    _append_week_header(chunks, active_week_start_iso, config.week_end_day)
     if active_week_entries:
-        _append_week_entries(blocks, active_week_entries)
+        _append_week_entries(chunks, active_week_entries)
 
-    return "\n".join(blocks).strip() + "\n"
+    return chunks
 
 
-def _append_week_header(blocks: list[str], week_start_iso: str, week_end_day: str) -> None:
+def _append_week_header(chunks: list[RenderedTextChunk], week_start_iso: str, week_end_day: str) -> None:
     week_start = datetime.fromisoformat(week_start_iso)
     week_end = _week_end_date(week_start, week_end_day)
-    blocks.extend(["", "", "", "", "", ""])
-    blocks.append(f"({week_end.strftime('%Y %b %d')})")
-    blocks.append("What I worked on for this week:")
-    blocks.append("")
+    chunks.extend(RenderedTextChunk("\n") for _ in range(6))
+    chunks.append(RenderedTextChunk(f"({week_end.strftime('%Y %b %d')})\n"))
+    chunks.append(RenderedTextChunk("What I worked on for this week:\n"))
+    chunks.append(RenderedTextChunk("\n"))
 
 
-def _append_week_entries(blocks: list[str], day_map: dict[str, list[EntryRecord]]) -> None:
+def _append_week_entries(chunks: list[RenderedTextChunk], day_map: dict[str, list[EntryRecord]]) -> None:
     for day_name in DAY_ORDER:
         entries = day_map.get(day_name)
         if not entries:
             continue
-        blocks.append(f"@{day_name}")
-        _append_day_repo_entries(blocks, entries)
-        blocks.append("")
+        chunks.append(RenderedTextChunk(f"@{day_name}\n"))
+        _append_day_repo_entries(chunks, entries)
+        chunks.append(RenderedTextChunk("\n"))
 
 
-def _append_day_repo_entries(blocks: list[str], entries: list[EntryRecord]) -> None:
+def _append_day_repo_entries(chunks: list[RenderedTextChunk], entries: list[EntryRecord]) -> None:
     for repo_label, repo_entries in _group_entries_by_repo(entries).items():
-        blocks.append(f"\t• {repo_label}:")
+        chunks.append(RenderedTextChunk(f"\t• {repo_label}:\n"))
         for entry in repo_entries:
+            tag = "heuristic" if _is_heuristic_entry(entry) else ""
             for line in _summary_lines(entry.summary):
-                blocks.append(f"\t\t• {line}")
+                chunks.append(RenderedTextChunk(f"\t\t• {line}\n", tag=tag))
+
+
+def _is_heuristic_entry(entry: EntryRecord) -> bool:
+    source = (entry.summary_source or "").strip().lower()
+    if source:
+        return source == "heuristic"
+    return entry.author == "Backup"
 
 
 def export_docx(config: AppConfig, output_dir: Path, file_name: str | None = None) -> Path:

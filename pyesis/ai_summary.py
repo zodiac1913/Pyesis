@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+from time import perf_counter
 from urllib import error, request
 
 from pyesis.git_monitor import FileChangeSummary, summarize_file_changes
@@ -107,6 +108,8 @@ class AISummaryResult:
     requested_source: str = ""
     warning: str = ""
     fallback_source: str = ""
+    timing_ms: int = 0
+    provider_details: str = ""
 
     @property
     def used_fallback(self) -> bool:
@@ -124,6 +127,13 @@ class StructuredSummary:
 
     def to_text(self) -> str:
         return _compose_description(self)
+
+
+@dataclass(frozen=True)
+class ProviderStructuredSummary:
+    structured: StructuredSummary
+    timing_ms: int = 0
+    provider_details: str = ""
 
 
 def build_summary(
@@ -170,11 +180,13 @@ def _build_provider_summary(
     allow_fallback: bool,
 ) -> AISummaryResult:
     try:
-        structured = builder(repo_label, diff_text, repo_path)
+        provider_summary = builder(repo_label, diff_text, repo_path)
         return AISummaryResult(
-            text=structured.to_text(),
+            text=provider_summary.structured.to_text(),
             source=provider,
             requested_source=provider,
+            timing_ms=provider_summary.timing_ms,
+            provider_details=provider_summary.provider_details,
         )
     except Exception as exc:
         if not allow_fallback:
@@ -1378,7 +1390,7 @@ def _chat_completions_structured_summary(
     api_key: str,
     timeout: int,
     missing_error: str,
-) -> StructuredSummary:
+) -> ProviderStructuredSummary:
     if not url or not model:
         raise RuntimeError(missing_error)
 
@@ -1400,6 +1412,7 @@ def _chat_completions_structured_summary(
         headers["Authorization"] = f"Bearer {api_key}"
 
     req = request.Request(url, data=body, headers=headers, method="POST")
+    started_at = perf_counter()
     try:
         with request.urlopen(req, timeout=timeout) as response:
             data = json.loads(response.read().decode("utf-8"))
@@ -1407,7 +1420,11 @@ def _chat_completions_structured_summary(
         raise RuntimeError(str(exc)) from exc
 
     content = data["choices"][0]["message"]["content"].strip()
-    return _structured_summary_from_json(_parse_ai_json_payload(content), changes, repo_label)
+    return ProviderStructuredSummary(
+        structured=_structured_summary_from_json(_parse_ai_json_payload(content), changes, repo_label),
+        timing_ms=int(round((perf_counter() - started_at) * 1000)),
+        provider_details=model,
+    )
 
 
 def _openai_compatible_structured_summary(repo_label: str, diff_text: str, repo_path: str | None = None) -> StructuredSummary:
@@ -1453,7 +1470,7 @@ def _ollama_request_structured_summary(
     url: str,
     model: str,
     keep_alive: str,
-) -> StructuredSummary:
+) -> ProviderStructuredSummary:
     changes = _summary_relevant_changes(_coalesce_changes(summarize_file_changes(diff_text)))
 
     payload = {
@@ -1474,20 +1491,26 @@ def _ollama_request_structured_summary(
     headers = {"Content-Type": "application/json"}
 
     req = request.Request(url, data=body, headers=headers, method="POST")
+    started_at = perf_counter()
     try:
         with request.urlopen(req, timeout=45) as response:
             data = json.loads(response.read().decode("utf-8"))
     except error.URLError as exc:
-        raise RuntimeError(str(exc)) from exc
+        elapsed_ms = int(round((perf_counter() - started_at) * 1000))
+        raise RuntimeError(f"{exc} ({elapsed_ms} ms)") from exc
 
     message = data.get("message", {})
     content = str(message.get("content", "")).strip()
     if not content:
         raise RuntimeError(f"Empty Ollama response for model {model}")
-    return _structured_summary_from_json(_parse_ai_json_payload(content), changes, repo_label)
+    return ProviderStructuredSummary(
+        structured=_structured_summary_from_json(_parse_ai_json_payload(content), changes, repo_label),
+        timing_ms=int(round((perf_counter() - started_at) * 1000)),
+        provider_details=model,
+    )
 
 
-def _ollama_structured_summary(repo_label: str, diff_text: str, repo_path: str | None = None) -> StructuredSummary:
+def _ollama_structured_summary(repo_label: str, diff_text: str, repo_path: str | None = None) -> ProviderStructuredSummary:
     url = os.getenv("PYESIS_OLLAMA_URL", "http://localhost:11434/api/chat").strip()
     model = os.getenv("PYESIS_OLLAMA_MODEL", DEFAULT_OLLAMA_SUMMARY_MODEL).strip()
     keep_alive = os.getenv("PYESIS_OLLAMA_KEEP_ALIVE", "5m").strip()

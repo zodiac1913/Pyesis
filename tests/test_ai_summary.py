@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import unittest
 from unittest.mock import patch
 
 from pyesis.ai_summary import (
+    ProviderStructuredSummary,
     _build_ai_user_prompt,
     _coalesce_changes,
     _ollama_model_candidates,
@@ -106,17 +108,21 @@ class AISummaryTests(unittest.TestCase):
             del repo_label, passed_diff, repo_path, url, keep_alive
             if model == "broken-model":
                 raise RuntimeError("model offline")
-            return _structured_summary_from_json(
-                {
-                    "who": "I",
-                    "what": "I added summarySource in pyesis/diff_buffer.py",
-                    "where": "pyesis/diff_buffer.py",
-                    "when": "Not available from the diff.",
-                    "why": "track summary source metadata",
-                    "how": "adding the summarySource field",
-                },
-                _coalesce_changes(summarize_file_changes(diff_text)),
-                "Pyesis",
+            return ProviderStructuredSummary(
+                structured=_structured_summary_from_json(
+                    {
+                        "who": "I",
+                        "what": "I added summarySource in pyesis/diff_buffer.py",
+                        "where": "pyesis/diff_buffer.py",
+                        "when": "Not available from the diff.",
+                        "why": "track summary source metadata",
+                        "how": "adding the summarySource field",
+                    },
+                    _coalesce_changes(summarize_file_changes(diff_text)),
+                    "Pyesis",
+                ),
+                timing_ms=1234,
+                provider_details=model,
             )
 
         with patch("pyesis.ai_summary._ollama_request_structured_summary", side_effect=fake_request):
@@ -131,7 +137,58 @@ class AISummaryTests(unittest.TestCase):
             ):
                 summary = _ollama_structured_summary("Pyesis", diff_text, "/tmp/repo")
 
-        self.assertIn("summarySource", summary.to_text())
+        self.assertIn("summarySource", summary.structured.to_text())
+
+    def test_build_summary_records_ollama_timing_and_model(self) -> None:
+        diff_text = (
+            "diff --git a/pyesis/diff_buffer.py b/pyesis/diff_buffer.py\n"
+            "+++ b/pyesis/diff_buffer.py\n"
+            "@@ -1,5 +1,6 @@\n"
+            " class DiffLedgerItem(TypedDict):\n"
+            "+    summarySource: str\n"
+            "     rewrittenBy: str\n"
+        )
+
+        response_payload = {
+            "message": {
+                "content": json.dumps(
+                    {
+                        "who": "I",
+                        "what": "I added summarySource in pyesis/diff_buffer.py",
+                        "where": "pyesis/diff_buffer.py",
+                        "when": "Not available from the diff.",
+                        "why": "track summary source metadata",
+                        "how": "adding the summarySource field",
+                    }
+                )
+            }
+        }
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return json.dumps(response_payload).encode("utf-8")
+
+        with patch("pyesis.ai_summary.request.urlopen", return_value=FakeResponse()):
+            with patch.dict(
+                "os.environ",
+                {
+                    "PYESIS_OLLAMA_URL": "http://localhost:11434/api/chat",
+                    "PYESIS_OLLAMA_MODEL": "qwen3-coder:30b",
+                    "PYESIS_OLLAMA_KEEP_ALIVE": "5m",
+                },
+                clear=False,
+            ):
+                result = build_summary("Pyesis", diff_text, repo_path="/tmp/repo", mode="ollama")
+
+        self.assertEqual(result.source, "ollama")
+        self.assertEqual(result.provider_details, "qwen3-coder:30b")
+        self.assertGreaterEqual(result.timing_ms, 0)
 
 
 if __name__ == "__main__":

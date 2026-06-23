@@ -44,8 +44,8 @@ from pyesis.config import (
     load_config,
     save_config,
 )
-from pyesis.diff_buffer import find_item, mark_as_shown, purge_old_daily_buffers, remember_diff
-from pyesis.document_formatter import export_docx, render_plain_text
+from pyesis.diff_buffer import BUFFER_DIR, find_item, mark_as_shown, purge_old_daily_buffers, remember_diff
+from pyesis.document_formatter import export_docx, render_plain_text, render_text_chunks
 from pyesis.github_auth import (
     GITHUB_DOTCOM_AUTH_MODE,
     GITHUB_ENTERPRISE_AUTH_MODE,
@@ -73,6 +73,9 @@ PYESIS_GITHUB_URL = "https://github.com/cms-enterprise/Pyesis"
 MOUSEWHEEL_EVENT = "<MouseWheel>"
 VSCODE_OLLAMA_AUTOCODER_MODEL_SETTING = "ollama-autocoder.model"
 DEFAULT_OLLAMA_SUMMARY_MODEL = "qwen3-coder:30b"
+OLLAMA_IDLE_STATUS = "[IDLE] Ollama has no active description job"
+POLL_REWRITE_LIMIT = 8
+BACKLOG_POLL_SECONDS = 15
 
 
 def _ollama_tags_url(base_url: str) -> str:
@@ -211,6 +214,8 @@ class PyesisApp:
         self.status_var = tk.StringVar(value="Idle")
         self._ai_status_severity = self._initial_ai_status_severity()
         self.ai_status_var = tk.StringVar(value=self._initial_ai_status_text())
+        self.ollama_activity_var = tk.StringVar(value=OLLAMA_IDLE_STATUS)
+        self.poll_summary_var = tk.StringVar(value="Last poll summary will appear here")
         self.week_end_var = tk.StringVar(value=self.config.week_end_day)
         self.theme_mode_var = tk.StringVar(value=self.config.theme_mode.capitalize())
         self.high_contrast_var = tk.BooleanVar(value=self.config.high_contrast)
@@ -226,8 +231,11 @@ class PyesisApp:
         self._poll_results: list[SnapshotCaptureResult] = []
         self._poll_captured_count = 0
         self._poll_errors: list[str] = []
+        self._poll_enhancement_report = None
+        self._poll_enhancement_error = ""
         self._enhancer_in_flight = False
         self._ai_backend_unavailable = False
+        self._ai_recovery_probe_in_flight = False
         self._ai_last_warning = ""
         self._buffer_day = datetime.now().strftime("%Y-%m-%d")
         purge_old_daily_buffers(7, self._buffer_day)
@@ -244,7 +252,6 @@ class PyesisApp:
         self._refresh_editor()
         self._maybe_auto_export_daily()
         self._schedule_poll()
-        self._schedule_enhancer_tick()
 
     def _set_windows_app_id(self) -> None:
         if os.name != "nt":
@@ -592,13 +599,21 @@ class PyesisApp:
         ttk.Button(sidebar, text="Edit Entry", underline=0, command=self._open_entry_editor).grid(row=16, column=0, sticky="ew", pady=(6, 0))
         ttk.Label(sidebar, text="AI status").grid(row=17, column=0, sticky="w", pady=(12, 2))
         ttk.Label(sidebar, textvariable=self.ai_status_var, style="AIStatus.TLabel", wraplength=260).grid(row=18, column=0, sticky="ew")
-        ttk.Label(sidebar, textvariable=self.status_var, wraplength=260).grid(row=19, column=0, sticky="ew", pady=(12, 0))
+        ttk.Label(sidebar, textvariable=self.ollama_activity_var, style="OllamaActivity.TLabel", wraplength=260).grid(row=19, column=0, sticky="ew", pady=(8, 0))
+        ttk.Label(sidebar, text="Last poll").grid(row=20, column=0, sticky="w", pady=(12, 2))
+        ttk.Label(sidebar, textvariable=self.poll_summary_var, style="PollSummary.TLabel", wraplength=260).grid(row=21, column=0, sticky="ew")
+        ttk.Label(sidebar, textvariable=self.status_var, wraplength=260).grid(row=22, column=0, sticky="ew", pady=(12, 0))
 
         editor_header = ttk.Frame(editor_area)
         editor_header.grid(row=0, column=0, sticky="ew")
         editor_header.columnconfigure(0, weight=1)
 
         ttk.Label(editor_header, text="Weekly Work Log Preview").grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            editor_header,
+            text="● Orange text marks heuristic summaries awaiting AI rewrite",
+            style="HeuristicLegend.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
 
         github_button = ttk.Button(editor_header, text="🐙 GitHub", underline=2, width=10, command=self._open_github_repo)
         github_button.grid(row=0, column=1, sticky="e", padx=(0, 6))
@@ -1644,6 +1659,9 @@ class PyesisApp:
         self.style.configure("TLabel", background=palette["bg"], foreground=palette["fg"])
         ai_fg = "#d13438" if self._ai_status_severity == "degraded" else "#107c10"
         self.style.configure("AIStatus.TLabel", background=palette["bg"], foreground=ai_fg)
+        self.style.configure("OllamaActivity.TLabel", background=palette["bg"], foreground=palette["muted_fg"])
+        self.style.configure("PollSummary.TLabel", background=palette["bg"], foreground=palette["muted_fg"])
+        self.style.configure("HeuristicLegend.TLabel", background=palette["bg"], foreground=palette["heuristic_fg"])
         self.style.configure("TButton", background=palette["surface"], foreground=palette["fg"])
         self.style.map(
             "TButton",
@@ -1698,6 +1716,7 @@ class PyesisApp:
             highlightbackground=palette["surface"],
             highlightcolor=palette["surface"],
         )
+        self.editor.tag_configure("heuristic", foreground=palette["heuristic_fg"])
         if self._editor_bg_canvas is not None:
             self._editor_bg_canvas.configure(bg=palette["surface"])
 
@@ -1713,6 +1732,7 @@ class PyesisApp:
                 "accent": "#ffff00",
                 "accent_fg": "#000000",
                 "border": "#ffffff",
+                "heuristic_fg": "#ff8c00",
             }
         if resolved_theme == "dark":
             return {
@@ -1725,6 +1745,7 @@ class PyesisApp:
                 "accent": "#3b82f6",
                 "accent_fg": "#ffffff",
                 "border": "#384353",
+                "heuristic_fg": "#ff9f1a",
             }
         return {
             "bg": "#f4f6f8",
@@ -1736,6 +1757,7 @@ class PyesisApp:
             "accent": "#0d6efd",
             "accent_fg": "#ffffff",
             "border": "#b8c4d2",
+            "heuristic_fg": "#d96a00",
         }
 
     def _apply_fonts(self) -> None:
@@ -1890,24 +1912,55 @@ class PyesisApp:
 
     def _refresh_editor(self) -> None:
         self.editor.delete("1.0", tk.END)
-        self.editor.insert("1.0", render_plain_text(self.config) if self.config.entries else "")
+        if not self.config.entries:
+            return
+        for chunk in render_text_chunks(self.config):
+            tags = (chunk.tag,) if chunk.tag else ()
+            self.editor.insert(tk.END, chunk.text, tags)
 
     def _schedule_poll(self) -> None:
         self.root.after(self._next_poll_interval_ms(), self._scheduled_poll)
-
-    def _schedule_enhancer_tick(self) -> None:
-        interval_minutes = max(5, int(self.config.summary_enhancer_interval_minutes))
-        self.root.after(interval_minutes * 60_000, self._scheduled_enhancer_tick)
-
-    def _scheduled_enhancer_tick(self) -> None:
-        self._run_periodic_summary_enhancer()
-        self._schedule_enhancer_tick()
 
     def _next_poll_interval_ms(self) -> int:
         if not self.config.repos:
             return 60_000
         seconds = min(max(5, int(repo.poll_seconds)) for repo in self.config.repos)
+        if self._has_current_week_heuristic_backlog() and self._current_ai_mode() != HEURISTIC_MODE:
+            seconds = min(seconds, BACKLOG_POLL_SECONDS)
         return seconds * 1000
+
+    def _has_current_week_heuristic_backlog(self) -> bool:
+        active_week = datetime.now().isocalendar()[:2]
+        for entry in self.config.entries:
+            if (entry.summary_source or "").strip().lower() != HEURISTIC_MODE:
+                continue
+            created_at = entry.created_at.strip()
+            try:
+                entry_week = datetime.fromisoformat(created_at).isocalendar()[:2]
+            except ValueError:
+                continue
+            if entry_week == active_week:
+                return True
+        for buffer_file in sorted(BUFFER_DIR.glob("*.json")):
+            try:
+                items = json.loads(buffer_file.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("summarySource", "")).strip().lower() != HEURISTIC_MODE:
+                    continue
+                timestamp = str(item.get("datetime", "")).strip()
+                try:
+                    item_week = datetime.fromisoformat(timestamp).isocalendar()[:2]
+                except ValueError:
+                    continue
+                if item_week == active_week:
+                    return True
+        return False
 
     def _scheduled_poll(self) -> None:
         self.run_poll_once()
@@ -2256,9 +2309,47 @@ class PyesisApp:
 
         return captured
 
+    def _make_poll_rewrite_gate(self, handled_repos: dict[str, int]):
+        def rewrite_gate(repo_label: str, _repo_path: str | None) -> bool:
+            handled_count = handled_repos.get(repo_label, 0)
+            if handled_count >= POLL_REWRITE_LIMIT:
+                return False
+            handled_repos[repo_label] = handled_count + 1
+            return True
+
+        return rewrite_gate
+
+    def _set_ollama_activity(self, message: str) -> None:
+        self.root.after(0, lambda text=message: self.ollama_activity_var.set(text))
+
+    def _poll_activity_callback(self, repo_label: str, _repo_path: str | None, is_starting: bool) -> None:
+        if self._current_ai_mode() != OLLAMA_MODE:
+            return
+        if is_starting:
+            self._set_ollama_activity(f"[BUSY] Ollama is handling 1 item for {repo_label}")
+            return
+        self._set_ollama_activity(OLLAMA_IDLE_STATUS)
+
+    def _run_poll_enhancer(self, rewrite_gate):
+        try:
+            return run_periodic_enhancer(
+                self.config,
+                force_run=True,
+                rewrite_gate=rewrite_gate,
+                activity_callback=self._poll_activity_callback,
+                aggressive_prodding_override=self._current_ai_mode() != HEURISTIC_MODE,
+            ), ""
+        except Exception as exc:
+            return None, str(exc)
+        finally:
+            self._set_ollama_activity(OLLAMA_IDLE_STATUS)
+
     def _poll_worker(self, repos: list[RepoConfig]) -> None:
         captured = 0
         errors: list[str] = []
+        handled_repos: dict[str, int] = {}
+        rewrite_gate = self._make_poll_rewrite_gate(handled_repos)
+
         for repo in repos:
             try:
                 snapshot = capture_snapshot(repo)
@@ -2276,8 +2367,12 @@ class PyesisApp:
                 errors.append(f"{repo.label}: capture failed: {exc}")
                 continue
 
+        enhancement_report, enhancement_error = self._run_poll_enhancer(rewrite_gate)
+
         self._poll_captured_count = captured
         self._poll_errors = errors
+        self._poll_enhancement_report = enhancement_report
+        self._poll_enhancement_error = enhancement_error
 
     def _check_poll_worker(self) -> None:
         if self._poll_thread is not None and self._poll_thread.is_alive():
@@ -2302,48 +2397,148 @@ class PyesisApp:
         self._poll_results = []
         self._poll_captured_count = 0
         self._poll_errors = []
+        self._poll_enhancement_report = None
+        self._poll_enhancement_error = ""
 
     def _finish_poll(self) -> None:
         captured = self._poll_captured_count
         errors = list(self._poll_errors)
+        enhancement_report = self._poll_enhancement_report
+        enhancement_error = self._poll_enhancement_error.strip()
 
         now_time = datetime.now().strftime('%H:%M:%S')
-        if captured:
+        if self._poll_has_persistable_updates(captured, enhancement_report):
             self._persist()
-            base = f"Captured {captured} new change summary{'ies' if captured != 1 else ''} at {now_time}"
+            base = self._poll_completion_message(captured, enhancement_report, now_time)
+            self.poll_summary_var.set(base)
             if errors:
                 self.status_var.set(f"{base} ({self._repo_error_count_text(len(errors))})")
             else:
                 self.status_var.set(base)
+        elif enhancement_error:
+            self.poll_summary_var.set(f"Poll at {now_time}: summary enhancer error")
+            self.status_var.set(f"Summary enhancer error: {enhancement_error}")
         elif errors:
+            self.poll_summary_var.set(f"Poll at {now_time}: no new diffs; {self._repo_error_count_text(len(errors))}")
             self.status_var.set(f"No new diffs; {self._repo_error_count_text(len(errors))} during scan")
         else:
+            self.poll_summary_var.set(f"Poll at {now_time}: no new diffs")
             self.status_var.set(f"No new diffs at {now_time}")
+
+        if enhancement_report is not None and enhancement_report.total_rewritten:
+            self._refresh_editor()
+            if self._current_ai_mode() != HEURISTIC_MODE:
+                provider = self._ai_provider_label(self._current_ai_mode())
+                self._ai_backend_unavailable = False
+                self._ai_last_warning = ""
+                self._ai_status_severity = "ok"
+                self.ai_status_var.set(f"[OK] Healthy: {provider} summaries active")
+                self._apply_theme()
+
+        self._start_ai_recovery_probe_if_needed()
 
         self._reset_poll_state()
 
-    def _run_periodic_summary_enhancer(self) -> None:
-        if self._enhancer_in_flight:
+    def _poll_has_persistable_updates(self, captured: int, enhancement_report) -> bool:
+        return bool(captured or (enhancement_report is not None and enhancement_report.total_rewritten))
+
+    def _enhancer_poll_summary(self, enhancement_report) -> str:
+        if enhancement_report is None or not enhancement_report.ran:
+            return ""
+
+        summary = (
+            f"enhancer rewritten {enhancement_report.total_rewritten}, "
+            f"weak {enhancement_report.skipped_weak}, "
+            f"AI unavailable {enhancement_report.skipped_ai_unavailable}"
+        )
+        if enhancement_report.skipped_gated:
+            summary += f", deferred {enhancement_report.skipped_gated}"
+        if enhancement_report.provider_timed_attempts:
+            summary += f", AI avg {enhancement_report.average_provider_ms} ms"
+        if enhancement_report.timed_attempts:
+            summary += f", avg {enhancement_report.average_attempt_ms} ms"
+        return summary
+
+    def _poll_completion_message(self, captured: int, enhancement_report, now_time: str) -> str:
+        summary_bits: list[str] = []
+        if captured:
+            summary_bits.append(f"Captured {captured} new change summary{'ies' if captured != 1 else ''} at {now_time}")
+        if enhancement_report is not None and enhancement_report.total_rewritten:
+            refreshed = enhancement_report.total_rewritten
+            summary_bits.append(f"refreshed {refreshed} heuristic entr{'y' if refreshed == 1 else 'ies'}")
+        enhancer_summary = self._enhancer_poll_summary(enhancement_report)
+        if enhancer_summary:
+            summary_bits.append(enhancer_summary)
+        return "; ".join(summary_bits)
+
+    def _complete_ai_recovery_probe(self, reachable: bool, message: str = "") -> None:
+        self._ai_recovery_probe_in_flight = False
+        if not reachable:
             return
+
+        provider = self._ai_provider_label(OLLAMA_MODE)
+        self._ai_backend_unavailable = False
+        self._ai_last_warning = ""
+        self._ai_status_severity = "ok"
+        self.ai_status_var.set(f"[OK] Healthy: {provider} reachable; retrying summaries")
+        self._apply_theme()
+        if message:
+            self.status_var.set(message)
+
+    def _start_ai_recovery_probe_if_needed(self) -> None:
+        if self._ai_recovery_probe_in_flight:
+            return
+        if not self._ai_backend_unavailable:
+            return
+        if self._current_ai_mode() != OLLAMA_MODE:
+            return
+
+        self._ai_recovery_probe_in_flight = True
+        base_url = self.config.ai_ollama_url.strip()
+
+        def worker() -> None:
+            try:
+                names = self._fetch_ollama_model_names(base_url)
+            except Exception:
+                self.root.after(0, lambda: self._complete_ai_recovery_probe(False))
+                return
+
+            detail = "Ollama reachable again; retrying current-week heuristic summaries"
+            self.root.after(0, lambda: self._complete_ai_recovery_probe(bool(names), detail))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _run_periodic_summary_enhancer(self, *, force_run: bool = False, update_status: bool = True):
+        if self._enhancer_in_flight:
+            return None
 
         self._enhancer_in_flight = True
         try:
-            report = run_periodic_enhancer(self.config)
+            report = run_periodic_enhancer(self.config, force_run=force_run)
         except Exception as exc:
             self.status_var.set(f"Summary enhancer error: {exc}")
-            return
+            return None
         finally:
             self._enhancer_in_flight = False
 
         if not report.ran:
-            return
-        if report.total_rewritten:
+            return report
+        if report.total_rewritten and update_status:
             mode_label = "dry-run" if report.dry_run else "live"
             self._refresh_editor()
+            self.poll_summary_var.set(self._enhancer_poll_summary(report))
             self.status_var.set(
                 f"Summary enhancer ({mode_label}) rewrote {report.total_rewritten} entries "
-                f"(state={report.rewritten_state}, buffer={report.rewritten_buffer})"
+                f"(state={report.rewritten_state}, buffer={report.rewritten_buffer}); "
+                f"{self._enhancer_poll_summary(report)}"
             )
+        elif update_status and report.ran:
+            self.poll_summary_var.set(self._enhancer_poll_summary(report))
+            self.status_var.set(f"Summary enhancer scanned current-week entries; {self._enhancer_poll_summary(report)}")
+        elif report.total_rewritten:
+            self._refresh_editor()
+
+        return report
 
     def run_poll_once(self) -> None:
         if self._poll_in_flight:

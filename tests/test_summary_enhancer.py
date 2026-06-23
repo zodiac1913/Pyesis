@@ -8,6 +8,7 @@ import unittest
 import os
 from unittest.mock import patch
 
+from pyesis.ai_summary import AISummaryResult
 from pyesis.config import AppConfig, EntryRecord
 from pyesis.summary_enhancer import run_periodic_enhancer
 
@@ -180,6 +181,7 @@ class SummaryEnhancerTests(unittest.TestCase):
             self.assertIn("Removed obsolete DAM compile exclusion", config.entries[0].summary)
             self.assertEqual(config.entries[0].diff_hash, original_hash)
             self.assertEqual(config.entries[0].diff_excerpt, diff_text)
+            self.assertEqual(config.entries[0].summary_source, "heuristic")
             self.assertEqual(config.entries[0].rewritten_by, "EnhancerTest")
             self.assertTrue(config.entries[0].rewritten_at)
 
@@ -190,8 +192,81 @@ class SummaryEnhancerTests(unittest.TestCase):
             self.assertEqual(updated_items[0]["gitDiffText"], diff_text)
             self.assertEqual(updated_items[0]["diffHash"], original_hash)
             self.assertIn("DAM compile exclusion", updated_items[0]["gitDiffDescription"])
+            self.assertEqual(updated_items[0]["summarySource"], "heuristic")
             self.assertEqual(updated_items[0]["rewrittenBy"], "EnhancerTest")
             self.assertTrue(updated_items[0]["rewrittenAt"])
+
+    def test_non_weak_heuristic_entries_upgrade_to_ollama_when_available(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp = Path(tmp_dir)
+            buffer_dir = tmp / "diff_buffers"
+            buffer_dir.mkdir(parents=True, exist_ok=True)
+            buffer_path = buffer_dir / "2026-06-16.json"
+
+            diff_text = "diff --git a/f.py b/f.py\n+++ b/f.py\n@@ -0,0 +1 @@\n+print('force-ai')\n"
+            buffer_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "datetime": "2026-06-16T12:00:00",
+                            "repo": "RepoForceAI",
+                            "gitDiffText": diff_text,
+                            "gitDiffDescription": "Implemented deterministic startup initialization with explicit focus and launch sequencing to reduce race conditions.",
+                            "shown": False,
+                            "diffHash": "forcehash",
+                            "repoPath": "repos/repo-force-ai",
+                            "author": "Backup",
+                            "summarySource": "heuristic",
+                        }
+                    ],
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            entry = EntryRecord(
+                repo_label="RepoForceAI",
+                repo_path="repos/repo-force-ai",
+                created_at="2026-06-16T12:00:00",
+                day_name="Monday",
+                week_start_iso="2026-06-15T00:00:00",
+                summary="Implemented deterministic startup initialization with explicit focus and launch sequencing to reduce race conditions.",
+                diff_hash="forcehash",
+                diff_excerpt=diff_text,
+                summary_source="heuristic",
+                author="Backup",
+            )
+
+            config = self._base_config()
+            config.summary_enhancer_dry_run = False
+            config.ai_mode = "ollama"
+            config.ai_ollama_model = "qwen3-coder:30b"
+            config.entries = [entry]
+
+            def fake_builder(_repo, _diff, _path):
+                from pyesis.ai_summary import AISummaryResult
+
+                return AISummaryResult(
+                    text="I added an Ollama-backed rewrite that explains the deterministic startup path and why the launch sequencing was tightened.",
+                    source="ollama",
+                )
+
+            report = run_periodic_enhancer(
+                config,
+                summary_builder=fake_builder,
+                buffer_dir=buffer_dir,
+                now=datetime(2026, 6, 16, 12, 30, 0),
+            )
+
+            self.assertTrue(report.ran)
+            self.assertEqual(report.rewritten_state, 1)
+            self.assertEqual(report.rewritten_buffer, 1)
+            self.assertEqual(config.entries[0].summary_source, "ollama")
+            self.assertEqual(config.entries[0].author, "AI")
+
+            updated_items = json.loads(buffer_path.read_text(encoding="utf-8"))
+            self.assertEqual(updated_items[0]["summarySource"], "ollama")
+            self.assertEqual(updated_items[0]["author"], "AI")
 
     def test_interval_guard_skips_run(self) -> None:
         config = self._base_config()
@@ -205,6 +280,39 @@ class SummaryEnhancerTests(unittest.TestCase):
         )
 
         self.assertFalse(report.ran)
+
+    def test_force_run_bypasses_interval_guard(self) -> None:
+        entry = EntryRecord(
+            repo_label="RepoForced",
+            repo_path="repos/repo-forced",
+            created_at="2026-06-16T09:00:00",
+            day_name="Monday",
+            week_start_iso="2026-06-15T00:00:00",
+            summary="made updates",
+            diff_hash="forceinterval",
+            diff_excerpt="diff --git a/force.py b/force.py\n+++ b/force.py\n@@ -0,0 +1 @@\n+print('forced')\n",
+            summary_source="heuristic",
+            author="Backup",
+        )
+
+        config = self._base_config()
+        config.summary_enhancer_dry_run = False
+        forced_now = datetime(2026, 6, 16, 12, 30, 0)
+        config.summary_enhancer_last_run_at = (forced_now - timedelta(seconds=10)).isoformat(timespec="seconds")
+        config.ai_mode = "ollama"
+        config.ai_ollama_model = "qwen3-coder:30b"
+        config.entries = [entry]
+
+        report = run_periodic_enhancer(
+            config,
+            summary_builder=lambda _repo, _diff, _path: "Forced rewrite documented the exact print path update and why it was retried immediately.",
+            now=forced_now,
+            force_run=True,
+        )
+
+        self.assertTrue(report.ran)
+        self.assertEqual(report.rewritten_state, 0)
+        self.assertEqual(config.entries[0].rewritten_at, "")
 
     def test_week_freezes_after_export_cutoff(self) -> None:
         config = self._base_config()
@@ -537,6 +645,425 @@ class SummaryEnhancerTests(unittest.TestCase):
             config.entries[0].summary,
             "Recast startup sequencing to document focus orchestration and deterministic launch ordering.",
         )
+
+    def test_aggressive_override_rewrites_non_weak_current_week_entries(self) -> None:
+        entry = EntryRecord(
+            repo_label="RepoAggressiveOverride",
+            repo_path="repos/repo-aggressive-override",
+            created_at="2026-06-16T09:10:00",
+            day_name="Monday",
+            week_start_iso="2026-06-15T00:00:00",
+            summary="Implemented deterministic startup initialization with explicit focus and launch sequencing to reduce race conditions.",
+            diff_hash="agg-override-hash",
+            diff_excerpt="diff --git a/a.py b/a.py\n+++ b/a.py\n@@ -0,0 +1 @@\n+print('aggressive-override')\n",
+            summary_source="heuristic",
+            author="Backup",
+        )
+
+        config = self._base_config()
+        config.summary_enhancer_dry_run = False
+        config.entries = [entry]
+
+        report = run_periodic_enhancer(
+            config,
+            summary_builder=lambda _repo, _diff, _path: "Recast startup sequencing to document focus orchestration and deterministic launch ordering.",
+            now=datetime(2026, 6, 16, 11, 45, 0),
+            aggressive_prodding_override=True,
+        )
+
+        self.assertTrue(report.ran)
+        self.assertEqual(report.rewritten_state, 1)
+        self.assertEqual(
+            config.entries[0].summary,
+            "Recast startup sequencing to document focus orchestration and deterministic launch ordering.",
+        )
+
+    def test_rewrite_gate_limits_eight_items_per_repo(self) -> None:
+        first_entry = EntryRecord(
+            repo_label="RepoLimited",
+            repo_path="repos/repo-limited",
+            created_at="2026-06-16T09:10:00",
+            day_name="Monday",
+            week_start_iso="2026-06-15T00:00:00",
+            summary="made updates",
+            diff_hash="limit-1",
+            diff_excerpt="diff --git a/a.py b/a.py\n+++ b/a.py\n@@ -0,0 +1 @@\n+print('one')\n",
+            summary_source="heuristic",
+            author="Backup",
+        )
+        second_entry = EntryRecord(
+            repo_label="RepoLimited",
+            repo_path="repos/repo-limited",
+            created_at="2026-06-16T09:12:00",
+            day_name="Monday",
+            week_start_iso="2026-06-15T00:00:00",
+            summary="made updates",
+            diff_hash="limit-2",
+            diff_excerpt="diff --git a/b.py b/b.py\n+++ b/b.py\n@@ -0,0 +1 @@\n+print('two')\n",
+            summary_source="heuristic",
+            author="Backup",
+        )
+        third_entry = EntryRecord(
+            repo_label="RepoLimited",
+            repo_path="repos/repo-limited",
+            created_at="2026-06-16T09:14:00",
+            day_name="Monday",
+            week_start_iso="2026-06-15T00:00:00",
+            summary="made updates",
+            diff_hash="limit-3",
+            diff_excerpt="diff --git a/c.py b/c.py\n+++ b/c.py\n@@ -0,0 +1 @@\n+print('three')\n",
+            summary_source="heuristic",
+            author="Backup",
+        )
+        fourth_entry = EntryRecord(
+            repo_label="RepoLimited",
+            repo_path="repos/repo-limited",
+            created_at="2026-06-16T09:16:00",
+            day_name="Monday",
+            week_start_iso="2026-06-15T00:00:00",
+            summary="made updates",
+            diff_hash="limit-4",
+            diff_excerpt="diff --git a/d.py b/d.py\n+++ b/d.py\n@@ -0,0 +1 @@\n+print('four')\n",
+            summary_source="heuristic",
+            author="Backup",
+        )
+        fifth_entry = EntryRecord(
+            repo_label="RepoLimited",
+            repo_path="repos/repo-limited",
+            created_at="2026-06-16T09:18:00",
+            day_name="Monday",
+            week_start_iso="2026-06-15T00:00:00",
+            summary="made updates",
+            diff_hash="limit-5",
+            diff_excerpt="diff --git a/e.py b/e.py\n+++ b/e.py\n@@ -0,0 +1 @@\n+print('five')\n",
+            summary_source="heuristic",
+            author="Backup",
+        )
+        sixth_entry = EntryRecord(
+            repo_label="RepoLimited",
+            repo_path="repos/repo-limited",
+            created_at="2026-06-16T09:20:00",
+            day_name="Monday",
+            week_start_iso="2026-06-15T00:00:00",
+            summary="made updates",
+            diff_hash="limit-6",
+            diff_excerpt="diff --git a/f.py b/f.py\n+++ b/f.py\n@@ -0,0 +1 @@\n+print('six')\n",
+            summary_source="heuristic",
+            author="Backup",
+        )
+        seventh_entry = EntryRecord(
+            repo_label="RepoLimited",
+            repo_path="repos/repo-limited",
+            created_at="2026-06-16T09:22:00",
+            day_name="Monday",
+            week_start_iso="2026-06-15T00:00:00",
+            summary="made updates",
+            diff_hash="limit-7",
+            diff_excerpt="diff --git a/g.py b/g.py\n+++ b/g.py\n@@ -0,0 +1 @@\n+print('seven')\n",
+            summary_source="heuristic",
+            author="Backup",
+        )
+        eighth_entry = EntryRecord(
+            repo_label="RepoLimited",
+            repo_path="repos/repo-limited",
+            created_at="2026-06-16T09:24:00",
+            day_name="Monday",
+            week_start_iso="2026-06-15T00:00:00",
+            summary="made updates",
+            diff_hash="limit-8",
+            diff_excerpt="diff --git a/h.py b/h.py\n+++ b/h.py\n@@ -0,0 +1 @@\n+print('eight')\n",
+            summary_source="heuristic",
+            author="Backup",
+        )
+        ninth_entry = EntryRecord(
+            repo_label="RepoLimited",
+            repo_path="repos/repo-limited",
+            created_at="2026-06-16T09:26:00",
+            day_name="Monday",
+            week_start_iso="2026-06-15T00:00:00",
+            summary="made updates",
+            diff_hash="limit-9",
+            diff_excerpt="diff --git a/i.py b/i.py\n+++ b/i.py\n@@ -0,0 +1 @@\n+print('nine')\n",
+            summary_source="heuristic",
+            author="Backup",
+        )
+
+        config = self._base_config()
+        config.summary_enhancer_dry_run = False
+        config.summary_enhancer_aggressive_prodding = True
+        config.entries = [
+            first_entry,
+            second_entry,
+            third_entry,
+            fourth_entry,
+            fifth_entry,
+            sixth_entry,
+            seventh_entry,
+            eighth_entry,
+            ninth_entry,
+        ]
+
+        handled_repos: dict[str, int] = {}
+
+        def rewrite_gate(repo_label: str, _repo_path: str | None) -> bool:
+            handled_count = handled_repos.get(repo_label, 0)
+            if handled_count >= 8:
+                return False
+            handled_repos[repo_label] = handled_count + 1
+            return True
+
+        report = run_periodic_enhancer(
+            config,
+            summary_builder=lambda _repo, _diff, _path: "Documented the concrete file change with a stronger AI rewrite for this repo.",
+            rewrite_gate=rewrite_gate,
+            now=datetime(2026, 6, 16, 11, 45, 0),
+        )
+
+        self.assertTrue(report.ran)
+        self.assertEqual(report.rewritten_state, 8)
+        self.assertEqual(config.entries[0].summary_source, "heuristic")
+        self.assertEqual(config.entries[1].summary_source, "heuristic")
+        self.assertEqual(config.entries[2].summary_source, "heuristic")
+        self.assertEqual(config.entries[3].summary_source, "heuristic")
+        self.assertEqual(config.entries[4].summary_source, "heuristic")
+        self.assertEqual(config.entries[5].summary_source, "heuristic")
+        self.assertEqual(config.entries[6].summary_source, "heuristic")
+        self.assertEqual(config.entries[7].summary_source, "heuristic")
+        self.assertEqual(config.entries[8].summary_source, "heuristic")
+        self.assertEqual(report.skipped_gated, 1)
+        rewritten_count = sum(1 for entry in config.entries if entry.rewritten_by == "EnhancerTest")
+        self.assertEqual(rewritten_count, 8)
+
+    def test_force_ai_upgrade_does_not_finalize_heuristic_fallback(self) -> None:
+        entry = EntryRecord(
+            repo_label="RepoRetryAI",
+            repo_path="repos/repo-retry-ai",
+            created_at="2026-06-16T09:10:00",
+            day_name="Monday",
+            week_start_iso="2026-06-15T00:00:00",
+            summary="made updates",
+            diff_hash="retry-ai-1",
+            diff_excerpt="diff --git a/a.py b/a.py\n+++ b/a.py\n@@ -0,0 +1 @@\n+print('retry-ai')\n",
+            summary_source="heuristic",
+            author="Backup",
+        )
+
+        config = self._base_config()
+        config.summary_enhancer_dry_run = False
+        config.ai_mode = "ollama"
+        config.ai_ollama_model = "qwen3-coder:30b"
+        config.entries = [entry]
+
+        def fake_build_summary(_repo_label, _diff_text, _repo_path, mode=None, allow_fallback=True):
+            from pyesis.ai_summary import AISummaryResult
+
+            if mode == "ollama":
+                return AISummaryResult(
+                    text="Fallback heuristic rewrite described the exact file change but AI was unavailable.",
+                    source="heuristic",
+                    requested_source="ollama",
+                    warning="Ollama summary failed: offline",
+                    fallback_source="heuristic",
+                )
+
+            return AISummaryResult(
+                text="Fallback heuristic rewrite described the exact file change but AI was unavailable.",
+                source="heuristic",
+                requested_source=mode or "heuristic",
+            )
+
+        with patch("pyesis.summary_enhancer.build_summary", side_effect=fake_build_summary):
+            report = run_periodic_enhancer(
+                config,
+                now=datetime(2026, 6, 16, 11, 45, 0),
+            )
+
+        self.assertTrue(report.ran)
+        self.assertEqual(report.rewritten_state, 0)
+        self.assertEqual(report.skipped_ai_unavailable, 1)
+        self.assertEqual(config.entries[0].summary, "made updates")
+        self.assertEqual(config.entries[0].rewritten_at, "")
+
+    def test_attempt_logs_include_duration_and_provider(self) -> None:
+        entry = EntryRecord(
+            repo_label="RepoTiming",
+            repo_path="repos/repo-timing",
+            created_at="2026-06-16T09:10:00",
+            day_name="Monday",
+            week_start_iso="2026-06-15T00:00:00",
+            summary="made updates",
+            diff_hash="timing-1",
+            diff_excerpt="diff --git a/a.py b/a.py\n+++ b/a.py\n@@ -0,0 +1 @@\n+print('timing')\n",
+            summary_source="heuristic",
+            author="Backup",
+        )
+
+        config = self._base_config()
+        config.summary_enhancer_dry_run = False
+        config.ai_mode = "ollama"
+        config.ai_ollama_model = "qwen3-coder:30b"
+        config.entries = [entry]
+
+        def fake_builder(_repo, _diff, _path):
+            return AISummaryResult(
+                text="Documented the exact timing test change and why the AI rewrite path succeeded.",
+                source="ollama",
+                timing_ms=4321,
+                provider_details="qwen3-coder:30b",
+            )
+
+        report = run_periodic_enhancer(
+            config,
+            summary_builder=fake_builder,
+            now=datetime(2026, 6, 16, 11, 50, 0),
+        )
+
+        self.assertTrue(report.ran)
+        self.assertEqual(report.rewritten_state, 1)
+        self.assertEqual(report.provider_timed_attempts, 1)
+        self.assertEqual(report.average_provider_ms, 4321)
+        self.assertTrue(any("State rewritten (ollama, 4321 ms via qwen3-coder:30b): RepoTiming" in log for log in report.logs or []))
+
+    def test_provider_timing_contributes_to_average(self) -> None:
+        entry = EntryRecord(
+            repo_label="RepoProviderTiming",
+            repo_path="repos/repo-provider-timing",
+            created_at="2026-06-16T09:10:00",
+            day_name="Monday",
+            week_start_iso="2026-06-15T00:00:00",
+            summary="made updates",
+            diff_hash="provider-timing-1",
+            diff_excerpt="diff --git a/a.py b/a.py\n+++ b/a.py\n@@ -0,0 +1 @@\n+print('provider')\n",
+            summary_source="heuristic",
+            author="Backup",
+        )
+
+        config = self._base_config()
+        config.summary_enhancer_dry_run = False
+        config.entries = [entry]
+
+        report = run_periodic_enhancer(
+            config,
+            summary_builder=lambda _repo, _diff, _path: AISummaryResult(
+                text="Documented the concrete provider timing path and confirmed the rewrite succeeded.",
+                source="ollama",
+                timing_ms=4321,
+                provider_details="qwen3-coder:30b",
+            ),
+            now=datetime(2026, 6, 16, 11, 51, 0),
+        )
+
+        self.assertTrue(report.ran)
+        self.assertEqual(report.provider_timed_attempts, 1)
+        self.assertEqual(report.average_provider_ms, 4321)
+
+    def test_force_ai_upgrade_retries_heuristic_rewrite_with_rewritten_at(self) -> None:
+        entry = EntryRecord(
+            repo_label="RepoRetryStamped",
+            repo_path="repos/repo-retry-stamped",
+            created_at="2026-06-16T09:10:00",
+            day_name="Monday",
+            week_start_iso="2026-06-15T00:00:00",
+            summary="I updated src/server.js around 'const OLLAMA_BASE_URL'.",
+            diff_hash="retry-ai-2",
+            diff_excerpt="diff --git a/server.js b/server.js\n+++ b/server.js\n@@ -0,0 +1 @@\n+print('server')\n",
+            summary_source="heuristic",
+            author="Backup",
+            rewritten_by="EnhancerTest",
+            rewritten_at="2026-06-23T05:58:12",
+        )
+
+        config = self._base_config()
+        config.summary_enhancer_dry_run = False
+        config.ai_mode = "ollama"
+        config.ai_ollama_model = "qwen3-coder:30b"
+        config.entries = [entry]
+
+        with patch("pyesis.summary_enhancer.build_summary") as fake_build_summary:
+            from pyesis.ai_summary import AISummaryResult
+
+            fake_build_summary.return_value = AISummaryResult(
+                text="Documented the server bootstrap change and the new startup token handling in concrete terms.",
+                source="ollama",
+                requested_source="ollama",
+            )
+
+            report = run_periodic_enhancer(
+                config,
+                now=datetime(2026, 6, 16, 11, 50, 0),
+            )
+
+        self.assertTrue(report.ran)
+        self.assertEqual(report.rewritten_state, 1)
+        self.assertEqual(config.entries[0].summary_source, "ollama")
+        self.assertEqual(config.entries[0].author, "AI")
+        self.assertEqual(config.entries[0].rewritten_by, "EnhancerTest")
+
+    def test_rewrite_gate_prioritizes_older_entries_before_newer_ones(self) -> None:
+        newer_entry = EntryRecord(
+            repo_label="RepoOrdered",
+            repo_path="repos/repo-ordered",
+            created_at="2026-06-16T09:14:00",
+            day_name="Monday",
+            week_start_iso="2026-06-15T00:00:00",
+            summary="made updates",
+            diff_hash="ordered-3",
+            diff_excerpt="diff --git a/c.py b/c.py\n+++ b/c.py\n@@ -0,0 +1 @@\n+print('three')\n",
+            summary_source="heuristic",
+            author="Backup",
+        )
+        oldest_entry = EntryRecord(
+            repo_label="RepoOrdered",
+            repo_path="repos/repo-ordered",
+            created_at="2026-06-16T09:10:00",
+            day_name="Monday",
+            week_start_iso="2026-06-15T00:00:00",
+            summary="made updates",
+            diff_hash="ordered-1",
+            diff_excerpt="diff --git a/a.py b/a.py\n+++ b/a.py\n@@ -0,0 +1 @@\n+print('one')\n",
+            summary_source="heuristic",
+            author="Backup",
+        )
+        middle_entry = EntryRecord(
+            repo_label="RepoOrdered",
+            repo_path="repos/repo-ordered",
+            created_at="2026-06-16T09:12:00",
+            day_name="Monday",
+            week_start_iso="2026-06-15T00:00:00",
+            summary="made updates",
+            diff_hash="ordered-2",
+            diff_excerpt="diff --git a/b.py b/b.py\n+++ b/b.py\n@@ -0,0 +1 @@\n+print('two')\n",
+            summary_source="heuristic",
+            author="Backup",
+        )
+
+        config = self._base_config()
+        config.summary_enhancer_dry_run = False
+        config.summary_enhancer_aggressive_prodding = True
+        config.entries = [newer_entry, oldest_entry, middle_entry]
+
+        handled_repos: dict[str, int] = {}
+
+        def rewrite_gate(repo_label: str, _repo_path: str | None) -> bool:
+            handled_count = handled_repos.get(repo_label, 0)
+            if handled_count >= 2:
+                return False
+            handled_repos[repo_label] = handled_count + 1
+            return True
+
+        report = run_periodic_enhancer(
+            config,
+            summary_builder=lambda _repo, diff, _path: f"Strong rewrite for {diff.splitlines()[0]}",
+            rewrite_gate=rewrite_gate,
+            now=datetime(2026, 6, 16, 11, 55, 0),
+        )
+
+        self.assertTrue(report.ran)
+        self.assertEqual(report.rewritten_state, 2)
+        rewritten_summaries = {entry.summary for entry in config.entries if entry.rewritten_at}
+        self.assertIn("Strong rewrite for diff --git a/a.py b/a.py", rewritten_summaries)
+        self.assertIn("Strong rewrite for diff --git a/b.py b/b.py", rewritten_summaries)
+        self.assertNotIn("Strong rewrite for diff --git a/c.py b/c.py", rewritten_summaries)
 
 
 if __name__ == "__main__":
