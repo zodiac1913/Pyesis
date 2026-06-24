@@ -78,10 +78,22 @@ class AISummaryTests(unittest.TestCase):
         self.assertIn("Forbidden phrases", prompt)
         self.assertIn("refined logic", prompt)
         self.assertIn("summarySource", prompt)
+        self.assertIn("Return exactly one JSON object and nothing else", prompt)
+        self.assertIn("Use double quotes for every key and every string value", prompt)
+        self.assertIn('{"who":"I","what":"I ..."', prompt)
 
     def test_ai_json_parser_accepts_wrapped_json(self) -> None:
         payload = _parse_ai_json_payload(
             "Here is the result:\n```json\n{\"who\":\"I\",\"what\":\"I added summarySource in pyesis/diff_buffer.py\",\"where\":\"pyesis/diff_buffer.py\",\"when\":\"Not available from the diff.\",\"why\":\"track summary source metadata\",\"how\":\"adding the summarySource field\"}\n```\nHope that helps."
+        )
+
+        self.assertIsInstance(payload, dict)
+        self.assertEqual(payload["who"], "I")
+        self.assertIn("summarySource", payload["what"])
+
+    def test_ai_json_parser_accepts_python_style_dict(self) -> None:
+        payload = _parse_ai_json_payload(
+            "{'who': 'I', 'what': 'I added summarySource in pyesis/diff_buffer.py', 'where': 'pyesis/diff_buffer.py', 'when': 'Not available from the diff.', 'why': 'track summary source metadata', 'how': 'adding the summarySource field'}"
         )
 
         self.assertIsInstance(payload, dict)
@@ -104,8 +116,8 @@ class AISummaryTests(unittest.TestCase):
             "     rewrittenBy: str\n"
         )
 
-        def fake_request(repo_label, passed_diff, repo_path, *, url, model, keep_alive):
-            del repo_label, passed_diff, repo_path, url, keep_alive
+        def fake_request(repo_label, passed_diff, repo_path, *, url, model, keep_alive, timeout):
+            del repo_label, passed_diff, repo_path, url, keep_alive, timeout
             if model == "broken-model":
                 raise RuntimeError("model offline")
             return ProviderStructuredSummary(
@@ -189,6 +201,99 @@ class AISummaryTests(unittest.TestCase):
         self.assertEqual(result.source, "ollama")
         self.assertEqual(result.provider_details, "qwen3-coder:30b")
         self.assertGreaterEqual(result.timing_ms, 0)
+
+    def test_build_summary_uses_configured_ollama_timeout(self) -> None:
+        diff_text = (
+            "diff --git a/pyesis/diff_buffer.py b/pyesis/diff_buffer.py\n"
+            "+++ b/pyesis/diff_buffer.py\n"
+            "@@ -1,5 +1,6 @@\n"
+            " class DiffLedgerItem(TypedDict):\n"
+            "+    summarySource: str\n"
+            "     rewrittenBy: str\n"
+        )
+
+        response_payload = {
+            "message": {
+                "content": json.dumps(
+                    {
+                        "who": "I",
+                        "what": "I added summarySource in pyesis/diff_buffer.py",
+                        "where": "pyesis/diff_buffer.py",
+                        "when": "Not available from the diff.",
+                        "why": "track summary source metadata",
+                        "how": "adding the summarySource field",
+                    }
+                )
+            }
+        }
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return json.dumps(response_payload).encode("utf-8")
+
+        with patch("pyesis.ai_summary.request.urlopen", return_value=FakeResponse()) as mock_urlopen:
+            with patch.dict(
+                "os.environ",
+                {
+                    "PYESIS_OLLAMA_URL": "http://localhost:11434/api/chat",
+                    "PYESIS_OLLAMA_MODEL": "qwen3-coder:30b",
+                    "PYESIS_OLLAMA_KEEP_ALIVE": "5m",
+                    "PYESIS_OLLAMA_TIMEOUT_SECONDS": "240",
+                },
+                clear=False,
+            ):
+                result = build_summary("Pyesis", diff_text, repo_path="/tmp/repo", mode="ollama")
+
+        self.assertEqual(result.source, "ollama")
+        self.assertEqual(mock_urlopen.call_args.kwargs["timeout"], 240)
+
+    def test_build_summary_reports_ollama_content_preview_on_parse_failure(self) -> None:
+        diff_text = (
+            "diff --git a/pyesis/diff_buffer.py b/pyesis/diff_buffer.py\n"
+            "+++ b/pyesis/diff_buffer.py\n"
+            "@@ -1,5 +1,6 @@\n"
+            " class DiffLedgerItem(TypedDict):\n"
+            "+    summarySource: str\n"
+            "     rewrittenBy: str\n"
+        )
+
+        response_payload = {
+            "message": {
+                "content": "Here is your answer: who=I what=added summarySource"
+            }
+        }
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return json.dumps(response_payload).encode("utf-8")
+
+        with patch("pyesis.ai_summary.request.urlopen", return_value=FakeResponse()):
+            with patch.dict(
+                "os.environ",
+                {
+                    "PYESIS_OLLAMA_URL": "http://localhost:11434/api/chat",
+                    "PYESIS_OLLAMA_MODEL": "qwen2.5-coder:latest",
+                    "PYESIS_OLLAMA_KEEP_ALIVE": "5m",
+                },
+                clear=False,
+            ):
+                result = build_summary("Pyesis", diff_text, repo_path="/tmp/repo", mode="ollama")
+
+        self.assertEqual(result.source, "heuristic")
+        self.assertIn("content preview:", result.warning)
+        self.assertIn("Here is your answer:", result.warning)
 
 
 if __name__ == "__main__":

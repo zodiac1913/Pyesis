@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from pyesis.ai_summary import AISummaryResult
 from pyesis.config import AppConfig, EntryRecord
-from pyesis.summary_enhancer import run_periodic_enhancer
+from pyesis.summary_enhancer import _build_summary_for_mode, _preferred_summary_modes, run_periodic_enhancer
 
 
 class SummaryEnhancerTests(unittest.TestCase):
@@ -39,6 +39,30 @@ class SummaryEnhancerTests(unittest.TestCase):
             summary_enhancer_rewritten_by="EnhancerTest",
             entries=[],
         )
+
+    def test_selected_mode_stays_ahead_of_github_token(self) -> None:
+        config = self._base_config()
+        config.ai_mode = "ollama"
+        config.ai_ollama_model = "qwen3-coder:30b"
+
+        with patch.dict(os.environ, {"PYESIS_GITHUB_GPT_API_KEY": "token"}, clear=False):
+            modes = _preferred_summary_modes(config)
+
+        self.assertGreaterEqual(len(modes), 2)
+        self.assertEqual(modes[0], "ollama")
+        self.assertEqual(modes[1], "github-gpt")
+
+    def test_ai_mode_passes_fallback_flag_to_provider(self) -> None:
+        config = self._base_config()
+        config.ai_mode = "ollama"
+
+        with patch("pyesis.summary_enhancer.build_summary") as mock_build_summary:
+            mock_build_summary.return_value = AISummaryResult(text="Used AI", source="ollama")
+
+            _build_summary_for_mode(config, "RepoA", "diff --git a/a.py b/a.py", "repos/repo-a", "ollama")
+
+        self.assertTrue(mock_build_summary.called)
+        self.assertTrue(mock_build_summary.call_args.kwargs["allow_fallback"])
 
     def test_dry_run_does_not_write_fields(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -366,6 +390,66 @@ class SummaryEnhancerTests(unittest.TestCase):
                 diff_hash="ghash",
                 diff_excerpt=diff_text,
                 summary_source="github-gpt",
+                author="AI",
+            )
+
+            config = self._base_config()
+            config.entries = [protected_entry]
+            config.summary_enhancer_dry_run = False
+
+            report = run_periodic_enhancer(
+                config,
+                summary_builder=lambda _repo, _diff, _path: "This rewrite should never apply.",
+                buffer_dir=buffer_dir,
+                now=datetime(2026, 6, 16, 10, 0, 0),
+            )
+
+            self.assertTrue(report.ran)
+            self.assertEqual(report.rewritten_state, 0)
+            self.assertEqual(report.rewritten_buffer, 0)
+            self.assertEqual(config.entries[0].summary, "made updates")
+
+            updated_items = json.loads(buffer_path.read_text(encoding="utf-8"))
+            self.assertEqual(updated_items[0]["gitDiffDescription"], "made updates")
+
+    def test_ollama_entries_are_not_rewritten(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp = Path(tmp_dir)
+            buffer_dir = tmp / "diff_buffers"
+            buffer_dir.mkdir(parents=True, exist_ok=True)
+            buffer_path = buffer_dir / "2026-06-16.json"
+
+            diff_text = "diff --git a/d.py b/d.py\n+++ b/d.py\n@@ -0,0 +1 @@\n+print('o')\n"
+            buffer_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "datetime": "2026-06-16T09:00:00",
+                            "repo": "RepoOllama",
+                            "gitDiffText": diff_text,
+                            "gitDiffDescription": "made updates",
+                            "shown": False,
+                            "diffHash": "ohash",
+                            "repoPath": "repos/repo-ollama",
+                            "author": "AI",
+                            "summarySource": "ollama",
+                        }
+                    ],
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            protected_entry = EntryRecord(
+                repo_label="RepoOllama",
+                repo_path="repos/repo-ollama",
+                created_at="2026-06-16T09:00:00",
+                day_name="Monday",
+                week_start_iso="2026-06-15T00:00:00",
+                summary="made updates",
+                diff_hash="ohash",
+                diff_excerpt=diff_text,
+                summary_source="ollama",
                 author="AI",
             )
 

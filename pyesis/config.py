@@ -19,6 +19,7 @@ from pyesis.github_auth import (
 STATE_PATH = Path("pyesis_state.json")
 NEAR_DUP_DIFF_SIMILARITY_THRESHOLD = 0.80
 OLLAMA_DEFAULT_URL = "http://localhost:11434/api/chat"
+OLLAMA_DEFAULT_TIMEOUT_SECONDS = 180
 SUPPORTED_AI_MODES = {"heuristic", "ollama", "openai-compatible", "github-gpt"}
 LEGACY_GITHUB_COPILOT_MODE = "github-copilot"
 GITHUB_GPT_DEFAULT_MODEL = "openai/gpt-5"
@@ -59,6 +60,11 @@ class EntryRecord:
     author: str = "Backup"
     rewritten_by: str = ""
     rewritten_at: str = ""
+    requested_summary_source: str = ""
+    summary_warning: str = ""
+    fallback_summary_source: str = ""
+    summary_timing_ms: int = 0
+    summary_provider_details: str = ""
 
 
 @dataclass
@@ -72,9 +78,11 @@ class AppConfig:
     last_auto_export_date: str = ""
     ai_mode: str = "heuristic"
     ai_fallback_enabled: bool = True
+    ai_attempt_logging_enabled: bool = True
     ai_ollama_url: str = OLLAMA_DEFAULT_URL
     ai_ollama_model: str = ""
     ai_ollama_keep_alive: str = "30m"
+    ai_ollama_timeout_seconds: int = OLLAMA_DEFAULT_TIMEOUT_SECONDS
     ai_openai_url: str = ""
     ai_openai_model: str = ""
     ai_github_gpt_url: str = GITHUB_MODELS_CHAT_COMPLETIONS_URL
@@ -244,6 +252,10 @@ def _merge_or_append_entry(
                 and existing.day_name == entry.day_name
                 and _fingerprint_overlap(entry_fp, deduped_file_fp[idx])
             ):
+                existing_source = (existing.summary_source or "").strip().lower()
+                entry_source = (entry.summary_source or "").strip().lower()
+                if existing_source != "heuristic" and entry_source == "heuristic":
+                    return
                 deduped[idx] = entry
                 deduped_file_fp[idx] = entry_fp
                 return
@@ -316,6 +328,11 @@ def _decode_entry(item: dict[str, Any]) -> EntryRecord:
         author=str(item.get("author", "Backup")),
         rewritten_by=str(item.get("rewritten_by", "")).strip(),
         rewritten_at=str(item.get("rewritten_at", "")).strip(),
+        requested_summary_source=str(item.get("requested_summary_source", "")).strip().lower(),
+        summary_warning=str(item.get("summary_warning", "")).strip(),
+        fallback_summary_source=str(item.get("fallback_summary_source", "")).strip().lower(),
+        summary_timing_ms=max(0, int(item.get("summary_timing_ms", 0) or 0)),
+        summary_provider_details=str(item.get("summary_provider_details", "")).strip(),
         diff_hash=item["diff_hash"],
         diff_excerpt=item.get("diff_excerpt", ""),
     )
@@ -344,7 +361,21 @@ def _should_rewrite_saved_entries(
 ) -> bool:
     missing_entry_author = any(isinstance(item, dict) and "author" not in item for item in raw_entry_items)
     missing_entry_source = any(isinstance(item, dict) and "summary_source" not in item for item in raw_entry_items)
-    return len(entries) != len(raw_entries) or missing_entry_author or missing_entry_source
+    missing_requested_source = any(isinstance(item, dict) and "requested_summary_source" not in item for item in raw_entry_items)
+    missing_warning = any(isinstance(item, dict) and "summary_warning" not in item for item in raw_entry_items)
+    missing_fallback_source = any(isinstance(item, dict) and "fallback_summary_source" not in item for item in raw_entry_items)
+    missing_timing = any(isinstance(item, dict) and "summary_timing_ms" not in item for item in raw_entry_items)
+    missing_provider_details = any(isinstance(item, dict) and "summary_provider_details" not in item for item in raw_entry_items)
+    return (
+        len(entries) != len(raw_entries)
+        or missing_entry_author
+        or missing_entry_source
+        or missing_requested_source
+        or missing_warning
+        or missing_fallback_source
+        or missing_timing
+        or missing_provider_details
+    )
 
 
 def load_config() -> AppConfig:
@@ -385,9 +416,11 @@ def load_config() -> AppConfig:
         last_auto_export_date=str(data.get("last_auto_export_date", "")),
         ai_mode=ai_mode,
         ai_fallback_enabled=bool(data.get("ai_fallback_enabled", True)),
+        ai_attempt_logging_enabled=bool(data.get("ai_attempt_logging_enabled", True)),
         ai_ollama_url=str(data.get("ai_ollama_url", OLLAMA_DEFAULT_URL)).strip() or OLLAMA_DEFAULT_URL,
         ai_ollama_model=str(data.get("ai_ollama_model", "")).strip(),
         ai_ollama_keep_alive=str(data.get("ai_ollama_keep_alive", "30m")).strip() or "30m",
+        ai_ollama_timeout_seconds=max(30, int(data.get("ai_ollama_timeout_seconds", OLLAMA_DEFAULT_TIMEOUT_SECONDS) or OLLAMA_DEFAULT_TIMEOUT_SECONDS)),
         ai_openai_url=str(data.get("ai_openai_url", "")).strip(),
         ai_openai_model=str(data.get("ai_openai_model", "")).strip(),
         ai_github_gpt_url=str(data.get("ai_github_gpt_url", data.get("ai_github_copilot_url", GITHUB_MODELS_CHAT_COMPLETIONS_URL))).strip() or GITHUB_MODELS_CHAT_COMPLETIONS_URL,
@@ -421,9 +454,11 @@ def save_config(config: AppConfig, state_path: Path = STATE_PATH) -> None:
         "last_auto_export_date": config.last_auto_export_date,
         "ai_mode": config.ai_mode,
         "ai_fallback_enabled": config.ai_fallback_enabled,
+        "ai_attempt_logging_enabled": config.ai_attempt_logging_enabled,
         "ai_ollama_url": config.ai_ollama_url,
         "ai_ollama_model": config.ai_ollama_model,
         "ai_ollama_keep_alive": config.ai_ollama_keep_alive,
+        "ai_ollama_timeout_seconds": max(30, int(config.ai_ollama_timeout_seconds)),
         "ai_openai_url": config.ai_openai_url,
         "ai_openai_model": config.ai_openai_model,
         "ai_github_gpt_url": config.ai_github_gpt_url,

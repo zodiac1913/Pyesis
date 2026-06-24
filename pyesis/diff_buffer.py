@@ -22,6 +22,11 @@ class DiffLedgerItem(TypedDict):
     summarySource: str
     rewrittenBy: str
     rewrittenAt: str
+    requestedSummarySource: str
+    summaryWarning: str
+    fallbackSummarySource: str
+    summaryTimingMs: int
+    summaryProviderDetails: str
 
 
 def _today_key() -> str:
@@ -77,6 +82,11 @@ def _read_items(path: Path) -> list[DiffLedgerItem]:
         summary_source = str(raw.get("summarySource", "")).strip().lower()
         rewritten_by = str(raw.get("rewrittenBy", "")).strip()
         rewritten_at = str(raw.get("rewrittenAt", "")).strip()
+        requested_summary_source = str(raw.get("requestedSummarySource", "")).strip().lower()
+        summary_warning = str(raw.get("summaryWarning", "")).strip()
+        fallback_summary_source = str(raw.get("fallbackSummarySource", "")).strip().lower()
+        summary_timing_ms = max(0, int(raw.get("summaryTimingMs", 0) or 0))
+        summary_provider_details = str(raw.get("summaryProviderDetails", "")).strip()
         if not repo or not git_diff_text:
             continue
         items.append(
@@ -92,6 +102,11 @@ def _read_items(path: Path) -> list[DiffLedgerItem]:
                 "summarySource": summary_source,
                 "rewrittenBy": rewritten_by,
                 "rewrittenAt": rewritten_at,
+                "requestedSummarySource": requested_summary_source,
+                "summaryWarning": summary_warning,
+                "fallbackSummarySource": fallback_summary_source,
+                "summaryTimingMs": summary_timing_ms,
+                "summaryProviderDetails": summary_provider_details,
             }
         )
     return items
@@ -112,6 +127,11 @@ def _write_items(path: Path, items: list[DiffLedgerItem]) -> None:
             "summarySource": item["summarySource"],
             "rewrittenBy": item["rewrittenBy"],
             "rewrittenAt": item["rewrittenAt"],
+            "requestedSummarySource": item["requestedSummarySource"],
+            "summaryWarning": item["summaryWarning"],
+            "fallbackSummarySource": item["fallbackSummarySource"],
+            "summaryTimingMs": item["summaryTimingMs"],
+            "summaryProviderDetails": item["summaryProviderDetails"],
         }
         for item in items
     ]
@@ -143,6 +163,11 @@ def _update_existing_item(
     description: str,
     author: str,
     summary_source: str,
+    requested_summary_source: str,
+    summary_warning: str,
+    fallback_summary_source: str,
+    summary_timing_ms: int,
+    summary_provider_details: str,
     created_at: str,
     repo_path: str,
 ) -> None:
@@ -152,6 +177,11 @@ def _update_existing_item(
         item["author"] = author
     if summary_source:
         item["summarySource"] = summary_source
+    item["requestedSummarySource"] = requested_summary_source
+    item["summaryWarning"] = summary_warning
+    item["fallbackSummarySource"] = fallback_summary_source
+    item["summaryTimingMs"] = max(0, int(summary_timing_ms))
+    item["summaryProviderDetails"] = summary_provider_details
     item["datetime"] = created_at
     item["repoPath"] = repo_path
 
@@ -163,6 +193,11 @@ def remember_diff(
     description: str,
     author: str = "Backup",
     summary_source: str = "",
+    requested_summary_source: str = "",
+    summary_warning: str = "",
+    fallback_summary_source: str = "",
+    summary_timing_ms: int = 0,
+    summary_provider_details: str = "",
     day_key: str | None = None,
 ) -> DiffLedgerItem:
     active_day = day_key or _today_key()
@@ -179,6 +214,11 @@ def remember_diff(
             description=description,
             author=author,
             summary_source=summary_source,
+            requested_summary_source=requested_summary_source,
+            summary_warning=summary_warning,
+            fallback_summary_source=fallback_summary_source,
+            summary_timing_ms=summary_timing_ms,
+            summary_provider_details=summary_provider_details,
             created_at=created_at,
             repo_path=repo_path,
         )
@@ -197,6 +237,11 @@ def remember_diff(
         "summarySource": summary_source,
         "rewrittenBy": "",
         "rewrittenAt": "",
+        "requestedSummarySource": requested_summary_source,
+        "summaryWarning": summary_warning,
+        "fallbackSummarySource": fallback_summary_source,
+        "summaryTimingMs": max(0, int(summary_timing_ms)),
+        "summaryProviderDetails": summary_provider_details,
     }
     items.append(new_item)
     _write_items(path, items)

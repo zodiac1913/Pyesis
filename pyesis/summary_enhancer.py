@@ -129,7 +129,8 @@ def _is_human_authored(author: str, source: str) -> bool:
 
 
 def _is_protected_ai_source(source: str) -> bool:
-    return (source or "").strip().lower() == GITHUB_GPT_MODE
+    normalized = (source or "").strip().lower()
+    return bool(normalized) and normalized != HEURISTIC_MODE and normalized not in HUMAN_SOURCES
 
 
 def _looks_weak(text: str) -> bool:
@@ -340,7 +341,7 @@ def _default_builder(config: AppConfig) -> SummaryBuilder:
 
 
 def _build_summary_for_mode(config: AppConfig, repo_label: str, diff_text: str, repo_path: str | None, mode: str) -> AISummaryResult:
-    allow_fallback = mode == HEURISTIC_MODE and config.ai_fallback_enabled
+    allow_fallback = mode != HEURISTIC_MODE and config.ai_fallback_enabled
     return build_summary(
         repo_label,
         diff_text,
@@ -387,16 +388,16 @@ def _build_summary_with_priority_modes(
 def _preferred_summary_modes(config: AppConfig) -> list[str]:
     modes: list[str] = []
 
+    current_mode = (config.ai_mode or "").strip().lower()
+    if current_mode and current_mode != HEURISTIC_MODE and current_mode not in modes:
+        modes.append(current_mode)
+
     github_token_env = os.getenv("PYESIS_GITHUB_GPT_API_KEY", "").strip()
     github_auth_mode = normalize_github_auth_mode(config.github_auth_mode)
     github_auth_endpoint = normalize_github_auth_endpoint(github_auth_mode, config.github_auth_endpoint)
     github_token_stored, _ = load_github_auth_token(github_auth_mode, github_auth_endpoint)
-    if github_token_env or github_token_stored.strip():
+    if (github_token_env or github_token_stored.strip()) and GITHUB_GPT_MODE not in modes:
         modes.append(GITHUB_GPT_MODE)
-
-    current_mode = (config.ai_mode or "").strip().lower()
-    if current_mode and current_mode != HEURISTIC_MODE and current_mode not in modes:
-        modes.append(current_mode)
 
     if config.ai_ollama_url.strip() and config.ai_ollama_model.strip() and OLLAMA_MODE not in modes:
         modes.append(OLLAMA_MODE)

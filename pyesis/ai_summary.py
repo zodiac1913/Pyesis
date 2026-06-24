@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass
 import json
 import os
@@ -13,6 +14,8 @@ from pyesis.git_monitor import FileChangeSummary, summarize_file_changes
 
 SYSTEM_PROMPT = (
     "Rewrite git diff activity as a short first-person work-log bullet. "
+    "When asked for JSON, return exactly one JSON object with double-quoted keys and string values only. "
+    "Do not use single quotes, code fences, comments, markdown, or explanatory text before or after the JSON object. "
     "Use a single sentence, past tense, concrete wording, and no markdown bullet prefix. "
     "Assume each diff is usually a single file change and name the file directly when the evidence supports it. "
     "Prefer explicit verbs like added, removed, renamed, refactored, and mention what changed. "
@@ -88,6 +91,7 @@ AI_REPO_CONTEXT_LINES = 80
 AI_REPO_CONTEXT_CHAR_LIMIT = 7000
 REPO_CONTEXT_SUFFIXES = (".py", ".cs", ".js", ".ts", ".tsx", ".jsx", ".md", ".toml", ".json", ".yml", ".yaml")
 DEFAULT_OLLAMA_SUMMARY_MODEL = "qwen3-coder:30b"
+DEFAULT_OLLAMA_TIMEOUT_SECONDS = 180
 HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 GOOD_WRITING_EXAMPLES = (
     "In Controllers/Configurer/ConfigurerController.cs, I hardened AppSec recovery by adding a null check around appSecDto, rebuilding appSec only when session data exists, and cleaning up the AppSec and role-handling flow so the code is easier to read.",
@@ -685,8 +689,25 @@ def _parse_ai_json_payload(content: str) -> object:
     except json.JSONDecodeError:
         extracted = _extract_json_object(text)
         if extracted is None:
+            python_literal = _parse_ai_python_literal_payload(text)
+            if python_literal is not None:
+                return python_literal
             raise
-        return json.loads(extracted)
+        try:
+            return json.loads(extracted)
+        except json.JSONDecodeError:
+            python_literal = _parse_ai_python_literal_payload(extracted)
+            if python_literal is not None:
+                return python_literal
+            raise
+
+
+def _parse_ai_python_literal_payload(text: str) -> object | None:
+    try:
+        parsed = ast.literal_eval(text)
+    except (SyntaxError, ValueError):
+        return None
+    return parsed if isinstance(parsed, (dict, list)) else None
 
 
 def _extract_json_object(text: str) -> str | None:
@@ -730,6 +751,10 @@ def _build_ai_user_prompt(repo_label: str, diff_text: str, repo_path: str | None
         f"Repository: {repo_label}\n"
         f"Likely changed files: {preferred_paths}\n"
         "Review this diff and answer with JSON only. "
+        "Return exactly one JSON object and nothing else. "
+        "Use double quotes for every key and every string value. "
+        "Do not wrap the JSON in markdown fences. "
+        "Do not add any prose before or after the JSON object. "
         "Use key thoughts of who, what, where, when, why, and how. "
         "Do not omit any key. If the diff does not provide a field, say 'Not available from the diff.' "
         "Keep values concise but detailed to the level given, and make 'what' a first-person summary of the code changes. "
@@ -744,6 +769,8 @@ def _build_ai_user_prompt(repo_label: str, diff_text: str, repo_path: str | None
         "Bad style examples to avoid:\n"
         f"- {BAD_WRITING_EXAMPLES[0]}\n"
         f"- {BAD_WRITING_EXAMPLES[1]}\n\n"
+        "Required JSON shape:\n"
+        '{"who":"I","what":"I ...","where":"...","when":"Not available from the diff.","why":"...","how":"..."}\n\n'
         "Change digest:\n"
         f"{signal_digest}\n\n"
         "Diff:\n"
@@ -1462,6 +1489,15 @@ def _ollama_model_candidates(raw_value: str) -> list[str]:
     return models
 
 
+def _preview_ollama_content(content: str, limit: int = 160) -> str:
+    normalized = re.sub(r"\s+", " ", content).strip()
+    if not normalized:
+        return "<empty>"
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: limit - 3] + "..."
+
+
 def _ollama_request_structured_summary(
     repo_label: str,
     diff_text: str,
@@ -1470,6 +1506,7 @@ def _ollama_request_structured_summary(
     url: str,
     model: str,
     keep_alive: str,
+    timeout: int,
 ) -> ProviderStructuredSummary:
     changes = _summary_relevant_changes(_coalesce_changes(summarize_file_changes(diff_text)))
 
@@ -1493,7 +1530,7 @@ def _ollama_request_structured_summary(
     req = request.Request(url, data=body, headers=headers, method="POST")
     started_at = perf_counter()
     try:
-        with request.urlopen(req, timeout=45) as response:
+        with request.urlopen(req, timeout=timeout) as response:
             data = json.loads(response.read().decode("utf-8"))
     except error.URLError as exc:
         elapsed_ms = int(round((perf_counter() - started_at) * 1000))
@@ -1503,8 +1540,13 @@ def _ollama_request_structured_summary(
     content = str(message.get("content", "")).strip()
     if not content:
         raise RuntimeError(f"Empty Ollama response for model {model}")
+    try:
+        parsed_content = _parse_ai_json_payload(content)
+    except (json.JSONDecodeError, SyntaxError, ValueError) as exc:
+        preview = _preview_ollama_content(content)
+        raise RuntimeError(f"{exc}; content preview: {preview}") from exc
     return ProviderStructuredSummary(
-        structured=_structured_summary_from_json(_parse_ai_json_payload(content), changes, repo_label),
+        structured=_structured_summary_from_json(parsed_content, changes, repo_label),
         timing_ms=int(round((perf_counter() - started_at) * 1000)),
         provider_details=model,
     )
@@ -1514,6 +1556,7 @@ def _ollama_structured_summary(repo_label: str, diff_text: str, repo_path: str |
     url = os.getenv("PYESIS_OLLAMA_URL", "http://localhost:11434/api/chat").strip()
     model = os.getenv("PYESIS_OLLAMA_MODEL", DEFAULT_OLLAMA_SUMMARY_MODEL).strip()
     keep_alive = os.getenv("PYESIS_OLLAMA_KEEP_ALIVE", "5m").strip()
+    timeout = max(30, int(os.getenv("PYESIS_OLLAMA_TIMEOUT_SECONDS", str(DEFAULT_OLLAMA_TIMEOUT_SECONDS)) or DEFAULT_OLLAMA_TIMEOUT_SECONDS))
     if not url or not model:
         raise RuntimeError("Missing Ollama configuration")
 
@@ -1531,6 +1574,7 @@ def _ollama_structured_summary(repo_label: str, diff_text: str, repo_path: str |
                 url=url,
                 model=candidate,
                 keep_alive=keep_alive,
+                timeout=timeout,
             )
         except Exception as exc:
             errors.append(f"{candidate}: {exc}")
