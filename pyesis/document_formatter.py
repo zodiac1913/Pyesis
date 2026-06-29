@@ -27,14 +27,27 @@ class RenderedTextChunk:
     tag: str = ""
 
 
-def _active_week_start(now: datetime | None = None) -> datetime:
+def _week_end_day_index(week_end_day: str) -> int:
+    try:
+        return DAY_ORDER.index(week_end_day)
+    except ValueError:
+        return DAY_ORDER.index("Thursday")
+
+
+def _active_week_start(week_end_day: str, now: datetime | None = None) -> datetime:
     reference = now or datetime.now()
-    return (reference - timedelta(days=reference.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    end_index = _week_end_day_index(week_end_day)
+    week_end = (reference + timedelta(days=(end_index - reference.weekday()) % 7)).replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    return week_end - timedelta(days=6)
 
 
-def _week_end_date(week_start: datetime, week_end_day: str) -> datetime:
-    end_index = DAY_ORDER.index(week_end_day)
-    return week_start + timedelta(days=end_index)
+def _week_end_date(week_start: datetime) -> datetime:
+    return week_start + timedelta(days=6)
 
 
 def _group_entries(entries: list[EntryRecord]) -> dict[str, dict[str, list[EntryRecord]]]:
@@ -44,8 +57,12 @@ def _group_entries(entries: list[EntryRecord]) -> dict[str, dict[str, list[Entry
     return grouped
 
 
-def _active_week_entries(entries: list[EntryRecord], now: datetime | None = None) -> tuple[str, dict[str, list[EntryRecord]]]:
-    active_week_start_iso = _active_week_start(now).isoformat()
+def _active_week_entries(
+    entries: list[EntryRecord],
+    week_end_day: str,
+    now: datetime | None = None,
+) -> tuple[str, dict[str, list[EntryRecord]]]:
+    active_week_start_iso = _active_week_start(week_end_day, now).isoformat()
     grouped = _group_entries(entries)
     return active_week_start_iso, grouped.get(active_week_start_iso, {})
 
@@ -65,19 +82,19 @@ def render_plain_text(config: AppConfig) -> str:
 
 
 def render_text_chunks(config: AppConfig) -> list[RenderedTextChunk]:
-    active_week_start_iso, active_week_entries = _active_week_entries(config.entries)
+    active_week_start_iso, active_week_entries = _active_week_entries(config.entries, config.week_end_day)
     chunks: list[RenderedTextChunk] = []
 
-    _append_week_header(chunks, active_week_start_iso, config.week_end_day)
+    _append_week_header(chunks, active_week_start_iso)
     if active_week_entries:
         _append_week_entries(chunks, active_week_entries)
 
     return chunks
 
 
-def _append_week_header(chunks: list[RenderedTextChunk], week_start_iso: str, week_end_day: str) -> None:
+def _append_week_header(chunks: list[RenderedTextChunk], week_start_iso: str) -> None:
     week_start = datetime.fromisoformat(week_start_iso)
-    week_end = _week_end_date(week_start, week_end_day)
+    week_end = _week_end_date(week_start)
     chunks.extend(RenderedTextChunk("\n") for _ in range(6))
     chunks.append(RenderedTextChunk(f"({week_end.strftime('%Y %b %d')})\n"))
     chunks.append(RenderedTextChunk("What I worked on for this week:\n"))
@@ -113,8 +130,8 @@ def _is_heuristic_entry(entry: EntryRecord) -> bool:
 def export_docx(config: AppConfig, output_dir: Path, file_name: str | None = None) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     document = Document()
-    active_week_start_iso, active_week_entries = _active_week_entries(config.entries)
-    _write_week_block(document, active_week_start_iso, active_week_entries, config.week_end_day)
+    active_week_start_iso, active_week_entries = _active_week_entries(config.entries, config.week_end_day)
+    _write_week_block(document, active_week_start_iso, active_week_entries)
 
     if file_name:
         target = output_dir / file_name
@@ -129,10 +146,9 @@ def _write_week_block(
     document: Document,
     week_start_iso: str,
     day_map: dict[str, list[EntryRecord]],
-    week_end_day: str,
 ) -> None:
     week_start = datetime.fromisoformat(week_start_iso)
-    week_end = _week_end_date(week_start, week_end_day)
+    week_end = _week_end_date(week_start)
     for _ in range(6):
         document.add_paragraph("")
     document.add_paragraph(f"({week_end.strftime('%Y %b %d')})")

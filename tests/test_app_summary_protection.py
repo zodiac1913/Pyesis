@@ -9,10 +9,29 @@ from pyesis.app import PyesisApp
 from pyesis.config import AppConfig, EntryRecord, RepoConfig
 
 
+class DummyVar:
+    def __init__(self, value: str = "") -> None:
+        self.value = value
+
+    def get(self) -> str:
+        return self.value
+
+    def set(self, value: str) -> None:
+        self.value = value
+
+
 class AppSummaryProtectionTests(unittest.TestCase):
     def _make_app(self) -> PyesisApp:
         app = PyesisApp.__new__(PyesisApp)
         app.config = AppConfig(entries=[])
+        app.week_end_var = DummyVar(app.config.week_end_day)
+        app.status_var = DummyVar()
+        app.backlog_button_var = DummyVar()
+        app.summary_refresh_button_var = DummyVar()
+        app.backlog_button = None
+        app.summary_refresh_button = None
+        app._enhancer_in_flight = False
+        app._refresh_editor = lambda: None
         return app
 
     def test_legacy_rewrite_skips_non_heuristic_entries(self) -> None:
@@ -57,8 +76,8 @@ class AppSummaryProtectionTests(unittest.TestCase):
             day_name="Wednesday",
             week_start_iso="2026-06-22T00:00:00",
             summary="I adjusted return flow in pyesis/ai_summary.py.",
-            diff_hash="hash-heuristic",
-            diff_excerpt="diff --git a/pyesis/ai_summary.py b/pyesis/ai_summary.py\n+++ b/pyesis/ai_summary.py\n@@ -1 +1 @@\n+parser\n",
+            diff_hash="hash-ai",
+            diff_excerpt="diff --git a/pyesis/ai_summary.py b/pyesis/ai_summary.py\n+++ b/pyesis/ai_summary.py\n@@ -1 +1 @@\n+prompt\n",
             summary_source="heuristic",
             author="Backup",
         )
@@ -115,7 +134,7 @@ class AppSummaryProtectionTests(unittest.TestCase):
 
         self.assertEqual(app._current_week_heuristic_entry_count(), 1)
 
-    def test_same_day_heuristic_series_merges_even_after_twenty_minutes(self) -> None:
+    def test_same_day_same_file_distinct_diffs_do_not_merge(self) -> None:
         app = self._make_app()
         existing = EntryRecord(
             repo_label="Pyesis",
@@ -145,9 +164,9 @@ class AppSummaryProtectionTests(unittest.TestCase):
 
         app._merge_or_append_captured_entry(candidate)
 
-        self.assertEqual(len(app.config.entries), 1)
-        self.assertEqual(app.config.entries[0].summary, candidate.summary)
-        self.assertEqual(app.config.entries[0].created_at, existing.created_at)
+        self.assertEqual(len(app.config.entries), 2)
+        self.assertEqual(app.config.entries[0].summary, existing.summary)
+        self.assertEqual(app.config.entries[1].summary, candidate.summary)
 
     def test_next_poll_interval_respects_repo_poll_seconds_even_with_backlog(self) -> None:
         app = self._make_app()
@@ -167,6 +186,84 @@ class AppSummaryProtectionTests(unittest.TestCase):
         self.assertIsNotNone(report)
         self.assertTrue(mock_run.called)
         self.assertNotIn("force_run", mock_run.call_args.kwargs)
+
+    def test_refresh_current_week_weak_summaries_rewrites_low_quality_ai_entry(self) -> None:
+        app = self._make_app()
+        app._build_summary_heuristic = lambda *_args: "I updated wwwroot/js/global/sml/Form/smlToggler.js around 'await togglePanelAsync(nextState);'."
+        now = datetime(2026, 6, 29, 12, 0, 0)
+        app.config.entries = [
+            EntryRecord(
+                repo_label="cms-dotnet-cats-source",
+                repo_path="/tmp/cats",
+                created_at="2026-06-29T10:05:00",
+                day_name="Monday",
+                week_start_iso="2026-06-26T00:00:00",
+                summary="I changed async flow in wwwroot/js/global/sml/Form/smlToggler.js.",
+                diff_hash="weak-ai",
+                diff_excerpt="diff --git a/wwwroot/js/global/sml/Form/smlToggler.js b/wwwroot/js/global/sml/Form/smlToggler.js\n+++ b/wwwroot/js/global/sml/Form/smlToggler.js\n@@ -1 +1 @@\n+await togglePanelAsync(nextState);\n",
+                summary_source="ollama",
+                author="AI",
+                requested_summary_source="ollama",
+                summary_warning="old warning",
+                fallback_summary_source="heuristic",
+                summary_timing_ms=150,
+                summary_provider_details="qwen3-coder:30b",
+            )
+        ]
+
+        with patch("pyesis.app.datetime") as mock_datetime, patch("pyesis.app.save_config") as mock_save:
+            mock_datetime.now.return_value = now
+            mock_datetime.fromisoformat.side_effect = datetime.fromisoformat
+            result = app._refresh_current_week_weak_summaries()
+
+        self.assertEqual(result, "break")
+        self.assertEqual(app.config.entries[0].summary_source, "heuristic")
+        self.assertEqual(app.config.entries[0].author, "Backup")
+        self.assertEqual(app.config.entries[0].requested_summary_source, "heuristic")
+        self.assertEqual(app.config.entries[0].summary_warning, "")
+        self.assertIn("togglePanelAsync", app.config.entries[0].summary)
+        self.assertIn("Refreshed 1 current-week weak summary", app.status_var.get())
+        self.assertTrue(mock_save.called)
+
+    def test_refresh_current_week_weak_summaries_skips_manual_and_strong_entries(self) -> None:
+        app = self._make_app()
+        now = datetime(2026, 6, 29, 12, 0, 0)
+        manual_entry = EntryRecord(
+            repo_label="cms-dotnet-cats-source",
+            repo_path="/tmp/cats",
+            created_at="2026-06-29T09:00:00",
+            day_name="Monday",
+            week_start_iso="2026-06-26T00:00:00",
+            summary="I manually documented the toggler change.",
+            diff_hash="manual",
+            diff_excerpt="diff --git a/file b/file\n",
+            summary_source="manual",
+            author="Manual",
+        )
+        strong_ai_entry = EntryRecord(
+            repo_label="cms-dotnet-cats-source",
+            repo_path="/tmp/cats",
+            created_at="2026-06-29T09:15:00",
+            day_name="Monday",
+            week_start_iso="2026-06-26T00:00:00",
+            summary="I added togglePanelAsync in wwwroot/js/global/sml/Form/smlToggler.js.",
+            diff_hash="strong-ai",
+            diff_excerpt="diff --git a/file b/file\n",
+            summary_source="ollama",
+            author="AI",
+        )
+        app.config.entries = [manual_entry, strong_ai_entry]
+
+        with patch("pyesis.app.datetime") as mock_datetime, patch("pyesis.app.save_config") as mock_save:
+            mock_datetime.now.return_value = now
+            mock_datetime.fromisoformat.side_effect = datetime.fromisoformat
+            result = app._refresh_current_week_weak_summaries()
+
+        self.assertEqual(result, "break")
+        self.assertEqual(app.config.entries[0].summary, manual_entry.summary)
+        self.assertEqual(app.config.entries[1].summary, strong_ai_entry.summary)
+        self.assertEqual(app.status_var.get(), "No current-week weak summaries to refresh")
+        self.assertFalse(mock_save.called)
 
 
 if __name__ == "__main__":

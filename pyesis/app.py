@@ -32,6 +32,7 @@ from pyesis.ai_summary import (
     HEURISTIC_MODE,
     OLLAMA_MODE,
     OPENAI_COMPATIBLE_MODE,
+    _is_low_quality_summary_text,
     build_summary,
 )
 from pyesis.config import (
@@ -78,6 +79,10 @@ OLLAMA_IDLE_STATUS = "[IDLE] Ollama has no active description job"
 POLL_REWRITE_LIMIT = 8
 BACKLOG_POLL_SECONDS = 15
 AI_ATTEMPT_LOG_PATH = Path("logs") / "ai_attempts.jsonl"
+HUMAN_SUMMARY_AUTHORS = {"human", "manual", "user"}
+STRUCTURED_SUMMARY_LABELS = ("who:", "what:", "where:", "when:", "why:", "how:", "description:")
+ADDITIONS_TOKEN = " additions"
+REMOVALS_TOKEN = " removals"
 DIFF_PATH_PREFIX = "+++ b/"
 AI_ATTEMPT_LOG_VIEW_LIMIT = 200
 LISTBOX_SELECT_EVENT = "<<ListboxSelect>>"
@@ -237,6 +242,8 @@ class PyesisApp:
         self.repo_action_button: ttk.Button | None = None
         self.backlog_button: ttk.Button | None = None
         self.backlog_button_var = tk.StringVar(value="Upgrade Oranges")
+        self.summary_refresh_button: ttk.Button | None = None
+        self.summary_refresh_button_var = tk.StringVar(value="Refresh Weak")
         self._poll_in_flight = False
         self._poll_thread: threading.Thread | None = None
         self._poll_results: list[SnapshotCaptureResult] = []
@@ -391,6 +398,12 @@ class PyesisApp:
 
     def _summary_requested_source(self, summary: AISummaryResult, fallback_requested_source: str = "") -> str:
         return (summary.requested_source or fallback_requested_source or summary.source or "").strip().lower()
+
+    def _summary_attempted_at(self, summary: AISummaryResult, fallback_requested_source: str = "") -> str:
+        requested_source = self._summary_requested_source(summary, fallback_requested_source)
+        if requested_source and requested_source != HEURISTIC_MODE:
+            return datetime.now().isoformat(timespec="seconds")
+        return ""
 
     def _primary_path_from_diff(self, diff_excerpt: str) -> str:
         for line in diff_excerpt.splitlines():
@@ -726,6 +739,15 @@ class PyesisApp:
         ai_log_button = ttk.Button(editor_header, text="AI Log", underline=3, width=9, command=self._open_ai_attempt_log)
         ai_log_button.grid(row=0, column=5, sticky="e", padx=(6, 0))
 
+        self.summary_refresh_button = ttk.Button(
+            editor_header,
+            textvariable=self.summary_refresh_button_var,
+            underline=0,
+            width=16,
+            command=self._refresh_current_week_weak_summaries,
+        )
+        self.summary_refresh_button.grid(row=0, column=6, sticky="e", padx=(6, 0))
+
         self.backlog_button = ttk.Button(
             editor_header,
             textvariable=self.backlog_button_var,
@@ -733,13 +755,14 @@ class PyesisApp:
             width=18,
             command=self._force_upgrade_heuristic_backlog,
         )
-        self.backlog_button.grid(row=0, column=6, sticky="e", padx=(6, 0))
+        self.backlog_button.grid(row=0, column=7, sticky="e", padx=(6, 0))
 
         ToolTip(github_button, "Open GitHub Repository (Ctrl+Shift+G)")
         ToolTip(docs_button, lambda: f"Pyesis docx file folder ({self._docx_output_dir()})")
         ToolTip(info_button, "Open README (F1)")
         ToolTip(settings_button, "Settings (Ctrl+,)")
         ToolTip(ai_log_button, "Open AI attempt log (Alt+L)")
+        ToolTip(self.summary_refresh_button, "Rewrite weak current-week summaries with improved heuristic wording (Alt+Shift+W)")
         ToolTip(self.backlog_button, "Force AI rewrite for current-week orange summaries (Alt+W)")
 
         preview_shell = ttk.Frame(editor_area)
@@ -802,6 +825,7 @@ class PyesisApp:
         self.root.bind_all("<Alt-i>", lambda _e: self._open_readme_view())
         self.root.bind_all("<Alt-g>", lambda _e: self._open_github_repo())
         self.root.bind_all("<Alt-l>", lambda _e: self._open_ai_attempt_log())
+        self.root.bind_all("<Alt-W>", lambda _e: self._refresh_current_week_weak_summaries())
         self.root.bind_all("<Alt-w>", lambda _e: self._force_upgrade_heuristic_backlog())
 
     def _on_shortcut_settings(self, _event: tk.Event) -> str:
@@ -974,11 +998,32 @@ class PyesisApp:
         )
         return week_end - timedelta(days=6)
 
+    def _active_week_start(self) -> datetime:
+        return self._week_start_for_datetime(datetime.now())
+
     def _entry_datetime(self, entry: EntryRecord) -> datetime | None:
         try:
             return datetime.fromisoformat(entry.created_at)
         except ValueError:
             return None
+
+    def _entry_week_start(self, entry: EntryRecord) -> datetime | None:
+        raw_week_start = entry.week_start_iso.strip()
+        if raw_week_start:
+            try:
+                return datetime.fromisoformat(raw_week_start)
+            except ValueError:
+                pass
+        entry_dt = self._entry_datetime(entry)
+        if entry_dt is None:
+            return None
+        return self._week_start_for_datetime(entry_dt)
+
+    def _is_current_week_entry(self, entry: EntryRecord) -> bool:
+        entry_week_start = self._entry_week_start(entry)
+        if entry_week_start is None:
+            return False
+        return entry_week_start == self._active_week_start()
 
     def _entry_day_name(self, entry: EntryRecord) -> str:
         entry_dt = self._entry_datetime(entry)
@@ -1033,6 +1078,13 @@ class PyesisApp:
         if self._entry_week_start_iso(previous) != self._entry_week_start_iso(current):
             return False
 
+        previous_diff = self._entry_diff_fingerprint(previous)
+        current_diff = self._entry_diff_fingerprint(current)
+        if not previous_diff or not current_diff:
+            return False
+        if previous_diff != current_diff:
+            return False
+
         previous_source = (previous.summary_source or "").strip().lower()
         current_source = (current.summary_source or "").strip().lower()
         if previous_source == HEURISTIC_MODE and current_source == HEURISTIC_MODE:
@@ -1082,7 +1134,7 @@ class PyesisApp:
             if (entry.summary_source or "").strip().lower() != HEURISTIC_MODE:
                 rewritten.append(entry)
                 continue
-            needs_refresh = self._needs_summary_refresh(entry)
+            needs_refresh = self._needs_summary_refresh(entry) or _is_low_quality_summary_text(entry.summary.strip())
             if needs_refresh and entry.diff_excerpt.strip():
                 next_summary = self._build_summary_heuristic(entry.repo_label, entry.diff_excerpt, entry.repo_path).strip() or entry.summary
                 rewritten.append(
@@ -1104,6 +1156,7 @@ class PyesisApp:
                         fallback_summary_source=entry.fallback_summary_source,
                         summary_timing_ms=entry.summary_timing_ms,
                         summary_provider_details=entry.summary_provider_details,
+                        last_ai_attempt_at=entry.last_ai_attempt_at,
                     )
                 )
             else:
@@ -1120,8 +1173,7 @@ class PyesisApp:
 
     def _needs_summary_refresh(self, entry: EntryRecord) -> bool:
         text = entry.summary.lower()
-        structured_labels = ("who:", "what:", "where:", "when:", "why:", "how:", "description:")
-        if all(label in text for label in structured_labels):
+        if all(label in text for label in STRUCTURED_SUMMARY_LABELS):
             return False
         if text.startswith("i ") and " to " in text and " by " in text:
             return False
@@ -1137,12 +1189,106 @@ class PyesisApp:
             text.startswith("i modified ")
             or (text.startswith("i changed ") and "adding " in text and "removing " in text)
             or text.startswith("implemented modified ")
-            or (" across " in text and " additions" in text and " removals" in text)
+            or (" across " in text and ADDITIONS_TOKEN in text and REMOVALS_TOKEN in text)
             or text.startswith("i expanded configuration handling in ")
             or text.startswith("i ")
             or "\n" not in entry.summary
-            or " with " in text and " additions" in text
+            or (" with " in text and ADDITIONS_TOKEN in text)
         )
+
+    def _needs_manual_summary_refresh(self, entry: EntryRecord) -> bool:
+        text = entry.summary.lower().strip()
+        return (
+            text.startswith("who:")
+            or text.startswith("what:")
+            or text.startswith("where:")
+            or text.startswith("when:")
+            or text.startswith("why:")
+            or text.startswith("how:")
+            or text.startswith("description:")
+            or text.startswith("i worked on ")
+            or text.startswith("i modified ")
+            or text.startswith("implemented modified ")
+            or (text.startswith("i changed ") and "adding " in text and "removing " in text)
+            or (" across " in text and ADDITIONS_TOKEN in text and REMOVALS_TOKEN in text)
+            or (" with " in text and ADDITIONS_TOKEN in text)
+        )
+
+    def _is_current_week_buffer_item(self, item: dict) -> bool:
+        timestamp = str(item.get("datetime", "")).strip()
+        try:
+            item_dt = datetime.fromisoformat(timestamp)
+        except ValueError:
+            return False
+        return self._week_start_for_datetime(item_dt) == self._active_week_start()
+
+    def _summary_needs_rewrite(self, entry: EntryRecord) -> bool:
+        summary_text = entry.summary.strip()
+        if not summary_text:
+            return False
+        return self._needs_manual_summary_refresh(entry) or _is_low_quality_summary_text(summary_text)
+
+    def _is_refreshable_current_week_summary(self, entry: EntryRecord) -> bool:
+        if not self._is_current_week_entry(entry):
+            return False
+        if not entry.diff_excerpt.strip():
+            return False
+        if entry.author.strip().lower() in HUMAN_SUMMARY_AUTHORS:
+            return False
+        if (entry.summary_source or "").strip().lower() in HUMAN_SUMMARY_AUTHORS:
+            return False
+        return self._summary_needs_rewrite(entry)
+
+    def _refreshable_current_week_summary_count(self) -> int:
+        return sum(1 for entry in self.config.entries if self._is_refreshable_current_week_summary(entry))
+
+    def _refresh_current_week_weak_summaries(self):
+        if self._enhancer_in_flight:
+            self.status_var.set("Summary enhancer already running")
+            return "break"
+
+        refreshed = 0
+        updated_entries: list[EntryRecord] = []
+        for entry in self.config.entries:
+            if not self._is_refreshable_current_week_summary(entry):
+                updated_entries.append(entry)
+                continue
+
+            next_summary = self._build_summary_heuristic(entry.repo_label, entry.diff_excerpt, entry.repo_path).strip() or entry.summary
+            updated_entries.append(
+                EntryRecord(
+                    repo_label=entry.repo_label,
+                    repo_path=entry.repo_path,
+                    created_at=entry.created_at,
+                    day_name=entry.day_name,
+                    week_start_iso=entry.week_start_iso,
+                    summary=next_summary,
+                    summary_source=HEURISTIC_MODE,
+                    diff_hash=entry.diff_hash,
+                    diff_excerpt=entry.diff_excerpt,
+                    author="Backup",
+                    rewritten_by=entry.rewritten_by,
+                    rewritten_at=entry.rewritten_at,
+                    requested_summary_source=HEURISTIC_MODE,
+                    summary_warning="",
+                    fallback_summary_source="",
+                    summary_timing_ms=0,
+                    summary_provider_details="",
+                    last_ai_attempt_at=entry.last_ai_attempt_at,
+                )
+            )
+            refreshed += 1
+
+        if refreshed <= 0:
+            self.status_var.set("No current-week weak summaries to refresh")
+            self._update_backlog_button()
+            return "break"
+
+        self.config.entries = updated_entries
+        save_config(self.config)
+        self._refresh_editor()
+        self.status_var.set(f"Refreshed {refreshed} current-week weak summar{'y' if refreshed == 1 else 'ies'}")
+        return "break"
 
     def _persist(self) -> None:
         self.config.week_end_day = self.week_end_var.get()
@@ -2279,17 +2425,11 @@ class PyesisApp:
         self._update_backlog_button()
 
     def _current_week_heuristic_entry_count(self) -> int:
-        active_week = datetime.now().isocalendar()[:2]
         count = 0
         for entry in self.config.entries:
             if (entry.summary_source or "").strip().lower() != HEURISTIC_MODE:
                 continue
-            created_at = entry.created_at.strip()
-            try:
-                entry_week = datetime.fromisoformat(created_at).isocalendar()[:2]
-            except ValueError:
-                continue
-            if entry_week == active_week:
+            if self._is_current_week_entry(entry):
                 count += 1
         return count
 
@@ -2297,6 +2437,12 @@ class PyesisApp:
         count = self._current_week_heuristic_entry_count()
         label = f"Upgrade {count} Oranges" if count else "Upgrade Oranges"
         self.backlog_button_var.set(label)
+        weak_count = self._refreshable_current_week_summary_count()
+        refresh_label = f"Refresh {weak_count} Weak" if weak_count else "Refresh Weak"
+        self.summary_refresh_button_var.set(refresh_label)
+        if self.summary_refresh_button is not None:
+            refresh_state = "disabled" if weak_count == 0 or self._enhancer_in_flight else "normal"
+            self.summary_refresh_button.configure(state=refresh_state)
         if self.backlog_button is None:
             return
         state = "normal"
@@ -2334,16 +2480,10 @@ class PyesisApp:
         return seconds * 1000
 
     def _has_current_week_heuristic_backlog(self) -> bool:
-        active_week = datetime.now().isocalendar()[:2]
         for entry in self.config.entries:
             if (entry.summary_source or "").strip().lower() != HEURISTIC_MODE:
                 continue
-            created_at = entry.created_at.strip()
-            try:
-                entry_week = datetime.fromisoformat(created_at).isocalendar()[:2]
-            except ValueError:
-                continue
-            if entry_week == active_week:
+            if self._is_current_week_entry(entry):
                 return True
         for buffer_file in sorted(BUFFER_DIR.glob("*.json")):
             try:
@@ -2357,12 +2497,7 @@ class PyesisApp:
                     continue
                 if str(item.get("summarySource", "")).strip().lower() != HEURISTIC_MODE:
                     continue
-                timestamp = str(item.get("datetime", "")).strip()
-                try:
-                    item_week = datetime.fromisoformat(timestamp).isocalendar()[:2]
-                except ValueError:
-                    continue
-                if item_week == active_week:
+                if self._is_current_week_buffer_item(item):
                     return True
         return False
 
@@ -2392,6 +2527,7 @@ class PyesisApp:
             "fallback_summary_source": str(existing.get("fallbackSummarySource", "")).strip().lower() if existing is not None else "",
             "summary_timing_ms": max(0, int(existing.get("summaryTimingMs", 0) or 0)) if existing is not None else 0,
             "summary_provider_details": str(existing.get("summaryProviderDetails", "")).strip() if existing is not None else "",
+            "last_ai_attempt_at": str(existing.get("lastAiAttemptAt", "")).strip() if existing is not None else "",
         }
 
         if summary_text.strip() and summary_source == GITHUB_GPT_MODE:
@@ -2437,6 +2573,7 @@ class PyesisApp:
                 "fallback_summary_source": (summary.fallback_source or "").strip().lower(),
                 "summary_timing_ms": max(0, int(summary.timing_ms)),
                 "summary_provider_details": summary.provider_details.strip(),
+                "last_ai_attempt_at": self._summary_attempted_at(summary, self._current_ai_mode()),
             }
         return None
 
@@ -2452,6 +2589,7 @@ class PyesisApp:
             "fallback_summary_source": (summary.fallback_source or "").strip().lower(),
             "summary_timing_ms": max(0, int(summary.timing_ms)),
             "summary_provider_details": summary.provider_details.strip(),
+            "last_ai_attempt_at": self._summary_attempted_at(summary, self._current_ai_mode()),
         }
 
     def _initial_ai_status_text(self) -> str:
@@ -2509,8 +2647,12 @@ class PyesisApp:
         fallback_summary_source: str = "",
         summary_timing_ms: int = 0,
         summary_provider_details: str = "",
+        last_ai_attempt_at: str = "",
     ) -> EntryRecord:
         week_start = self._week_start_for_datetime(created_at)
+        attempted_at = last_ai_attempt_at.strip()
+        if not attempted_at and requested_summary_source and requested_summary_source != HEURISTIC_MODE:
+            attempted_at = created_at.isoformat(timespec="seconds")
         return EntryRecord(
             repo_label=repo.label,
             repo_path=repo.path,
@@ -2529,6 +2671,7 @@ class PyesisApp:
             fallback_summary_source=fallback_summary_source,
             summary_timing_ms=max(0, int(summary_timing_ms)),
             summary_provider_details=summary_provider_details,
+            last_ai_attempt_at=attempted_at,
         )
 
     def _merge_or_append_captured_entry(self, candidate: EntryRecord) -> None:
@@ -2567,6 +2710,7 @@ class PyesisApp:
                 fallback_summary_source=candidate.fallback_summary_source,
                 summary_timing_ms=candidate.summary_timing_ms,
                 summary_provider_details=candidate.summary_provider_details,
+                last_ai_attempt_at=candidate.last_ai_attempt_at,
             )
             return
 
@@ -2740,6 +2884,7 @@ class PyesisApp:
                 str(summary_metadata.get("fallback_summary_source", "")).strip().lower(),
                 max(0, int(summary_metadata.get("summary_timing_ms", 0) or 0)),
                 str(summary_metadata.get("summary_provider_details", "")).strip(),
+                str(summary_metadata.get("last_ai_attempt_at", "")).strip(),
                 self._buffer_day,
             )
             if ledger_item["shown"]:
@@ -2758,6 +2903,7 @@ class PyesisApp:
                 str(ledger_item.get("fallbackSummarySource", "")).strip().lower(),
                 max(0, int(ledger_item.get("summaryTimingMs", 0) or 0)),
                 str(ledger_item.get("summaryProviderDetails", "")).strip(),
+                str(ledger_item.get("lastAiAttemptAt", "")).strip(),
             )
             if self._should_skip_captured_entry(repo, file_path, file_diff_text, new_entry):
                 continue

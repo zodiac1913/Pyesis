@@ -49,6 +49,8 @@ WEAK_TEMPLATE_PATTERNS = (
 )
 HUMAN_AUTHORS = {"human", "user", "manual"}
 HUMAN_SOURCES = {"human", "manual"}
+FAILED_AI_RETRY_WINDOW = timedelta(minutes=10)
+FAILED_AI_RETRY_COOLDOWN = timedelta(minutes=3)
 
 
 @dataclass
@@ -97,6 +99,9 @@ class SummaryRewrite:
     text: str
     source: str
     author: str
+    requested_source: str = ""
+    warning: str = ""
+    fallback_source: str = ""
     timing_ms: int = 0
     provider_details: str = ""
 
@@ -178,27 +183,74 @@ def _call_builder(
             activity_callback(repo_label, repo_path, False)
 
 
-def _rewrite_from_builder_result(result: AISummaryResult | str, current_source: str, current_author: str) -> SummaryRewrite | None:
-    if isinstance(result, AISummaryResult):
-        text = (result.text or "").strip()
-        if not text:
-            return None
-        source = (result.source or current_source or HEURISTIC_MODE).strip().lower() or HEURISTIC_MODE
-        author = "AI" if source != HEURISTIC_MODE else current_author
-        return SummaryRewrite(
-            text=text,
-            source=source,
-            author=author,
-            timing_ms=result.timing_ms,
-            provider_details=result.provider_details,
-        )
+def _author_for_source(source: str, current_author: str) -> str:
+    return "AI" if source != HEURISTIC_MODE else current_author
 
+
+def _rewrite_from_ai_summary_result(result: AISummaryResult, current_source: str, current_author: str) -> SummaryRewrite | None:
+    text = (result.text or "").strip()
+    if not text:
+        return None
+    source = (result.source or current_source or HEURISTIC_MODE).strip().lower() or HEURISTIC_MODE
+    return SummaryRewrite(
+        text=text,
+        source=source,
+        author=_author_for_source(source, current_author),
+        requested_source=(result.requested_source or "").strip().lower(),
+        warning=(result.warning or "").strip(),
+        fallback_source=(result.fallback_source or "").strip().lower(),
+        timing_ms=result.timing_ms,
+        provider_details=result.provider_details,
+    )
+
+
+def _rewrite_from_plain_text_result(result: str, current_source: str, current_author: str) -> SummaryRewrite | None:
     text = str(result or "").strip()
     if not text:
         return None
     source = (current_source or HEURISTIC_MODE).strip().lower() or HEURISTIC_MODE
-    author = "AI" if source != HEURISTIC_MODE else current_author
-    return SummaryRewrite(text=text, source=source, author=author)
+    return SummaryRewrite(
+        text=text,
+        source=source,
+        author=_author_for_source(source, current_author),
+    )
+
+
+def _rewrite_from_builder_result(result: AISummaryResult | str, current_source: str, current_author: str) -> SummaryRewrite | None:
+    if isinstance(result, AISummaryResult):
+        return _rewrite_from_ai_summary_result(result, current_source, current_author)
+    return _rewrite_from_plain_text_result(str(result or ""), current_source, current_author)
+
+
+def _has_failed_ai_upgrade(summary_source: str, requested_summary_source: str, fallback_summary_source: str) -> bool:
+    normalized_source = (summary_source or "").strip().lower()
+    normalized_requested = (requested_summary_source or "").strip().lower()
+    normalized_fallback = (fallback_summary_source or "").strip().lower()
+    return (
+        normalized_source == HEURISTIC_MODE
+        and normalized_requested not in {"", HEURISTIC_MODE}
+        and normalized_fallback == HEURISTIC_MODE
+    )
+
+
+def _should_persist_failed_ai_upgrade(rewrite: SummaryRewrite | None, force_ai_upgrade: bool) -> bool:
+    return bool(
+        force_ai_upgrade
+        and rewrite is not None
+        and rewrite.source == HEURISTIC_MODE
+        and rewrite.requested_source not in {"", HEURISTIC_MODE}
+        and rewrite.fallback_source == HEURISTIC_MODE
+    )
+
+
+def _should_retry_failed_ai_upgrade(created_at: str, last_ai_attempt_at: str, current_time: datetime) -> bool:
+    created = _parse_iso(created_at)
+    last_attempt = _parse_iso(last_ai_attempt_at)
+    if created is None or last_attempt is None:
+        return False
+    if current_time > (created + FAILED_AI_RETRY_WINDOW):
+        return False
+    return current_time >= (last_attempt + FAILED_AI_RETRY_COOLDOWN)
 
 
 def _read_buffer_items(path: Path) -> list[dict]:
@@ -283,10 +335,27 @@ def _eligible_state_entry(
     active_week_start: datetime,
     aggressive_prodding: bool,
     force_ai_upgrade: bool,
+    allow_retry_failed_ai_upgrade: bool,
+    current_time: datetime,
 ) -> bool:
     if not _is_current_week_entry(entry, active_week_start):
         return False
     if _is_protected_ai_source(entry.summary_source):
+        return False
+    if (
+        force_ai_upgrade
+        and _has_failed_ai_upgrade(
+            entry.summary_source,
+            entry.requested_summary_source,
+            entry.fallback_summary_source,
+        )
+        and not allow_retry_failed_ai_upgrade
+        and not _should_retry_failed_ai_upgrade(
+            entry.created_at,
+            entry.last_ai_attempt_at,
+            current_time,
+        )
+    ):
         return False
     if not force_ai_upgrade and not aggressive_prodding and not _looks_weak(entry.summary):
         return False
@@ -302,10 +371,27 @@ def _eligible_buffer_item(
     active_week_start: datetime,
     aggressive_prodding: bool,
     force_ai_upgrade: bool,
+    allow_retry_failed_ai_upgrade: bool,
+    current_time: datetime,
 ) -> bool:
     if not _is_current_week_timestamp(str(item.get("datetime", "")), active_week_start):
         return False
     if _is_protected_ai_source(str(item.get("summarySource", ""))):
+        return False
+    if (
+        force_ai_upgrade
+        and _has_failed_ai_upgrade(
+            str(item.get("summarySource", "")),
+            str(item.get("requestedSummarySource", "")),
+            str(item.get("fallbackSummarySource", "")),
+        )
+        and not allow_retry_failed_ai_upgrade
+        and not _should_retry_failed_ai_upgrade(
+            str(item.get("datetime", "")),
+            str(item.get("lastAiAttemptAt", "")),
+            current_time,
+        )
+    ):
         return False
     if _is_human_authored(str(item.get("author", "")), str(item.get("summarySource", ""))):
         return False
@@ -368,13 +454,33 @@ def _build_summary_with_priority_modes(
     repo_path: str | None,
 ) -> AISummaryResult:
     last_result: AISummaryResult | None = None
+    last_failed_ai_result: AISummaryResult | None = None
     warnings: list[str] = []
 
     for mode in _preferred_summary_modes(config):
         result = _build_summary_for_mode(config, repo_label, diff_text, repo_path, mode)
         if result.warning.strip():
             warnings.append(result.warning.strip())
+        if (
+            mode != HEURISTIC_MODE
+            and result.text.strip()
+            and result.source == HEURISTIC_MODE
+            and (result.requested_source or "").strip().lower() not in {"", HEURISTIC_MODE}
+            and (result.fallback_source or "").strip().lower() == HEURISTIC_MODE
+        ):
+            last_failed_ai_result = result
         if _accept_summary_result(result, mode):
+            if mode == HEURISTIC_MODE and last_failed_ai_result is not None and result.source == HEURISTIC_MODE:
+                merged_result = AISummaryResult(
+                    text=result.text,
+                    source=result.source,
+                    requested_source=last_failed_ai_result.requested_source,
+                    warning=last_failed_ai_result.warning,
+                    fallback_source=last_failed_ai_result.fallback_source,
+                    timing_ms=last_failed_ai_result.timing_ms,
+                    provider_details=last_failed_ai_result.provider_details,
+                )
+                return _attach_summary_warnings(merged_result, warnings)
             return _attach_summary_warnings(result, warnings)
         last_result = result
 
@@ -512,6 +618,8 @@ def _rewrite_state_entries(
     rewritten_at: str,
     dry_run: bool,
     aggressive_prodding: bool,
+    allow_retry_failed_ai_upgrade: bool,
+    current_time: datetime,
     report: EnhanceReport,
 ) -> None:
     ordered_entries = sorted(enumerate(config.entries), key=lambda item: _state_rewrite_order(item[1]))
@@ -521,7 +629,14 @@ def _rewrite_state_entries(
             report.skipped_human += 1
             continue
         force_ai_upgrade = _should_force_ai_upgrade(entry.summary_source, config)
-        if not _eligible_state_entry(entry, active_week_start, aggressive_prodding, force_ai_upgrade):
+        if not _eligible_state_entry(
+            entry,
+            active_week_start,
+            aggressive_prodding,
+            force_ai_upgrade,
+            allow_retry_failed_ai_upgrade,
+            current_time,
+        ):
             _count_strong_skip(report, force_ai_upgrade, aggressive_prodding, entry.summary)
             continue
 
@@ -544,6 +659,28 @@ def _rewrite_state_entries(
         )
         if not _accept_rewrite(rewrite, force_ai_upgrade):
             _log_rewrite_skip(report, "State", entry.repo_label, rewrite, force_ai_upgrade, builder_call.duration_seconds)
+            if not dry_run and _should_persist_failed_ai_upgrade(rewrite, force_ai_upgrade):
+                assert rewrite is not None
+                config.entries[index] = EntryRecord(
+                    repo_label=entry.repo_label,
+                    repo_path=entry.repo_path,
+                    created_at=entry.created_at,
+                    day_name=entry.day_name,
+                    week_start_iso=entry.week_start_iso,
+                    summary=entry.summary,
+                    diff_hash=entry.diff_hash,
+                    diff_excerpt=entry.diff_excerpt,
+                    summary_source=entry.summary_source,
+                    author=entry.author,
+                    rewritten_by=entry.rewritten_by,
+                    rewritten_at=entry.rewritten_at,
+                    requested_summary_source=rewrite.requested_source,
+                    summary_warning=rewrite.warning,
+                    fallback_summary_source=rewrite.fallback_source,
+                    summary_timing_ms=max(0, int(rewrite.timing_ms)),
+                    summary_provider_details=rewrite.provider_details,
+                    last_ai_attempt_at=rewritten_at,
+                )
             continue
 
         report.rewritten_state += 1
@@ -565,6 +702,12 @@ def _rewrite_state_entries(
             author=rewrite.author,
             rewritten_by=rewritten_by,
             rewritten_at=rewritten_at,
+            requested_summary_source=rewrite.requested_source,
+            summary_warning=rewrite.warning,
+            fallback_summary_source=rewrite.fallback_source,
+            summary_timing_ms=max(0, int(rewrite.timing_ms)),
+            summary_provider_details=rewrite.provider_details,
+            last_ai_attempt_at=rewritten_at,
         )
 
 
@@ -580,6 +723,8 @@ def _rewrite_buffer_items(
     rewritten_at: str,
     dry_run: bool,
     aggressive_prodding: bool,
+    allow_retry_failed_ai_upgrade: bool,
+    current_time: datetime,
     report: EnhanceReport,
 ) -> bool:
     file_changed = False
@@ -589,7 +734,14 @@ def _rewrite_buffer_items(
             report.skipped_human += 1
             continue
         force_ai_upgrade = _should_force_ai_upgrade(str(item.get("summarySource", "")), config)
-        if not _eligible_buffer_item(item, active_week_start, aggressive_prodding, force_ai_upgrade):
+        if not _eligible_buffer_item(
+            item,
+            active_week_start,
+            aggressive_prodding,
+            force_ai_upgrade,
+            allow_retry_failed_ai_upgrade,
+            current_time,
+        ):
             description = str(item.get("gitDiffDescription", ""))
             _count_strong_skip(report, force_ai_upgrade, aggressive_prodding, description)
             continue
@@ -623,6 +775,15 @@ def _rewrite_buffer_items(
                 force_ai_upgrade,
                 builder_call.duration_seconds,
             )
+            if not dry_run and _should_persist_failed_ai_upgrade(rewrite, force_ai_upgrade):
+                assert rewrite is not None
+                item["requestedSummarySource"] = rewrite.requested_source
+                item["summaryWarning"] = rewrite.warning
+                item["fallbackSummarySource"] = rewrite.fallback_source
+                item["summaryTimingMs"] = max(0, int(rewrite.timing_ms))
+                item["summaryProviderDetails"] = rewrite.provider_details
+                item["lastAiAttemptAt"] = rewritten_at
+                file_changed = True
             continue
 
         report.rewritten_buffer += 1
@@ -642,6 +803,12 @@ def _rewrite_buffer_items(
         item["author"] = rewrite.author
         item["rewrittenBy"] = rewritten_by
         item["rewrittenAt"] = rewritten_at
+        item["requestedSummarySource"] = rewrite.requested_source
+        item["summaryWarning"] = rewrite.warning
+        item["fallbackSummarySource"] = rewrite.fallback_source
+        item["summaryTimingMs"] = max(0, int(rewrite.timing_ms))
+        item["summaryProviderDetails"] = rewrite.provider_details
+        item["lastAiAttemptAt"] = rewritten_at
         file_changed = True
     return file_changed
 
@@ -658,6 +825,8 @@ def _rewrite_buffer_files(
     rewritten_at: str,
     dry_run: bool,
     aggressive_prodding: bool,
+    allow_retry_failed_ai_upgrade: bool,
+    current_time: datetime,
     report: EnhanceReport,
 ) -> bool:
     updated = False
@@ -676,6 +845,8 @@ def _rewrite_buffer_files(
             rewritten_at=rewritten_at,
             dry_run=dry_run,
             aggressive_prodding=aggressive_prodding,
+            allow_retry_failed_ai_upgrade=allow_retry_failed_ai_upgrade,
+            current_time=current_time,
             report=report,
         )
         if file_changed:
@@ -714,6 +885,7 @@ def run_periodic_enhancer(
         aggressive_prodding = bool(config.summary_enhancer_aggressive_prodding)
     else:
         aggressive_prodding = aggressive_prodding_override
+    allow_retry_failed_ai_upgrade = force_run or aggressive_prodding
     builder = summary_builder or _default_builder(config)
 
     if not (resolved_state_path.exists() or resolved_state_path.parent.exists()):
@@ -729,6 +901,8 @@ def run_periodic_enhancer(
         rewritten_at=rewritten_at,
         dry_run=dry_run,
         aggressive_prodding=aggressive_prodding,
+        allow_retry_failed_ai_upgrade=allow_retry_failed_ai_upgrade,
+        current_time=current_time,
         report=report,
     )
     buffer_updated = _rewrite_buffer_files(
@@ -742,6 +916,8 @@ def run_periodic_enhancer(
         rewritten_at=rewritten_at,
         dry_run=dry_run,
         aggressive_prodding=aggressive_prodding,
+        allow_retry_failed_ai_upgrade=allow_retry_failed_ai_upgrade,
+        current_time=current_time,
         report=report,
     )
 

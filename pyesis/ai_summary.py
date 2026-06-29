@@ -588,6 +588,10 @@ def _normalized_clause(text: str) -> str:
     return normalized
 
 
+def _contains_low_quality_marker(normalized_text: str) -> bool:
+    return any(_normalized_clause(marker) in normalized_text for marker in LOW_QUALITY_AI_MARKERS)
+
+
 def _best_sample_snippet(change: FileChangeSummary) -> str:
     candidate = ""
     if change.added_samples:
@@ -657,14 +661,14 @@ def _is_low_quality_ai_field(field_name: str, value: str) -> bool:
         return True
     if field_name == "what" and not normalized.startswith("i "):
         return True
-    if field_name in {"what", "why", "how"} and any(marker in normalized for marker in LOW_QUALITY_AI_MARKERS):
+    if field_name in {"what", "why", "how"} and _contains_low_quality_marker(normalized):
         return True
     return False
 
 
 def _is_low_quality_summary_text(text: str) -> bool:
     normalized = _normalized_clause(text)
-    return any(marker in normalized for marker in LOW_QUALITY_AI_MARKERS)
+    return _contains_low_quality_marker(normalized)
 
 
 def _summary_relevant_changes(changes: list[FileChangeSummary]) -> list[FileChangeSummary]:
@@ -1208,6 +1212,7 @@ def _file_phrase(change: FileChangeSummary) -> str:
     path = change.path
     path_l = path.lower()
     intents = _intents_for_change(change)
+    significant_intents = [intent for intent in intents if intent not in LOW_SIGNAL_INTENTS]
     import_targets = _import_targets(change)
     has_import_intent = IMPORT_INTENT in intents
 
@@ -1216,15 +1221,21 @@ def _file_phrase(change: FileChangeSummary) -> str:
         return special
 
     if any(token in path_l for token in ("controller", "service", "extension", "handler")):
-        if intents:
-            if has_import_intent and import_targets:
-                return f"updated imports in {path} to use {_join_with_and(import_targets[:3])}"
-            return f"{_to_past_tense(intents[0])} in {path}"
-        return f"refined logic in {path}"
-    if intents:
         if has_import_intent and import_targets:
             return f"updated imports in {path} to use {_join_with_and(import_targets[:3])}"
-        return f"{_to_past_tense(intents[0])} in {path}"
+        if significant_intents:
+            return f"{_to_past_tense(significant_intents[0])} in {path}"
+        anchored_phrase = _anchored_change_phrase(change)
+        if anchored_phrase:
+            return anchored_phrase
+        return f"refined logic in {path}"
+    if has_import_intent and import_targets:
+        return f"updated imports in {path} to use {_join_with_and(import_targets[:3])}"
+    if significant_intents:
+        return f"{_to_past_tense(significant_intents[0])} in {path}"
+    anchored_phrase = _anchored_change_phrase(change)
+    if anchored_phrase:
+        return anchored_phrase
     return f"changed {path}"
 
 
@@ -1396,7 +1407,6 @@ def _intent_rules(added: str, removed: str, combined: str) -> list[tuple[str, bo
         ("adjusting return flow", "return " in added and "return " in removed),
         ("updating mapping logic", "map(" in combined or "mapper" in combined),
         ("tightening validation", "validate" in combined or "validator" in combined),
-        ("changing async flow", "await " in combined or "async " in combined),
         ("cleaning up code layout", any(token in combined for token in ("/// <summary>", "public ", "function ", "class ")) and abs(len(added.splitlines()) - len(removed.splitlines())) <= 6),
         ("rewiring page state", any(token in added for token in ("window.appsec", "window.cso", "leviathan", "levi="))),
         ("restoring legacy script cleanup", "removelegacyscripts" in combined),

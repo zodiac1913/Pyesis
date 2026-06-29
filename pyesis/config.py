@@ -65,6 +65,7 @@ class EntryRecord:
     fallback_summary_source: str = ""
     summary_timing_ms: int = 0
     summary_provider_details: str = ""
+    last_ai_attempt_at: str = ""
 
 
 @dataclass
@@ -225,6 +226,9 @@ def _is_semantic_duplicate(
     entry_fp: list[str],
     seen_semantic: set[tuple[str, str, str, str, tuple[str, ...]]],
 ) -> bool:
+    if _entry_diff_fingerprint(entry):
+        return False
+
     semantic_key = (
         entry.repo_path,
         entry.week_start_iso,
@@ -244,6 +248,7 @@ def _merge_or_append_entry(
     deduped: list[EntryRecord],
     deduped_file_fp: list[list[str]],
 ) -> None:
+    entry_diff = _entry_diff_fingerprint(entry)
     if entry_fp:
         for idx, existing in enumerate(deduped):
             if (
@@ -252,6 +257,9 @@ def _merge_or_append_entry(
                 and existing.day_name == entry.day_name
                 and _fingerprint_overlap(entry_fp, deduped_file_fp[idx])
             ):
+                existing_diff = _entry_diff_fingerprint(existing)
+                if not entry_diff or not existing_diff or entry_diff != existing_diff:
+                    continue
                 existing_source = (existing.summary_source or "").strip().lower()
                 entry_source = (entry.summary_source or "").strip().lower()
                 if existing_source != "heuristic" and entry_source == "heuristic":
@@ -333,6 +341,7 @@ def _decode_entry(item: dict[str, Any]) -> EntryRecord:
         fallback_summary_source=str(item.get("fallback_summary_source", "")).strip().lower(),
         summary_timing_ms=max(0, int(item.get("summary_timing_ms", 0) or 0)),
         summary_provider_details=str(item.get("summary_provider_details", "")).strip(),
+        last_ai_attempt_at=str(item.get("last_ai_attempt_at", "")).strip(),
         diff_hash=item["diff_hash"],
         diff_excerpt=item.get("diff_excerpt", ""),
     )
@@ -366,6 +375,7 @@ def _should_rewrite_saved_entries(
     missing_fallback_source = any(isinstance(item, dict) and "fallback_summary_source" not in item for item in raw_entry_items)
     missing_timing = any(isinstance(item, dict) and "summary_timing_ms" not in item for item in raw_entry_items)
     missing_provider_details = any(isinstance(item, dict) and "summary_provider_details" not in item for item in raw_entry_items)
+    missing_last_ai_attempt = any(isinstance(item, dict) and "last_ai_attempt_at" not in item for item in raw_entry_items)
     return (
         len(entries) != len(raw_entries)
         or missing_entry_author
@@ -375,6 +385,7 @@ def _should_rewrite_saved_entries(
         or missing_fallback_source
         or missing_timing
         or missing_provider_details
+        or missing_last_ai_attempt
     )
 
 

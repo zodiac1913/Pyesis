@@ -27,6 +27,7 @@ class DiffLedgerItem(TypedDict):
     fallbackSummarySource: str
     summaryTimingMs: int
     summaryProviderDetails: str
+    lastAiAttemptAt: str
 
 
 def _today_key() -> str:
@@ -87,6 +88,7 @@ def _read_items(path: Path) -> list[DiffLedgerItem]:
         fallback_summary_source = str(raw.get("fallbackSummarySource", "")).strip().lower()
         summary_timing_ms = max(0, int(raw.get("summaryTimingMs", 0) or 0))
         summary_provider_details = str(raw.get("summaryProviderDetails", "")).strip()
+        last_ai_attempt_at = str(raw.get("lastAiAttemptAt", "")).strip()
         if not repo or not git_diff_text:
             continue
         items.append(
@@ -107,6 +109,7 @@ def _read_items(path: Path) -> list[DiffLedgerItem]:
                 "fallbackSummarySource": fallback_summary_source,
                 "summaryTimingMs": summary_timing_ms,
                 "summaryProviderDetails": summary_provider_details,
+                "lastAiAttemptAt": last_ai_attempt_at,
             }
         )
     return items
@@ -132,6 +135,7 @@ def _write_items(path: Path, items: list[DiffLedgerItem]) -> None:
             "fallbackSummarySource": item["fallbackSummarySource"],
             "summaryTimingMs": item["summaryTimingMs"],
             "summaryProviderDetails": item["summaryProviderDetails"],
+            "lastAiAttemptAt": item["lastAiAttemptAt"],
         }
         for item in items
     ]
@@ -168,6 +172,7 @@ def _update_existing_item(
     fallback_summary_source: str,
     summary_timing_ms: int,
     summary_provider_details: str,
+    last_ai_attempt_at: str,
     created_at: str,
     repo_path: str,
 ) -> None:
@@ -182,6 +187,7 @@ def _update_existing_item(
     item["fallbackSummarySource"] = fallback_summary_source
     item["summaryTimingMs"] = max(0, int(summary_timing_ms))
     item["summaryProviderDetails"] = summary_provider_details
+    item["lastAiAttemptAt"] = last_ai_attempt_at
     item["datetime"] = created_at
     item["repoPath"] = repo_path
 
@@ -198,6 +204,7 @@ def remember_diff(
     fallback_summary_source: str = "",
     summary_timing_ms: int = 0,
     summary_provider_details: str = "",
+    last_ai_attempt_at: str = "",
     day_key: str | None = None,
 ) -> DiffLedgerItem:
     active_day = day_key or _today_key()
@@ -219,6 +226,7 @@ def remember_diff(
             fallback_summary_source=fallback_summary_source,
             summary_timing_ms=summary_timing_ms,
             summary_provider_details=summary_provider_details,
+            last_ai_attempt_at=last_ai_attempt_at,
             created_at=created_at,
             repo_path=repo_path,
         )
@@ -242,6 +250,7 @@ def remember_diff(
         "fallbackSummarySource": fallback_summary_source,
         "summaryTimingMs": max(0, int(summary_timing_ms)),
         "summaryProviderDetails": summary_provider_details,
+        "lastAiAttemptAt": last_ai_attempt_at,
     }
     items.append(new_item)
     _write_items(path, items)

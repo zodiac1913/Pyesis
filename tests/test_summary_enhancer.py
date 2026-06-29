@@ -967,6 +967,113 @@ class SummaryEnhancerTests(unittest.TestCase):
         self.assertEqual(report.skipped_ai_unavailable, 1)
         self.assertEqual(config.entries[0].summary, "made updates")
         self.assertEqual(config.entries[0].rewritten_at, "")
+        self.assertEqual(config.entries[0].requested_summary_source, "ollama")
+        self.assertEqual(config.entries[0].fallback_summary_source, "heuristic")
+        self.assertIn("offline", config.entries[0].summary_warning)
+        self.assertEqual(config.entries[0].last_ai_attempt_at, "2026-06-16T11:45:00")
+
+        with patch("pyesis.summary_enhancer.build_summary") as second_attempt:
+            second_report = run_periodic_enhancer(
+                config,
+                now=datetime(2026, 6, 16, 11, 47, 0),
+            )
+
+        self.assertTrue(second_report.ran)
+        self.assertEqual(second_report.rewritten_state, 0)
+        self.assertFalse(second_attempt.called)
+
+    def test_failed_ai_upgrade_retries_after_cooldown_within_ten_minutes(self) -> None:
+        entry = EntryRecord(
+            repo_label="RepoRetryWindow",
+            repo_path="repos/repo-retry-window",
+            created_at="2026-06-16T11:44:00",
+            day_name="Monday",
+            week_start_iso="2026-06-15T00:00:00",
+            summary="made updates",
+            diff_hash="retry-window-1",
+            diff_excerpt="diff --git a/a.py b/a.py\n+++ b/a.py\n@@ -0,0 +1 @@\n+print('retry-window')\n",
+            summary_source="heuristic",
+            author="Backup",
+            requested_summary_source="ollama",
+            summary_warning="Ollama summary failed: offline",
+            fallback_summary_source="heuristic",
+            last_ai_attempt_at="2026-06-16T11:45:00",
+        )
+
+        config = self._base_config()
+        config.summary_enhancer_dry_run = False
+        config.ai_mode = "ollama"
+        config.ai_ollama_model = "qwen3-coder:30b"
+        config.entries = [entry]
+
+        with patch("pyesis.summary_enhancer.build_summary") as early_attempt:
+            early_report = run_periodic_enhancer(
+                config,
+                now=datetime(2026, 6, 16, 11, 47, 0),
+            )
+
+        self.assertTrue(early_report.ran)
+        self.assertEqual(early_report.rewritten_state, 0)
+        self.assertFalse(early_attempt.called)
+
+        with patch("pyesis.summary_enhancer.build_summary") as retry_attempt:
+            retry_attempt.return_value = AISummaryResult(
+                text="I documented the fresh retry path and the AI rewrite completed before the orange window expired.",
+                source="ollama",
+                requested_source="ollama",
+            )
+
+            retry_report = run_periodic_enhancer(
+                config,
+                now=datetime(2026, 6, 16, 11, 48, 0),
+            )
+
+        self.assertTrue(retry_report.ran)
+        self.assertEqual(retry_report.rewritten_state, 1)
+        self.assertEqual(config.entries[0].summary_source, "ollama")
+        self.assertEqual(config.entries[0].author, "AI")
+
+    def test_force_run_retries_failed_ai_upgrade_after_metadata_stamp(self) -> None:
+        entry = EntryRecord(
+            repo_label="RepoRetryForced",
+            repo_path="repos/repo-retry-forced",
+            created_at="2026-06-16T09:10:00",
+            day_name="Monday",
+            week_start_iso="2026-06-15T00:00:00",
+            summary="made updates",
+            diff_hash="retry-ai-3",
+            diff_excerpt="diff --git a/a.py b/a.py\n+++ b/a.py\n@@ -0,0 +1 @@\n+print('retry-force')\n",
+            summary_source="heuristic",
+            author="Backup",
+            requested_summary_source="ollama",
+            summary_warning="Ollama summary failed: offline",
+            fallback_summary_source="heuristic",
+        )
+
+        config = self._base_config()
+        config.summary_enhancer_dry_run = False
+        config.ai_mode = "ollama"
+        config.ai_ollama_model = "qwen3-coder:30b"
+        config.entries = [entry]
+
+        with patch("pyesis.summary_enhancer.build_summary") as fake_build_summary:
+            fake_build_summary.return_value = AISummaryResult(
+                text="I documented the exact retry path after the prior Ollama fallback and confirmed the AI rewrite succeeded.",
+                source="ollama",
+                requested_source="ollama",
+                provider_details="qwen3-coder:30b",
+            )
+
+            report = run_periodic_enhancer(
+                config,
+                now=datetime(2026, 6, 16, 11, 50, 0),
+                force_run=True,
+            )
+
+        self.assertTrue(report.ran)
+        self.assertEqual(report.rewritten_state, 1)
+        self.assertEqual(config.entries[0].summary_source, "ollama")
+        self.assertEqual(config.entries[0].author, "AI")
 
     def test_attempt_logs_include_duration_and_provider(self) -> None:
         entry = EntryRecord(

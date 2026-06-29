@@ -295,6 +295,49 @@ class AISummaryTests(unittest.TestCase):
         self.assertIn("content preview:", result.warning)
         self.assertIn("Here is your answer:", result.warning)
 
+    def test_heuristic_summary_uses_async_snippet_instead_of_async_flow_filler(self) -> None:
+        diff_text = (
+            "diff --git a/wwwroot/js/global/sml/Form/smlForm.js b/wwwroot/js/global/sml/Form/smlForm.js\n"
+            "+++ b/wwwroot/js/global/sml/Form/smlForm.js\n"
+            "@@ -40,2 +40,3 @@\n"
+            "-    submitForm();\n"
+            "+    await submitFormAsync(payload);\n"
+            "+    toggleSubmitState(false);\n"
+        )
+
+        result = build_summary("cms-dotnet-cats-source", diff_text, repo_path="/tmp/repo", mode="heuristic")
+
+        self.assertIn("submitFormAsync", result.text)
+        self.assertNotIn("changed async flow", result.text.lower())
+
+    def test_low_quality_async_flow_ai_summary_repairs_to_async_snippet(self) -> None:
+        diff_text = (
+            "diff --git a/wwwroot/js/global/sml/Form/smlToggler.js b/wwwroot/js/global/sml/Form/smlToggler.js\n"
+            "+++ b/wwwroot/js/global/sml/Form/smlToggler.js\n"
+            "@@ -15,2 +15,3 @@\n"
+            "-    toggle();\n"
+            "+    await togglePanelAsync(nextState);\n"
+            "+    syncToggleButton(nextState);\n"
+        )
+        changes = _coalesce_changes(summarize_file_changes(diff_text))
+
+        repaired = _structured_summary_from_json(
+            {
+                "who": "I",
+                "what": "I changed async flow in wwwroot/js/global/sml/Form/smlToggler.js.",
+                "where": "wwwroot/js/global/sml/Form/smlToggler.js",
+                "when": "Not available from the diff.",
+                "why": "changed async flow",
+                "how": "changed async flow",
+            },
+            changes,
+            "cms-dotnet-cats-source",
+        )
+
+        repaired_text = repaired.to_text()
+        self.assertIn("togglePanelAsync", repaired_text)
+        self.assertNotIn("changed async flow", repaired_text.lower())
+
 
 if __name__ == "__main__":
     unittest.main()
