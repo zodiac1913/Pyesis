@@ -257,6 +257,14 @@ def _merge_or_append_entry(
                 and existing.day_name == entry.day_name
                 and _fingerprint_overlap(entry_fp, deduped_file_fp[idx])
             ):
+                if _same_summary_duplicate(existing, entry):
+                    existing_source = (existing.summary_source or "").strip().lower()
+                    entry_source = (entry.summary_source or "").strip().lower()
+                    if existing_source != "heuristic" and entry_source == "heuristic":
+                        return
+                    deduped[idx] = entry
+                    deduped_file_fp[idx] = entry_fp
+                    return
                 existing_diff = _entry_diff_fingerprint(existing)
                 if not entry_diff or not existing_diff or entry_diff != existing_diff:
                     continue
@@ -270,6 +278,15 @@ def _merge_or_append_entry(
 
     deduped.append(entry)
     deduped_file_fp.append(entry_fp)
+
+
+def _same_summary_duplicate(existing: EntryRecord, candidate: EntryRecord) -> bool:
+    return _normalized_repeat_summary(existing.summary) == _normalized_repeat_summary(candidate.summary)
+
+
+def _normalized_repeat_summary(summary: str) -> str:
+    cleaned = re.sub(r"\s+", " ", summary.strip().lower())
+    return cleaned.rstrip(".")
 
 
 def _summary_prefix40_normalized(summary: str) -> str:

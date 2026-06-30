@@ -107,6 +107,37 @@ class ConfigSummaryProtectionTests(unittest.TestCase):
         self.assertEqual(len(deduped), 2)
         self.assertEqual({entry.diff_hash for entry in deduped}, {"hash-one", "hash-two"})
 
+    def test_dedupe_collapses_same_day_same_file_exact_same_summary(self) -> None:
+        first_entry = EntryRecord(
+            repo_label="Cats",
+            repo_path="/tmp/cats",
+            created_at="2026-06-30T07:18:57",
+            day_name="Tuesday",
+            week_start_iso="2026-06-26T00:00:00",
+            summary="I cleaning up code layout in Controllers/Configurer/Configs/AppConfig.cs.",
+            diff_hash="hash-one",
+            diff_excerpt="diff --git a/Controllers/Configurer/Configs/AppConfig.cs b/Controllers/Configurer/Configs/AppConfig.cs\n+++ b/Controllers/Configurer/Configs/AppConfig.cs\n@@ -1 +1 @@\n+CfgReport<AppFacadeDTO> ctx\n",
+            summary_source="ollama",
+            author="AI",
+        )
+        second_entry = EntryRecord(
+            repo_label="Cats",
+            repo_path="/tmp/cats",
+            created_at="2026-06-30T07:44:57",
+            day_name="Tuesday",
+            week_start_iso="2026-06-26T00:00:00",
+            summary="I cleaning up code layout in Controllers/Configurer/Configs/AppConfig.cs.",
+            diff_hash="hash-two",
+            diff_excerpt="diff --git a/Controllers/Configurer/Configs/AppConfig.cs b/Controllers/Configurer/Configs/AppConfig.cs\n+++ b/Controllers/Configurer/Configs/AppConfig.cs\n@@ -1 +1 @@\n+CfgReport<AppFacadeDTO> report\n",
+            summary_source="ollama",
+            author="AI",
+        )
+
+        deduped = dedupe_entries([first_entry, second_entry])
+
+        self.assertEqual(len(deduped), 1)
+        self.assertEqual(deduped[0].diff_hash, "hash-two")
+
 
 if __name__ == "__main__":
     unittest.main()

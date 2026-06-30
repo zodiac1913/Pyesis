@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from pyesis.config import AppConfig, EntryRecord
-from pyesis.document_formatter import render_plain_text
+from pyesis.document_formatter import render_plain_text, render_text_chunks
 
 
 class DocumentFormatterTests(unittest.TestCase):
@@ -63,6 +63,36 @@ class DocumentFormatterTests(unittest.TestCase):
             output = render_plain_text(config)
 
         self.assertIn("(2026 Jul 02)", output)
+
+    def test_render_text_chunks_can_show_warning_comment_with_custom_tags(self) -> None:
+        entry = EntryRecord(
+            repo_label="Pyesis",
+            repo_path="/tmp/pyesis",
+            created_at="2026-06-29T06:37:47",
+            day_name="Monday",
+            week_start_iso="2026-06-26T00:00:00",
+            summary="I kept the existing heuristic summary.",
+            diff_hash="hash-warning",
+            diff_excerpt="diff --git a/a.py b/a.py\n+++ b/a.py\n",
+            summary_source="heuristic",
+            author="Backup",
+            summary_warning="Ollama summary failed: offline",
+        )
+        config = AppConfig(week_end_day="Thursday", entries=[entry])
+
+        with patch("pyesis.document_formatter.datetime") as mock_datetime:
+            mock_datetime.now.return_value = datetime(2026, 6, 29, 12, 0, 0)
+            mock_datetime.fromisoformat.side_effect = datetime.fromisoformat
+            chunks = render_text_chunks(
+                config,
+                entry_tag_resolver=lambda _entry: ("ai-failed",),
+                warning_comment_resolver=lambda current: f"[[{current.summary_warning}]]",
+            )
+
+        rendered_text = "".join(chunk.text for chunk in chunks)
+        self.assertIn("[[Ollama summary failed: offline]]", rendered_text)
+        comment_chunk = next(chunk for chunk in chunks if "[[Ollama summary failed: offline]]" in chunk.text)
+        self.assertEqual(comment_chunk.tags, ("ai-failed", "ai-comment"))
 
 
 if __name__ == "__main__":

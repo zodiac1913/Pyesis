@@ -24,7 +24,7 @@ DAY_ORDER = [
 @dataclass(frozen=True)
 class RenderedTextChunk:
     text: str
-    tag: str = ""
+    tags: tuple[str, ...] = ()
 
 
 def _week_end_day_index(week_end_day: str) -> int:
@@ -81,13 +81,17 @@ def render_plain_text(config: AppConfig) -> str:
     return "".join(chunk.text for chunk in render_text_chunks(config)).rstrip("\n") + "\n"
 
 
-def render_text_chunks(config: AppConfig) -> list[RenderedTextChunk]:
+def render_text_chunks(
+    config: AppConfig,
+    entry_tag_resolver=None,
+    warning_comment_resolver=None,
+) -> list[RenderedTextChunk]:
     active_week_start_iso, active_week_entries = _active_week_entries(config.entries, config.week_end_day)
     chunks: list[RenderedTextChunk] = []
 
     _append_week_header(chunks, active_week_start_iso)
     if active_week_entries:
-        _append_week_entries(chunks, active_week_entries)
+        _append_week_entries(chunks, active_week_entries, entry_tag_resolver, warning_comment_resolver)
 
     return chunks
 
@@ -101,23 +105,50 @@ def _append_week_header(chunks: list[RenderedTextChunk], week_start_iso: str) ->
     chunks.append(RenderedTextChunk("\n"))
 
 
-def _append_week_entries(chunks: list[RenderedTextChunk], day_map: dict[str, list[EntryRecord]]) -> None:
+def _append_week_entries(
+    chunks: list[RenderedTextChunk],
+    day_map: dict[str, list[EntryRecord]],
+    entry_tag_resolver,
+    warning_comment_resolver,
+) -> None:
     for day_name in DAY_ORDER:
         entries = day_map.get(day_name)
         if not entries:
             continue
         chunks.append(RenderedTextChunk(f"@{day_name}\n"))
-        _append_day_repo_entries(chunks, entries)
+        _append_day_repo_entries(chunks, entries, entry_tag_resolver, warning_comment_resolver)
         chunks.append(RenderedTextChunk("\n"))
 
 
-def _append_day_repo_entries(chunks: list[RenderedTextChunk], entries: list[EntryRecord]) -> None:
+def _append_day_repo_entries(
+    chunks: list[RenderedTextChunk],
+    entries: list[EntryRecord],
+    entry_tag_resolver,
+    warning_comment_resolver,
+) -> None:
     for repo_label, repo_entries in _group_entries_by_repo(entries).items():
         chunks.append(RenderedTextChunk(f"\t• {repo_label}:\n"))
         for entry in repo_entries:
-            tag = "heuristic" if _is_heuristic_entry(entry) else ""
+            tags = _resolved_entry_tags(entry, entry_tag_resolver)
             for line in _summary_lines(entry.summary):
-                chunks.append(RenderedTextChunk(f"\t\t• {line}\n", tag=tag))
+                chunks.append(RenderedTextChunk(f"\t\t• {line}\n", tags=tags))
+            warning_comment = _resolved_warning_comment(entry, warning_comment_resolver)
+            if warning_comment:
+                chunks.append(RenderedTextChunk(f"\t\t  {warning_comment}\n", tags=tags + ("ai-comment",)))
+
+
+def _resolved_entry_tags(entry: EntryRecord, entry_tag_resolver) -> tuple[str, ...]:
+    if entry_tag_resolver is not None:
+        resolved = entry_tag_resolver(entry)
+        if resolved is not None:
+            return tuple(resolved)
+    return ("heuristic",) if _is_heuristic_entry(entry) else ()
+
+
+def _resolved_warning_comment(entry: EntryRecord, warning_comment_resolver) -> str:
+    if warning_comment_resolver is None:
+        return ""
+    return str(warning_comment_resolver(entry) or "").strip()
 
 
 def _is_heuristic_entry(entry: EntryRecord) -> bool:

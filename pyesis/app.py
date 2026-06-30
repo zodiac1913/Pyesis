@@ -251,6 +251,9 @@ class PyesisApp:
         self._poll_errors: list[str] = []
         self._poll_enhancement_report = None
         self._poll_enhancement_error = ""
+        self._active_ai_entry_keys: set[str] = set()
+        self._ai_working_pulse_on = False
+        self._ai_working_pulse_scheduled = False
         self._enhancer_in_flight = False
         self._ai_backend_unavailable = False
         self._ai_recovery_probe_in_flight = False
@@ -377,20 +380,45 @@ class PyesisApp:
             return HEURISTIC_MODE
         return self._current_ai_mode()
 
+    def _has_openai_api_key(self) -> bool:
+        return bool(os.getenv("PYESIS_AI_API_KEY", "").strip())
+
+    def _is_live_ai_mode(self, mode: str) -> bool:
+        normalized = (mode or "").strip().lower()
+        if normalized == OLLAMA_MODE:
+            return bool(self.config.ai_ollama_url.strip())
+        if normalized == OPENAI_COMPATIBLE_MODE:
+            return bool(self.config.ai_openai_url.strip() and self._has_openai_api_key())
+        if normalized == GITHUB_GPT_MODE:
+            return self._github_auth_status().has_token
+        return normalized == HEURISTIC_MODE
+
+    def _effective_ai_mode(self) -> str:
+        current_mode = self._current_ai_mode()
+        if current_mode == HEURISTIC_MODE:
+            return HEURISTIC_MODE
+        if self._is_live_ai_mode(current_mode):
+            return current_mode
+
+        for mode in self._preferred_summary_modes():
+            if mode != HEURISTIC_MODE:
+                return mode
+        return HEURISTIC_MODE
+
     def _preferred_summary_modes(self) -> list[str]:
         modes: list[str] = []
 
         current_mode = self._current_ai_mode()
-        if current_mode != HEURISTIC_MODE and current_mode not in modes:
+        if current_mode != HEURISTIC_MODE and self._is_live_ai_mode(current_mode) and current_mode not in modes:
             modes.append(current_mode)
 
-        if self._github_auth_status().has_token and GITHUB_GPT_MODE not in modes:
-            modes.append(GITHUB_GPT_MODE)
-
-        if self.config.ai_ollama_url.strip() and OLLAMA_MODE not in modes:
+        if self._is_live_ai_mode(OLLAMA_MODE) and OLLAMA_MODE not in modes:
             modes.append(OLLAMA_MODE)
 
-        if self.config.ai_openai_url.strip() and os.getenv("PYESIS_AI_API_KEY", "").strip() and OPENAI_COMPATIBLE_MODE not in modes:
+        if self._is_live_ai_mode(GITHUB_GPT_MODE) and GITHUB_GPT_MODE not in modes:
+            modes.append(GITHUB_GPT_MODE)
+
+        if self._is_live_ai_mode(OPENAI_COMPATIBLE_MODE) and OPENAI_COMPATIBLE_MODE not in modes:
             modes.append(OPENAI_COMPATIBLE_MODE)
 
         modes.append(HEURISTIC_MODE)
@@ -472,9 +500,6 @@ class PyesisApp:
         return describe_github_auth(self.config.github_auth_mode, self.config.github_auth_endpoint)
 
     def _initial_ai_status_severity(self) -> str:
-        mode = self._current_ai_mode()
-        if mode == GITHUB_GPT_MODE and not self._github_auth_status().has_token:
-            return "degraded"
         return "ok"
 
     def _normalize_github_auth_settings_or_show_error(self, mode: str, endpoint: str) -> tuple[str, str] | None:
@@ -1067,6 +1092,8 @@ class PyesisApp:
             excerpt_l = entry.diff_excerpt.lower()
             if "pyesis_state.json" in summary_l or "pyesis_state.json" in excerpt_l:
                 continue
+            if "logs/ai_attempts.jsonl" in summary_l or "logs/ai_attempts.jsonl" in excerpt_l:
+                continue
             cleaned.append(entry)
         return cleaned
 
@@ -1423,7 +1450,7 @@ class PyesisApp:
 
         self._apply_settings_changes(settings)
         auto_export_state = self.config.auto_export_time or "disabled"
-        provider = self._ai_provider_label(self._current_ai_mode())
+        provider = self._ai_provider_label(self._effective_ai_mode())
         self.status_var.set(
             f"Auto-export time set to {auto_export_state}; DOCX folder set to {self.config.export_directory}; summary provider set to {provider}"
         )
@@ -2216,6 +2243,10 @@ class PyesisApp:
             highlightcolor=palette["surface"],
         )
         self.editor.tag_configure("heuristic", foreground=palette["heuristic_fg"])
+        self.editor.tag_configure("ai-failed", foreground=palette["failed_fg"])
+        self.editor.tag_configure("ai-working-bright", foreground=palette["working_fg_bright"])
+        self.editor.tag_configure("ai-working-dim", foreground=palette["working_fg_dim"])
+        self.editor.tag_configure("ai-comment", foreground=palette["failed_fg"])
         if self._editor_bg_canvas is not None:
             self._editor_bg_canvas.configure(bg=palette["surface"])
 
@@ -2232,6 +2263,9 @@ class PyesisApp:
                 "accent_fg": "#000000",
                 "border": "#ffffff",
                 "heuristic_fg": "#ff8c00",
+                "failed_fg": "#ff5c5c",
+                "working_fg_bright": "#ffffff",
+                "working_fg_dim": "#777777",
             }
         if resolved_theme == "dark":
             return {
@@ -2245,6 +2279,9 @@ class PyesisApp:
                 "accent_fg": "#ffffff",
                 "border": "#384353",
                 "heuristic_fg": "#ff9f1a",
+                "failed_fg": "#ff6b6b",
+                "working_fg_bright": "#e6ebf2",
+                "working_fg_dim": "#6f7d8f",
             }
         return {
             "bg": "#f4f6f8",
@@ -2257,6 +2294,9 @@ class PyesisApp:
             "accent_fg": "#ffffff",
             "border": "#b8c4d2",
             "heuristic_fg": "#d96a00",
+            "failed_fg": "#c62828",
+            "working_fg_bright": "#1d2733",
+            "working_fg_dim": "#9aa6b2",
         }
 
     def _apply_fonts(self) -> None:
@@ -2419,10 +2459,61 @@ class PyesisApp:
         if not self.config.entries:
             self._update_backlog_button()
             return
-        for chunk in render_text_chunks(self.config):
-            tags = (chunk.tag,) if chunk.tag else ()
-            self.editor.insert(tk.END, chunk.text, tags)
+        for chunk in render_text_chunks(
+            self.config,
+            entry_tag_resolver=self._entry_render_tags,
+            warning_comment_resolver=self._entry_warning_comment,
+        ):
+            self.editor.insert(tk.END, chunk.text, chunk.tags)
         self._update_backlog_button()
+
+    def _entry_status_key(self, entry: EntryRecord) -> str:
+        return f"{entry.repo_label}\0{entry.created_at}\0{entry.diff_hash}"
+
+    def _entry_render_tags(self, entry: EntryRecord) -> tuple[str, ...]:
+        entry_key = self._entry_status_key(entry)
+        if entry_key in self._active_ai_entry_keys:
+            return ("ai-working-bright",) if self._ai_working_pulse_on else ("ai-working-dim",)
+        if entry.summary_warning.strip():
+            return ("ai-failed",)
+        summary_source = (entry.summary_source or "").strip().lower()
+        if summary_source:
+            return ("heuristic",) if summary_source == HEURISTIC_MODE else ()
+        return ("heuristic",) if entry.author == "Backup" else ()
+
+    def _entry_warning_comment(self, entry: EntryRecord) -> str:
+        warning = re.sub(r"\s+", " ", entry.summary_warning.strip())
+        if not warning:
+            return ""
+        return f"[[{warning}]]"
+
+    def _schedule_ai_working_pulse(self) -> None:
+        if self._ai_working_pulse_scheduled or not self._active_ai_entry_keys:
+            return
+        self._ai_working_pulse_scheduled = True
+        self.root.after(350, self._tick_ai_working_pulse)
+
+    def _tick_ai_working_pulse(self) -> None:
+        if not self._active_ai_entry_keys:
+            self._ai_working_pulse_scheduled = False
+            self._ai_working_pulse_on = False
+            return
+        self._ai_working_pulse_on = not self._ai_working_pulse_on
+        self._refresh_editor()
+        self.root.after(350, self._tick_ai_working_pulse)
+
+    def _on_entry_rewrite_progress(self, entry_key: str, status: str) -> None:
+        def apply() -> None:
+            if status == "start":
+                self._active_ai_entry_keys.add(entry_key)
+                self._schedule_ai_working_pulse()
+            else:
+                self._active_ai_entry_keys.discard(entry_key)
+                if not self._active_ai_entry_keys:
+                    self._ai_working_pulse_on = False
+            self._refresh_editor()
+
+        self.root.after(0, apply)
 
     def _current_week_heuristic_entry_count(self) -> int:
         count = 0
@@ -2464,14 +2555,21 @@ class PyesisApp:
             self._update_backlog_button()
             return "break"
 
+        if self.config.summary_enhancer_dry_run:
+            self.config.summary_enhancer_dry_run = False
+            save_config(self.config)
+
         self.status_var.set(f"Upgrading {backlog_count} current-week orange summaries...")
-        report = self._run_periodic_summary_enhancer(force_run=True, update_status=True)
-        if report is not None:
-            self._update_backlog_button()
+        self._run_periodic_summary_enhancer(force_run=True, update_status=True)
         return "break"
 
     def _schedule_poll(self) -> None:
         self.root.after(self._next_poll_interval_ms(), self._scheduled_poll)
+
+    def _queue_startup_poll(self) -> None:
+        if not self.config.repos:
+            return
+        self.root.after(0, self.run_poll_once)
 
     def _next_poll_interval_ms(self) -> int:
         if not self.config.repos:
@@ -2593,15 +2691,11 @@ class PyesisApp:
         }
 
     def _initial_ai_status_text(self) -> str:
-        mode = self._current_ai_mode()
+        mode = self._effective_ai_mode()
         if mode == HEURISTIC_MODE:
             return "[OK] Heuristic summaries active"
         provider = self._ai_provider_label(mode)
         fallback_note = " with heuristic fallback" if self.config.ai_fallback_enabled else " without fallback"
-        if mode == GITHUB_GPT_MODE:
-            github_auth_status = self._github_auth_status()
-            if not github_auth_status.has_token:
-                return f"[SETUP] {provider} selected; {github_auth_status.detail}"
         return f"[PENDING] {provider} waiting for first response{fallback_note}"
 
     def _handle_ai_health(self, summary: AISummaryResult, repo_label: str) -> None:
@@ -2681,14 +2775,43 @@ class PyesisApp:
             return
 
         for idx, existing in enumerate(self.config.entries):
+            existing_fp = self._entry_files_fingerprint(existing)
+            if self._same_scope_entry(existing, candidate) and self._fingerprint_overlap(candidate_fp, existing_fp) and self._same_summary_duplicate(existing, candidate):
+                existing_source = (existing.summary_source or "").strip().lower()
+                candidate_source = (candidate.summary_source or "").strip().lower()
+                if existing_source != HEURISTIC_MODE and candidate_source == HEURISTIC_MODE:
+                    return
+
+                self.config.entries[idx] = EntryRecord(
+                    repo_label=candidate.repo_label,
+                    repo_path=candidate.repo_path,
+                    created_at=existing.created_at,
+                    day_name=self._entry_day_name(existing),
+                    week_start_iso=self._entry_week_start_iso(existing),
+                    summary=candidate.summary,
+                    summary_source=candidate.summary_source,
+                    diff_hash=candidate.diff_hash,
+                    diff_excerpt=candidate.diff_excerpt,
+                    author=candidate.author,
+                    rewritten_by=candidate.rewritten_by,
+                    rewritten_at=candidate.rewritten_at,
+                    requested_summary_source=candidate.requested_summary_source,
+                    summary_warning=candidate.summary_warning,
+                    fallback_summary_source=candidate.fallback_summary_source,
+                    summary_timing_ms=candidate.summary_timing_ms,
+                    summary_provider_details=candidate.summary_provider_details,
+                    last_ai_attempt_at=candidate.last_ai_attempt_at,
+                )
+                return
+
             if not self._should_merge_entries(existing, candidate):
                 continue
-            existing_fp = self._entry_files_fingerprint(existing)
             if not self._fingerprint_overlap(candidate_fp, existing_fp):
                 continue
 
             existing_source = (existing.summary_source or "").strip().lower()
             candidate_source = (candidate.summary_source or "").strip().lower()
+
             if existing_source != HEURISTIC_MODE and candidate_source == HEURISTIC_MODE:
                 return
 
@@ -2718,6 +2841,13 @@ class PyesisApp:
 
     def _entry_day_key(self, created_at_iso: str) -> str:
         return created_at_iso[:10] if len(created_at_iso) >= 10 else ""
+
+    def _same_scope_entry(self, previous: EntryRecord, current: EntryRecord) -> bool:
+        return (
+            previous.repo_path == current.repo_path
+            and self._entry_day_name(previous) == self._entry_day_name(current)
+            and self._entry_week_start_iso(previous) == self._entry_week_start_iso(current)
+        )
 
     def _entry_diff_fingerprint(self, entry: EntryRecord) -> str:
         diff_hash = entry.diff_hash.strip()
@@ -2776,6 +2906,12 @@ class PyesisApp:
         if union_size == 0:
             return False
         return (len(intersect) / union_size) >= 0.6
+
+    def _same_summary_duplicate(self, existing: EntryRecord, candidate: EntryRecord) -> bool:
+        return self._normalized_repeat_summary(existing.summary) == self._normalized_repeat_summary(candidate.summary)
+
+    def _normalized_repeat_summary(self, summary: str) -> str:
+        return re.sub(r"\s+", " ", summary.strip().lower()).rstrip(".")
 
     def _is_possible_duplicate_diff(self, candidate: EntryRecord) -> bool:
         candidate_fp = self._entry_diff_fingerprint(candidate)
@@ -2941,6 +3077,7 @@ class PyesisApp:
                 self.config,
                 rewrite_gate=rewrite_gate,
                 activity_callback=self._poll_activity_callback,
+                progress_callback=self._on_entry_rewrite_progress,
                 aggressive_prodding_override=self._current_ai_mode() != HEURISTIC_MODE,
             ), ""
         except Exception as exc:
@@ -3029,10 +3166,11 @@ class PyesisApp:
             self.poll_summary_var.set(f"Poll at {now_time}: no new diffs")
             self.status_var.set(f"No new diffs at {now_time}")
 
-        if enhancement_report is not None and enhancement_report.total_rewritten:
+        if enhancement_report is not None and (enhancement_report.total_rewritten or enhancement_report.total_failed_marked):
             self._refresh_editor()
-            if self._current_ai_mode() != HEURISTIC_MODE:
-                provider = self._ai_provider_label(self._current_ai_mode())
+            provider_mode = self._effective_ai_mode()
+            if provider_mode != HEURISTIC_MODE:
+                provider = self._ai_provider_label(provider_mode)
                 self._ai_backend_unavailable = False
                 self._ai_last_warning = ""
                 self._ai_status_severity = "ok"
@@ -3044,7 +3182,13 @@ class PyesisApp:
         self._reset_poll_state()
 
     def _poll_has_persistable_updates(self, captured: int, enhancement_report) -> bool:
-        return bool(captured or (enhancement_report is not None and enhancement_report.total_rewritten))
+        return bool(
+            captured
+            or (
+                enhancement_report is not None
+                and (enhancement_report.total_rewritten or enhancement_report.total_failed_marked)
+            )
+        )
 
     def _enhancer_poll_summary(self, enhancement_report) -> str:
         if enhancement_report is None or not enhancement_report.ran:
@@ -3055,6 +3199,8 @@ class PyesisApp:
             f"weak {enhancement_report.skipped_weak}, "
             f"AI unavailable {enhancement_report.skipped_ai_unavailable}"
         )
+        if enhancement_report.total_failed_marked:
+            summary += f", failed {enhancement_report.total_failed_marked}"
         if enhancement_report.skipped_gated:
             summary += f", deferred {enhancement_report.skipped_gated}"
         if enhancement_report.provider_timed_attempts:
@@ -3112,22 +3258,22 @@ class PyesisApp:
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _run_periodic_summary_enhancer(self, *, force_run: bool = False, update_status: bool = True):
-        if self._enhancer_in_flight:
-            return None
+    def _complete_periodic_summary_enhancer(self, report, error: str, update_status: bool) -> None:
+        self._enhancer_in_flight = False
 
-        self._enhancer_in_flight = True
-        try:
-            report = run_periodic_enhancer(self.config, force_run=force_run)
-        except Exception as exc:
-            self.status_var.set(f"Summary enhancer error: {exc}")
-            return None
-        finally:
-            self._enhancer_in_flight = False
+        if error:
+            self.status_var.set(f"Summary enhancer error: {error}")
+            self._update_backlog_button()
+            return
+
+        if report is None:
+            self._update_backlog_button()
+            return
 
         if not report.ran:
-            return report
-        if report.total_rewritten and update_status:
+            self._update_backlog_button()
+            return
+        if (report.total_rewritten or report.total_failed_marked) and update_status:
             mode_label = "dry-run" if report.dry_run else "live"
             self._refresh_editor()
             self.poll_summary_var.set(self._enhancer_poll_summary(report))
@@ -3139,10 +3285,34 @@ class PyesisApp:
         elif update_status and report.ran:
             self.poll_summary_var.set(self._enhancer_poll_summary(report))
             self.status_var.set(f"Summary enhancer scanned current-week entries; {self._enhancer_poll_summary(report)}")
-        elif report.total_rewritten:
+        elif report.total_rewritten or report.total_failed_marked:
             self._refresh_editor()
 
-        return report
+        self._update_backlog_button()
+
+    def _run_periodic_summary_enhancer(self, *, force_run: bool = False, update_status: bool = True):
+        if self._enhancer_in_flight:
+            return None
+
+        self._enhancer_in_flight = True
+        self._update_backlog_button()
+
+        def worker() -> None:
+            try:
+                report = run_periodic_enhancer(
+                    self.config,
+                    force_run=force_run,
+                    progress_callback=self._on_entry_rewrite_progress,
+                )
+                error = ""
+            except Exception as exc:
+                report = None
+                error = str(exc)
+
+            self.root.after(0, lambda: self._complete_periodic_summary_enhancer(report, error, update_status))
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
 
     def run_poll_once(self) -> None:
         if self._poll_in_flight:
@@ -3200,6 +3370,7 @@ def launch() -> None:
     app = PyesisApp(root)
     root.minsize(980, 640)
     app.status_var.set("Ready")
+    app._queue_startup_poll()
     if sys.platform == "darwin":
         root.update_idletasks()
         root.deiconify()

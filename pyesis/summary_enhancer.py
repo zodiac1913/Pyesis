@@ -61,6 +61,8 @@ class EnhanceReport:
     scanned_buffer: int = 0
     rewritten_state: int = 0
     rewritten_buffer: int = 0
+    failed_state_marked: int = 0
+    failed_buffer_marked: int = 0
     skipped_human: int = 0
     skipped_strong: int = 0
     skipped_weak: int = 0
@@ -75,6 +77,10 @@ class EnhanceReport:
     @property
     def total_rewritten(self) -> int:
         return self.rewritten_state + self.rewritten_buffer
+
+    @property
+    def total_failed_marked(self) -> int:
+        return self.failed_state_marked + self.failed_buffer_marked
 
     @property
     def average_attempt_ms(self) -> int:
@@ -92,6 +98,7 @@ class EnhanceReport:
 SummaryBuilder = Callable[[str, str, str | None], AISummaryResult | str]
 RewriteGate = Callable[[str, str | None], bool]
 RewriteActivityCallback = Callable[[str, str | None, bool], None]
+RewriteProgressCallback = Callable[[str, str], None]
 
 
 @dataclass(frozen=True)
@@ -160,6 +167,8 @@ def _call_builder(
     repo_path: str,
     rewrite_gate: RewriteGate | None = None,
     activity_callback: RewriteActivityCallback | None = None,
+    progress_callback: RewriteProgressCallback | None = None,
+    item_key: str = "",
 ) -> BuilderCallResult:
     started_at = perf_counter()
     if rewrite_gate is not None and not rewrite_gate(repo_label, repo_path):
@@ -168,6 +177,9 @@ def _call_builder(
             gate_blocked=True,
             duration_seconds=perf_counter() - started_at,
         )
+
+    if progress_callback is not None and item_key:
+        progress_callback(item_key, "start")
 
     if activity_callback is not None:
         activity_callback(repo_label, repo_path, True)
@@ -537,6 +549,14 @@ def _rewrite_skip_reason(rewrite: SummaryRewrite | None, force_ai_upgrade: bool)
     return "weak rewrite"
 
 
+def _rewrite_failure_warning(rewrite: SummaryRewrite | None, force_ai_upgrade: bool) -> str:
+    if rewrite is not None and rewrite.warning.strip():
+        return rewrite.warning.strip()
+    if force_ai_upgrade and rewrite is not None and rewrite.source == HEURISTIC_MODE:
+        return "AI rewrite unavailable; heuristic summary kept"
+    return "AI rewrite skipped; no acceptable rewrite was produced"
+
+
 def _record_attempt_timing(report: EnhanceReport, duration_seconds: float) -> int:
     report.timed_attempts += 1
     report.total_attempt_seconds += duration_seconds
@@ -595,16 +615,22 @@ def _count_strong_skip(report: EnhanceReport, force_ai_upgrade: bool, aggressive
 
 
 def _state_rewrite_order(entry: EntryRecord) -> tuple[int, str, str, str]:
+    failure_rank = 0 if (entry.summary_warning or "").strip() else 1
     retried_rank = 0 if (entry.rewritten_at or "").strip() else 1
-    return (retried_rank, entry.created_at, entry.repo_label.lower(), entry.diff_hash)
+    return (failure_rank, retried_rank, entry.created_at, entry.repo_label.lower(), entry.diff_hash)
 
 
 def _buffer_rewrite_order(item: dict) -> tuple[int, str, str, str]:
+    failure_rank = 0 if str(item.get("summaryWarning", "")).strip() else 1
     retried_rank = 0 if str(item.get("rewrittenAt", "")).strip() else 1
     timestamp = str(item.get("datetime", ""))
     repo_label = str(item.get("repo", "")).lower()
     diff_hash = str(item.get("diffHash", ""))
-    return (retried_rank, timestamp, repo_label, diff_hash)
+    return (failure_rank, retried_rank, timestamp, repo_label, diff_hash)
+
+
+def _state_item_key(entry: EntryRecord) -> str:
+    return f"{entry.repo_label}\0{entry.created_at}\0{entry.diff_hash}"
 
 
 def _rewrite_state_entries(
@@ -613,6 +639,7 @@ def _rewrite_state_entries(
     builder: SummaryBuilder,
     rewrite_gate: RewriteGate | None,
     activity_callback: RewriteActivityCallback | None,
+    progress_callback: RewriteProgressCallback | None,
     active_week_start: datetime,
     rewritten_by: str,
     rewritten_at: str,
@@ -647,6 +674,8 @@ def _rewrite_state_entries(
             entry.repo_path,
             rewrite_gate,
             activity_callback,
+            progress_callback,
+            _state_item_key(entry),
         )
         if builder_call.gate_blocked:
             _mark_rewrite_deferred(report, "State", entry.repo_label)
@@ -659,8 +688,8 @@ def _rewrite_state_entries(
         )
         if not _accept_rewrite(rewrite, force_ai_upgrade):
             _log_rewrite_skip(report, "State", entry.repo_label, rewrite, force_ai_upgrade, builder_call.duration_seconds)
-            if not dry_run and _should_persist_failed_ai_upgrade(rewrite, force_ai_upgrade):
-                assert rewrite is not None
+            if not dry_run:
+                failure_warning = _rewrite_failure_warning(rewrite, force_ai_upgrade)
                 config.entries[index] = EntryRecord(
                     repo_label=entry.repo_label,
                     repo_path=entry.repo_path,
@@ -674,13 +703,16 @@ def _rewrite_state_entries(
                     author=entry.author,
                     rewritten_by=entry.rewritten_by,
                     rewritten_at=entry.rewritten_at,
-                    requested_summary_source=rewrite.requested_source,
-                    summary_warning=rewrite.warning,
-                    fallback_summary_source=rewrite.fallback_source,
-                    summary_timing_ms=max(0, int(rewrite.timing_ms)),
-                    summary_provider_details=rewrite.provider_details,
+                    requested_summary_source=(rewrite.requested_source if rewrite is not None else entry.requested_summary_source),
+                    summary_warning=failure_warning,
+                    fallback_summary_source=(rewrite.fallback_source if rewrite is not None else entry.fallback_summary_source),
+                    summary_timing_ms=max(0, int(rewrite.timing_ms)) if rewrite is not None else entry.summary_timing_ms,
+                    summary_provider_details=(rewrite.provider_details if rewrite is not None else entry.summary_provider_details),
                     last_ai_attempt_at=rewritten_at,
                 )
+                report.failed_state_marked += 1
+            if progress_callback is not None:
+                progress_callback(_state_item_key(entry), "failed")
             continue
 
         report.rewritten_state += 1
@@ -709,6 +741,8 @@ def _rewrite_state_entries(
             summary_provider_details=rewrite.provider_details,
             last_ai_attempt_at=rewritten_at,
         )
+        if progress_callback is not None:
+            progress_callback(_state_item_key(entry), "success")
 
 
 def _rewrite_buffer_items(
@@ -775,14 +809,15 @@ def _rewrite_buffer_items(
                 force_ai_upgrade,
                 builder_call.duration_seconds,
             )
-            if not dry_run and _should_persist_failed_ai_upgrade(rewrite, force_ai_upgrade):
-                assert rewrite is not None
-                item["requestedSummarySource"] = rewrite.requested_source
-                item["summaryWarning"] = rewrite.warning
-                item["fallbackSummarySource"] = rewrite.fallback_source
-                item["summaryTimingMs"] = max(0, int(rewrite.timing_ms))
-                item["summaryProviderDetails"] = rewrite.provider_details
+            if not dry_run:
+                failure_warning = _rewrite_failure_warning(rewrite, force_ai_upgrade)
+                item["requestedSummarySource"] = rewrite.requested_source if rewrite is not None else str(item.get("requestedSummarySource", ""))
+                item["summaryWarning"] = failure_warning
+                item["fallbackSummarySource"] = rewrite.fallback_source if rewrite is not None else str(item.get("fallbackSummarySource", ""))
+                item["summaryTimingMs"] = max(0, int(rewrite.timing_ms)) if rewrite is not None else max(0, int(item.get("summaryTimingMs", 0) or 0))
+                item["summaryProviderDetails"] = rewrite.provider_details if rewrite is not None else str(item.get("summaryProviderDetails", ""))
                 item["lastAiAttemptAt"] = rewritten_at
+                report.failed_buffer_marked += 1
                 file_changed = True
             continue
 
@@ -861,6 +896,7 @@ def run_periodic_enhancer(
     summary_builder: SummaryBuilder | None = None,
     rewrite_gate: RewriteGate | None = None,
     activity_callback: RewriteActivityCallback | None = None,
+    progress_callback: RewriteProgressCallback | None = None,
     state_path: Path | None = None,
     buffer_dir: Path | None = None,
     now: datetime | None = None,
@@ -896,6 +932,7 @@ def run_periodic_enhancer(
         builder=builder,
         rewrite_gate=rewrite_gate,
         activity_callback=activity_callback,
+        progress_callback=progress_callback,
         active_week_start=active_week_start,
         rewritten_by=rewritten_by,
         rewritten_at=rewritten_at,

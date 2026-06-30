@@ -1190,6 +1190,90 @@ class SummaryEnhancerTests(unittest.TestCase):
         self.assertEqual(config.entries[0].author, "AI")
         self.assertEqual(config.entries[0].rewritten_by, "EnhancerTest")
 
+    def test_failed_rewrite_marks_warning_and_prioritizes_next_round(self) -> None:
+        failed_entry = EntryRecord(
+            repo_label="RepoPriority",
+            repo_path="repos/repo-priority",
+            created_at="2026-06-16T09:12:00",
+            day_name="Monday",
+            week_start_iso="2026-06-15T00:00:00",
+            summary="made updates",
+            diff_hash="priority-failed",
+            diff_excerpt="diff --git a/b.py b/b.py\n+++ b/b.py\n@@ -0,0 +1 @@\n+print('two')\n",
+            summary_source="heuristic",
+            author="Backup",
+            summary_warning="Ollama summary failed: offline",
+        )
+        untouched_entry = EntryRecord(
+            repo_label="RepoPriority",
+            repo_path="repos/repo-priority",
+            created_at="2026-06-16T09:10:00",
+            day_name="Monday",
+            week_start_iso="2026-06-15T00:00:00",
+            summary="made updates",
+            diff_hash="priority-untouched",
+            diff_excerpt="diff --git a/a.py b/a.py\n+++ b/a.py\n@@ -0,0 +1 @@\n+print('one')\n",
+            summary_source="heuristic",
+            author="Backup",
+        )
+
+        config = self._base_config()
+        config.summary_enhancer_dry_run = False
+        config.summary_enhancer_aggressive_prodding = True
+        config.entries = [failed_entry, untouched_entry]
+
+        handled_repos: dict[str, int] = {}
+
+        def rewrite_gate(repo_label: str, _repo_path: str | None) -> bool:
+            handled_count = handled_repos.get(repo_label, 0)
+            if handled_count >= 1:
+                return False
+            handled_repos[repo_label] = handled_count + 1
+            return True
+
+        report = run_periodic_enhancer(
+            config,
+            summary_builder=lambda _repo, diff, _path: f"Strong rewrite for {diff.splitlines()[0]}",
+            rewrite_gate=rewrite_gate,
+            now=datetime(2026, 6, 16, 11, 55, 0),
+        )
+
+        self.assertTrue(report.ran)
+        self.assertEqual(report.rewritten_state, 1)
+        rewritten_by_hash = {entry.diff_hash: entry.rewritten_at for entry in config.entries}
+        self.assertTrue(rewritten_by_hash["priority-failed"])
+        self.assertEqual(rewritten_by_hash["priority-untouched"], "")
+
+    def test_failed_rewrite_without_provider_warning_still_marks_entry(self) -> None:
+        entry = EntryRecord(
+            repo_label="RepoWeak",
+            repo_path="repos/repo-weak",
+            created_at="2026-06-16T09:10:00",
+            day_name="Monday",
+            week_start_iso="2026-06-15T00:00:00",
+            summary="made updates",
+            diff_hash="weak-rewrite",
+            diff_excerpt="diff --git a/a.py b/a.py\n+++ b/a.py\n@@ -0,0 +1 @@\n+print('weak')\n",
+            summary_source="heuristic",
+            author="Backup",
+        )
+
+        config = self._base_config()
+        config.summary_enhancer_dry_run = False
+        config.summary_enhancer_aggressive_prodding = True
+        config.entries = [entry]
+
+        report = run_periodic_enhancer(
+            config,
+            summary_builder=lambda _repo, _diff, _path: "made updates",
+            now=datetime(2026, 6, 16, 11, 55, 0),
+        )
+
+        self.assertTrue(report.ran)
+        self.assertEqual(report.failed_state_marked, 1)
+        self.assertIn("AI rewrite skipped", config.entries[0].summary_warning)
+        self.assertEqual(config.entries[0].rewritten_at, "")
+
     def test_rewrite_gate_prioritizes_older_entries_before_newer_ones(self) -> None:
         newer_entry = EntryRecord(
             repo_label="RepoOrdered",

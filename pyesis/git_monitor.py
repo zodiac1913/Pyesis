@@ -18,6 +18,7 @@ DEFAULT_EXCLUDES = [
     "pyesis_state.json",
     "diff_buffers/**",
     "exports/**",
+    "logs/**",
     ".venv/**",
     "__pycache__/**",
 ]

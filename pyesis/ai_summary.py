@@ -16,10 +16,10 @@ SYSTEM_PROMPT = (
     "Rewrite git diff activity as a short first-person work-log bullet. "
     "When asked for JSON, return exactly one JSON object with double-quoted keys and string values only. "
     "Do not use single quotes, code fences, comments, markdown, or explanatory text before or after the JSON object. "
-    "Use a single sentence, past tense, concrete wording, and no markdown bullet prefix. "
+    "Use up to five sentence(s), past tense, concrete wording, and no markdown bullet prefix. "
     "Assume each diff is usually a single file change and name the file directly when the evidence supports it. "
     "Prefer explicit verbs like added, removed, renamed, refactored, and mention what changed. "
-    "Avoid vague wording like updated or worked on unless details are unavailable. "
+    "Avoid vague wording like updated or worked on unless details are unavailable. When details are unavailable try to explain file changes. "
     "Anchor the summary to concrete evidence from the diff, such as an added field name, function name, import target, setting key, route, or UI label. "
     "If the diff exposes a named symbol or literal string, mention that exact symbol or string instead of summarizing abstractly. "
     "Never use filler phrases like 'updated implementation details', 'keep behavior aligned with the current implementation goals', or 'advance implementation quality'. "
@@ -47,7 +47,7 @@ AI_PROVIDER_LABELS = {
 }
 NO_INTENT_SENTINEL = "made updates"
 IMPORT_INTENT = "adding imports"
-LOW_SIGNAL_INTENTS = {IMPORT_INTENT, "adding follow-up notes"}
+LOW_SIGNAL_INTENTS = {IMPORT_INTENT, "adding follow-up notes", "cleaning up code layout"}
 LOW_QUALITY_AI_MARKERS = (
     "refined logic",
     "clarify behavior",
@@ -63,6 +63,7 @@ INTENT_PAST_TENSE_PREFIXES = {
     "adjusting ": "adjusted ",
     "tightening ": "tightened ",
     "changing ": "changed ",
+    "cleaning ": "cleaned ",
 }
 INTENT_PURPOSE_PREFIXES = {
     "adding ": "add ",
@@ -70,6 +71,7 @@ INTENT_PURPOSE_PREFIXES = {
     "adjusting ": "adjust ",
     "tightening ": "tighten ",
     "changing ": "change ",
+    "cleaning ": "clean ",
     "improving ": "improve ",
 }
 APP_FILENAME = "app.py"
@@ -80,7 +82,7 @@ JSON_SUFFIX = ".json"
 YAML_SUFFIXES = (".yml", ".yaml")
 DIFF_TIME_UNAVAILABLE = "Not available from the diff."
 CLARIFY_CONFIGURATION_BEHAVIOR = "clarify configuration behavior"
-SUMMARY_EXCLUDED_PATH_PREFIXES = ("diff_buffers/", "exports/", "__pycache__/")
+SUMMARY_EXCLUDED_PATH_PREFIXES = ("diff_buffers/", "exports/", "logs/", "__pycache__/")
 SUMMARY_EXCLUDED_PATHS = {"pyesis_state.json"}
 AI_DIFF_CHAR_LIMIT = 8000
 AI_CONTEXT_FILE_LIMIT = 3
@@ -519,6 +521,8 @@ def _anchored_change_phrase(change: FileChangeSummary) -> str:
         if not symbol_name:
             continue
         if symbol_kind in {"function", "class"}:
+            if change.action == "modified":
+                return f"updated {symbol_name} in {path}"
             return f"introduced {symbol_name} in {path}"
         return f"added {symbol_name} in {path}"
 
@@ -696,6 +700,9 @@ def _parse_ai_json_payload(content: str) -> object:
             python_literal = _parse_ai_python_literal_payload(text)
             if python_literal is not None:
                 return python_literal
+            labeled_payload = _parse_ai_labeled_payload(text)
+            if labeled_payload is not None:
+                return labeled_payload
             raise
         try:
             return json.loads(extracted)
@@ -703,6 +710,9 @@ def _parse_ai_json_payload(content: str) -> object:
             python_literal = _parse_ai_python_literal_payload(extracted)
             if python_literal is not None:
                 return python_literal
+            labeled_payload = _parse_ai_labeled_payload(extracted)
+            if labeled_payload is not None:
+                return labeled_payload
             raise
 
 
@@ -712,6 +722,25 @@ def _parse_ai_python_literal_payload(text: str) -> object | None:
     except (SyntaxError, ValueError):
         return None
     return parsed if isinstance(parsed, (dict, list)) else None
+
+
+def _parse_ai_labeled_payload(text: str) -> dict[str, str] | None:
+    pattern = re.compile(r"(?i)(?:\*\*)?\b(who|what|where|when|why|how)\b(?:\*\*)?\s*[:=]\s*")
+    matches = list(pattern.finditer(text))
+    if not matches:
+        return None
+
+    payload: dict[str, str] = {}
+    for index, match in enumerate(matches):
+        key = match.group(1).lower()
+        value_start = match.end()
+        value_end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        value = text[value_start:value_end].strip(" \t\r\n-*")
+        value = re.sub(r"\s+", " ", value).strip()
+        if value:
+            payload[key] = value
+
+    return payload if "what" in payload else None
 
 
 def _extract_json_object(text: str) -> str | None:
@@ -1530,6 +1559,8 @@ def _ollama_request_structured_summary(
             },
         ],
         "stream": False,
+        "format": "json",
+        "options": {"temperature": 0},
     }
     if keep_alive:
         payload["keep_alive"] = keep_alive
@@ -1552,7 +1583,7 @@ def _ollama_request_structured_summary(
         raise RuntimeError(f"Empty Ollama response for model {model}")
     try:
         parsed_content = _parse_ai_json_payload(content)
-    except (json.JSONDecodeError, SyntaxError, ValueError) as exc:
+    except (SyntaxError, ValueError) as exc:
         preview = _preview_ollama_content(content)
         raise RuntimeError(f"{exc}; content preview: {preview}") from exc
     return ProviderStructuredSummary(
