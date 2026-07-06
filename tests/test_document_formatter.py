@@ -94,6 +94,66 @@ class DocumentFormatterTests(unittest.TestCase):
         comment_chunk = next(chunk for chunk in chunks if "[[Ollama summary failed: offline]]" in chunk.text)
         self.assertEqual(comment_chunk.tags, ("ai-failed", "ai-comment"))
 
+    def test_render_text_chunks_adds_evidence_from_diff_when_summary_has_none(self) -> None:
+        entry = EntryRecord(
+            repo_label="Pyesis",
+            repo_path="/tmp/pyesis",
+            created_at="2026-06-29T06:37:47",
+            day_name="Monday",
+            week_start_iso="2026-06-26T00:00:00",
+            summary="I added summary source tracking.",
+            diff_hash="hash-evidence",
+            diff_excerpt=(
+                "diff --git a/pyesis/diff_buffer.py b/pyesis/diff_buffer.py\n"
+                "+++ b/pyesis/diff_buffer.py\n"
+                "@@ -1,5 +1,6 @@\n"
+                " class DiffLedgerItem(TypedDict):\n"
+                "+    summarySource: str\n"
+                "     rewrittenBy: str\n"
+            ),
+            summary_source="heuristic",
+            author="Backup",
+        )
+        config = AppConfig(week_end_day="Thursday", entries=[entry])
+
+        with patch("pyesis.document_formatter.datetime") as mock_datetime:
+            mock_datetime.now.return_value = datetime(2026, 6, 29, 12, 0, 0)
+            mock_datetime.fromisoformat.side_effect = datetime.fromisoformat
+            chunks = render_text_chunks(config)
+
+        rendered_text = "".join(chunk.text for chunk in chunks)
+        self.assertIn("Evidence: pyesis/diff_buffer.py:2 \"summarySource: str\"", rendered_text)
+
+    def test_render_text_chunks_adds_before_after_for_null_check_rewrite(self) -> None:
+        entry = EntryRecord(
+            repo_label="Cats",
+            repo_path="/tmp/cats",
+            created_at="2026-06-29T06:37:47",
+            day_name="Monday",
+            week_start_iso="2026-06-26T00:00:00",
+            summary="I added null checks and adjusted return flow in Controllers/Officials/CCXOOwnerAdminController.cs.",
+            diff_hash="hash-null-check",
+            diff_excerpt=(
+                "diff --git a/Controllers/Officials/CCXOOwnerAdminController.cs b/Controllers/Officials/CCXOOwnerAdminController.cs\n"
+                "+++ b/Controllers/Officials/CCXOOwnerAdminController.cs\n"
+                "@@ -10,3 +10,3 @@\n"
+                "-var variable=3*SomeVariable;\n"
+                "+var variable=3*(SomeVariable.NotEmpty()?SomeVariable:1);\n"
+            ),
+            summary_source="heuristic",
+            author="Backup",
+        )
+        config = AppConfig(week_end_day="Thursday", entries=[entry])
+
+        with patch("pyesis.document_formatter.datetime") as mock_datetime:
+            mock_datetime.now.return_value = datetime(2026, 6, 29, 12, 0, 0)
+            mock_datetime.fromisoformat.side_effect = datetime.fromisoformat
+            chunks = render_text_chunks(config)
+
+        rendered_text = "".join(chunk.text for chunk in chunks)
+        self.assertIn("Before: var variable=3*SomeVariable;", rendered_text)
+        self.assertIn("After:  var variable=3*(SomeVariable.NotEmpty()?SomeVariable:1);", rendered_text)
+
 
 if __name__ == "__main__":
     unittest.main()

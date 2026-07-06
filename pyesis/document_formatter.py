@@ -4,10 +4,12 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
+import re
 
 from docx import Document
 
 from pyesis.config import AppConfig, EntryRecord
+from pyesis.git_monitor import summarize_file_changes
 
 
 DAY_ORDER = [
@@ -19,6 +21,7 @@ DAY_ORDER = [
     "Saturday",
     "Sunday",
 ]
+LIST_BULLET_LEVEL_THREE = "List Bullet 3"
 
 
 @dataclass(frozen=True)
@@ -77,16 +80,17 @@ def _group_entries_by_repo(entries: list[EntryRecord]) -> dict[str, list[EntryRe
     }
 
 
-def render_plain_text(config: AppConfig) -> str:
-    return "".join(chunk.text for chunk in render_text_chunks(config)).rstrip("\n") + "\n"
+def render_plain_text(config: AppConfig, now: datetime | None = None) -> str:
+    return "".join(chunk.text for chunk in render_text_chunks(config, now=now)).rstrip("\n") + "\n"
 
 
 def render_text_chunks(
     config: AppConfig,
     entry_tag_resolver=None,
     warning_comment_resolver=None,
+    now: datetime | None = None,
 ) -> list[RenderedTextChunk]:
-    active_week_start_iso, active_week_entries = _active_week_entries(config.entries, config.week_end_day)
+    active_week_start_iso, active_week_entries = _active_week_entries(config.entries, config.week_end_day, now=now)
     chunks: list[RenderedTextChunk] = []
 
     _append_week_header(chunks, active_week_start_iso)
@@ -132,6 +136,14 @@ def _append_day_repo_entries(
             tags = _resolved_entry_tags(entry, entry_tag_resolver)
             for line in _summary_lines(entry.summary):
                 chunks.append(RenderedTextChunk(f"\t\t• {line}\n", tags=tags))
+            evidence = _entry_evidence_line(entry)
+            if evidence:
+                chunks.append(RenderedTextChunk(f"\t\t  Evidence: {evidence}\n", tags=tags + ("evidence",)))
+            null_check_pair = _null_check_rewrite_pair(entry.diff_excerpt)
+            if null_check_pair is not None:
+                before_line, after_line = null_check_pair
+                chunks.append(RenderedTextChunk(f"\t\t  Before: {before_line}\n", tags=tags + ("evidence",)))
+                chunks.append(RenderedTextChunk(f"\t\t  After:  {after_line}\n", tags=tags + ("evidence",)))
             warning_comment = _resolved_warning_comment(entry, warning_comment_resolver)
             if warning_comment:
                 chunks.append(RenderedTextChunk(f"\t\t  {warning_comment}\n", tags=tags + ("ai-comment",)))
@@ -201,13 +213,108 @@ def _write_week_block(
 def _write_repo_entries(document: Document, repo_entries: list[EntryRecord]) -> None:
     for entry in repo_entries:
         for idx, line in enumerate(_summary_lines(entry.summary)):
-            style = "List Bullet 2" if idx == 0 else "List Bullet 3"
+            style = "List Bullet 2" if idx == 0 else LIST_BULLET_LEVEL_THREE
             entry_paragraph = document.add_paragraph(style=style)
             entry_paragraph.paragraph_format.left_indent = None
             entry_paragraph.paragraph_format.first_line_indent = None
             entry_paragraph.add_run(line)
+        evidence = _entry_evidence_line(entry)
+        if evidence:
+            evidence_paragraph = document.add_paragraph(style=LIST_BULLET_LEVEL_THREE)
+            evidence_paragraph.paragraph_format.left_indent = None
+            evidence_paragraph.paragraph_format.first_line_indent = None
+            evidence_paragraph.add_run(f"Evidence: {evidence}")
+        null_check_pair = _null_check_rewrite_pair(entry.diff_excerpt)
+        if null_check_pair is not None:
+            before_line, after_line = null_check_pair
+            before_paragraph = document.add_paragraph(style=LIST_BULLET_LEVEL_THREE)
+            before_paragraph.paragraph_format.left_indent = None
+            before_paragraph.paragraph_format.first_line_indent = None
+            before_paragraph.add_run(f"Before: {before_line}")
+            after_paragraph = document.add_paragraph(style=LIST_BULLET_LEVEL_THREE)
+            after_paragraph.paragraph_format.left_indent = None
+            after_paragraph.paragraph_format.first_line_indent = None
+            after_paragraph.add_run(f"After:  {after_line}")
 
 
 def _summary_lines(summary: str) -> list[str]:
     lines = [line.strip().lstrip("-• ").strip() for line in summary.splitlines() if line.strip()]
     return lines or [summary.strip()]
+
+
+def _entry_evidence_line(entry: EntryRecord) -> str:
+    if "evidence:" in entry.summary.lower():
+        return ""
+
+    changes = summarize_file_changes(entry.diff_excerpt)
+    for change in changes:
+        if change.added_line_samples:
+            line_no, snippet = change.added_line_samples[0]
+            return f"{change.path}:{line_no} \"{snippet}\""
+        if change.added_samples:
+            return f"{change.path} \"{change.added_samples[0]}\""
+    return ""
+
+
+def _null_check_rewrite_pair(diff_excerpt: str) -> tuple[str, str] | None:
+    removed_lines: list[str] = []
+    added_lines: list[str] = []
+
+    def flush() -> tuple[str, str] | None:
+        nonlocal removed_lines, added_lines
+        pair = _first_null_check_pair(removed_lines, added_lines)
+        removed_lines = []
+        added_lines = []
+        return pair
+
+    for raw_line in diff_excerpt.splitlines():
+        if raw_line.startswith(("@@", " ")):
+            pair = flush()
+            if pair is not None:
+                return pair
+            continue
+
+        if raw_line.startswith(("diff --git ", "index ", "--- ", "+++ ", "\\")):
+            continue
+        if raw_line.startswith("-"):
+            removed_lines.append(raw_line[1:].strip())
+            continue
+        if raw_line.startswith("+"):
+            added_lines.append(raw_line[1:].strip())
+
+    return flush()
+
+
+def _first_null_check_pair(removed_lines: list[str], added_lines: list[str]) -> tuple[str, str] | None:
+    if not removed_lines or not added_lines:
+        return None
+
+    for before_line in removed_lines:
+        if not before_line:
+            continue
+        for after_line in added_lines:
+            if not after_line or before_line == after_line:
+                continue
+            if _looks_like_null_check_change(before_line, after_line):
+                return before_line, after_line
+    return None
+
+
+def _looks_like_null_check_change(before_line: str, after_line: str) -> bool:
+    del before_line
+    lowered = after_line.lower()
+    null_markers = (
+        "??",
+        "?.",
+        "== null",
+        "!= null",
+        " is none",
+        " is not none",
+        ".notempty(",
+        " if ",
+        " else ",
+    )
+    if any(marker in lowered for marker in null_markers):
+        return True
+    # Match C# / JS / Python ternary-like guards that often encode null fallback.
+    return bool(re.search(r"\?.+:.+", after_line))

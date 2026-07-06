@@ -5,6 +5,7 @@ from datetime import datetime
 import hashlib
 import os
 from pathlib import Path
+import re
 import subprocess
 
 from pyesis.config import EntryRecord, RepoConfig
@@ -24,6 +25,7 @@ DEFAULT_EXCLUDES = [
 ]
 DIFF_CONTEXT_LINES = 20
 DIFF_SAMPLE_LIMIT = 12
+HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 
 
 @dataclass
@@ -42,6 +44,7 @@ class FileChangeSummary:
     removed_lines: int
     added_samples: list[str] = field(default_factory=list)
     removed_samples: list[str] = field(default_factory=list)
+    added_line_samples: list[tuple[int, str]] = field(default_factory=list)
 
 
 def _run_git(repo_path: str, *args: str) -> str:
@@ -116,12 +119,14 @@ def summarize_changed_files(diff_text: str) -> list[str]:
 def summarize_file_changes(diff_text: str) -> list[FileChangeSummary]:
     summaries: list[FileChangeSummary] = []
     current: FileChangeSummary | None = None
+    current_new_line: int | None = None
 
     for line in diff_text.splitlines():
         new_change = _parse_diff_header(line)
         if new_change is not None:
             _finalize_change(summaries, current)
             current = new_change
+            current_new_line = None
             continue
 
         if current is None:
@@ -131,15 +136,31 @@ def summarize_file_changes(diff_text: str) -> list[FileChangeSummary]:
             continue
         if _apply_path_metadata(current, line):
             continue
+        hunk_start = _hunk_new_start(line)
+        if hunk_start is not None:
+            current_new_line = hunk_start
+            continue
         if line.startswith(("+++", "---")):
+            continue
+        if line.startswith(" "):
+            if current_new_line is not None:
+                current_new_line += 1
+            continue
+        if line.startswith("\\"):
             continue
         if line.startswith("+"):
             current.added_lines += 1
             _collect_sample(current.added_samples, line[1:])
+            _collect_line_sample(current.added_line_samples, current_new_line, line[1:])
+            if current_new_line is not None:
+                current_new_line += 1
             continue
         if line.startswith("-"):
             current.removed_lines += 1
             _collect_sample(current.removed_samples, line[1:])
+            continue
+        if current_new_line is not None:
+            current_new_line += 1
 
     _finalize_change(summaries, current)
     return summaries
@@ -235,6 +256,24 @@ def _collect_sample(target: list[str], text: str, limit: int = DIFF_SAMPLE_LIMIT
     if len(snippet) > 140:
         snippet = f"{snippet[:137]}..."
     target.append(snippet)
+
+
+def _collect_line_sample(target: list[tuple[int, str]], line_no: int | None, text: str, limit: int = DIFF_SAMPLE_LIMIT) -> None:
+    if line_no is None or len(target) >= limit:
+        return
+    snippet = text.strip()
+    if not snippet:
+        return
+    if len(snippet) > 140:
+        snippet = f"{snippet[:137]}..."
+    target.append((line_no, snippet))
+
+
+def _hunk_new_start(line: str) -> int | None:
+    match = HUNK_HEADER_RE.match(line)
+    if match is None:
+        return None
+    return int(match.group(1))
 
 
 def _is_excluded_path(path: str) -> bool:

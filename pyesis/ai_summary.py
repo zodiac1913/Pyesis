@@ -105,6 +105,39 @@ BAD_WRITING_EXAMPLES = (
     "In pyesis/app.py, I refined application flow to improve the user-facing app flow.",
     "I changed async flow.",
 )
+ACRONYM_TOKENS = {
+    "ai",
+    "api",
+    "ccxo",
+    "cpu",
+    "css",
+    "csv",
+    "dam",
+    "db",
+    "dto",
+    "gpu",
+    "html",
+    "http",
+    "https",
+    "id",
+    "io",
+    "ip",
+    "json",
+    "jwt",
+    "oauth",
+    "sdk",
+    "sml",
+    "sql",
+    "tcp",
+    "udp",
+    "ui",
+    "uri",
+    "url",
+    "uuid",
+    "ux",
+    "xml",
+    "yaml",
+}
 
 
 @dataclass
@@ -150,18 +183,27 @@ def build_summary(
     allow_fallback: bool = True,
 ) -> AISummaryResult:
     selected_mode = _normalize_ai_mode(mode or os.getenv("PYESIS_AI_MODE", HEURISTIC_MODE))
+    changes = _summary_relevant_changes(_coalesce_changes(summarize_file_changes(diff_text)))
     if selected_mode == OLLAMA_MODE:
-        return _build_provider_summary(selected_mode, repo_label, diff_text, repo_path, _ollama_structured_summary, allow_fallback)
+        result = _build_provider_summary(selected_mode, repo_label, diff_text, repo_path, _ollama_structured_summary, allow_fallback)
+        result.text = _append_evidence_suffix(_normalize_acronyms_in_text(_cleanup_repeated_connectors(result.text)), changes)
+        return result
     if selected_mode == OPENAI_COMPATIBLE_MODE:
-        return _build_provider_summary(selected_mode, repo_label, diff_text, repo_path, _openai_compatible_structured_summary, allow_fallback)
+        result = _build_provider_summary(selected_mode, repo_label, diff_text, repo_path, _openai_compatible_structured_summary, allow_fallback)
+        result.text = _append_evidence_suffix(_normalize_acronyms_in_text(_cleanup_repeated_connectors(result.text)), changes)
+        return result
     if selected_mode == GITHUB_GPT_MODE:
-        return _build_provider_summary(selected_mode, repo_label, diff_text, repo_path, _github_gpt_structured_summary, allow_fallback)
+        result = _build_provider_summary(selected_mode, repo_label, diff_text, repo_path, _github_gpt_structured_summary, allow_fallback)
+        result.text = _append_evidence_suffix(_normalize_acronyms_in_text(_cleanup_repeated_connectors(result.text)), changes)
+        return result
 
-    return AISummaryResult(
+    result = AISummaryResult(
         text=_heuristic_structured_summary(repo_label, diff_text).to_text(),
         source=HEURISTIC_MODE,
         requested_source=selected_mode,
     )
+    result.text = _append_evidence_suffix(_normalize_acronyms_in_text(_cleanup_repeated_connectors(result.text)), changes)
+    return result
 
 
 def _normalize_ai_mode(value: str) -> str:
@@ -328,7 +370,7 @@ def _compose_description(summary: StructuredSummary) -> str:
         and _normalized_clause(why_text) not in normalized_what
         and not _clauses_meaningfully_overlap(what_text, why_text)
     ):
-        parts.append(f"to {why_text}")
+        parts.append(_clause_with_connector("to", why_text))
         added_why = True
     if (
         not added_why
@@ -337,8 +379,57 @@ def _compose_description(summary: StructuredSummary) -> str:
         and not _is_low_value_clause(how_text)
         and _normalized_clause(how_text) not in normalized_what
     ):
-        parts.append(f"by {how_text}")
-    return _sentence_without_period(" ".join(parts)).strip() + "."
+        parts.append(_clause_with_connector("by", how_text))
+    composed = _sentence_without_period(" ".join(parts)).strip() + "."
+    return _cleanup_repeated_connectors(composed)
+
+
+def _clause_with_connector(connector: str, clause: str) -> str:
+    cleaned = clause.strip()
+    if re.match(rf"(?i)^{re.escape(connector)}\b", cleaned):
+        return cleaned
+    return f"{connector} {cleaned}"
+
+
+def _cleanup_repeated_connectors(text: str) -> str:
+    cleaned = re.sub(r"(?i)\b(to|by)\s+\1\b", r"\1", text)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _normalize_acronyms_in_text(text: str) -> str:
+    normalized = text
+
+    # Uppercase known acronym words regardless of incoming case.
+    for token in sorted(ACRONYM_TOKENS, key=len, reverse=True):
+        normalized = re.sub(rf"(?i)\b{re.escape(token)}\b", token.upper(), normalized)
+
+    return normalized
+
+
+def _append_evidence_suffix(text: str, changes: list[FileChangeSummary]) -> str:
+    evidence = _first_evidence_reference(changes)
+    if not evidence:
+        return text
+
+    normalized = text.lower()
+    if "evidence:" in normalized:
+        return text
+
+    base = text.rstrip()
+    if not base.endswith("."):
+        base = _sentence_without_period(base) + "."
+    return f"{base} Evidence: {evidence}."
+
+
+def _first_evidence_reference(changes: list[FileChangeSummary]) -> str:
+    for change in changes:
+        if change.added_line_samples:
+            line_no, snippet = change.added_line_samples[0]
+            return f"{change.path}:{line_no} \"{snippet}\""
+        if change.added_samples:
+            snippet = change.added_samples[0]
+            return f"{change.path} \"{snippet}\""
+    return ""
 
 
 def _is_low_value_clause(text: str) -> bool:
@@ -520,6 +611,8 @@ def _anchored_change_phrase(change: FileChangeSummary) -> str:
         symbol_name, symbol_kind = _anchored_symbol_from_line(line)
         if not symbol_name:
             continue
+        if _is_low_signal_symbol(symbol_name):
+            continue
         if symbol_kind in {"function", "class"}:
             if change.action == "modified":
                 return f"updated {symbol_name} in {path}"
@@ -556,6 +649,15 @@ def _anchored_symbol_from_line(line: str) -> tuple[str, str]:
         if match:
             return match.group(1), kind
     return "", ""
+
+
+def _is_low_signal_symbol(symbol_name: str) -> bool:
+    token = symbol_name.strip()
+    if len(token) <= 3 and token.islower():
+        return True
+    if token in {"tmp", "val", "obj", "ctx", "res", "req"}:
+        return True
+    return False
 
 
 def _compile_remove_target(change: FileChangeSummary) -> str:

@@ -19,5 +19,5 @@
         "titleBar.inactiveForeground": "#e7e7e799"
     },
     "peacock.color": "Magenta",
-    "ollama-autocoder.model": "qwen2.5-coder:latest"
+    "ollama-autocoder.model": "gemma3:4b"
 }

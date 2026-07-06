@@ -64,7 +64,7 @@ from pyesis.github_auth import (
     start_github_device_login,
     store_github_auth_token,
 )
-from pyesis.git_monitor import DiffSnapshot, capture_snapshot, split_diff_by_file, validate_repo
+from pyesis.git_monitor import DiffSnapshot, capture_snapshot, split_diff_by_file, summarize_file_changes, validate_repo
 from pyesis.summary_enhancer import run_periodic_enhancer
 
 
@@ -258,6 +258,7 @@ class PyesisApp:
         self._ai_backend_unavailable = False
         self._ai_recovery_probe_in_flight = False
         self._ai_last_warning = ""
+        self._last_rendered_week_start_iso = ""
         self._buffer_day = datetime.now().strftime("%Y-%m-%d")
         purge_old_daily_buffers(7, self._buffer_day)
         self.style = ttk.Style(self.root)
@@ -273,6 +274,7 @@ class PyesisApp:
         self._refresh_editor()
         self._maybe_auto_export_daily()
         self._schedule_poll()
+        self._schedule_backlog_poll()
 
     def _set_windows_app_id(self) -> None:
         if os.name != "nt":
@@ -2247,6 +2249,7 @@ class PyesisApp:
         self.editor.tag_configure("ai-working-bright", foreground=palette["working_fg_bright"])
         self.editor.tag_configure("ai-working-dim", foreground=palette["working_fg_dim"])
         self.editor.tag_configure("ai-comment", foreground=palette["failed_fg"])
+        self.editor.tag_configure("empty-week-note", foreground=palette["muted_fg"])
         if self._editor_bg_canvas is not None:
             self._editor_bg_canvas.configure(bg=palette["surface"])
 
@@ -2326,7 +2329,21 @@ class PyesisApp:
         excerpt = one_line[:72] + ("..." if len(one_line) > 72 else "")
         if not excerpt:
             excerpt = "(empty summary)"
+        evidence = self._entry_evidence_from_diff_excerpt(entry.diff_excerpt)
+        if evidence:
+            excerpt = f"{excerpt} [{evidence}]"
+            if len(excerpt) > 128:
+                excerpt = excerpt[:125] + "..."
         return f"{stamp} | {entry.repo_label} | {excerpt}"
+
+    def _entry_evidence_from_diff_excerpt(self, diff_excerpt: str) -> str:
+        for change in summarize_file_changes(diff_excerpt):
+            if change.added_line_samples:
+                line_no, snippet = change.added_line_samples[0]
+                return f"{change.path}:{line_no} \"{snippet}\""
+            if change.added_samples:
+                return f"{change.path} \"{change.added_samples[0]}\""
+        return ""
 
     def _open_entry_editor(self) -> None:
         indexed_entries = self._editable_entries()
@@ -2387,7 +2404,11 @@ class PyesisApp:
             listbox.see(position)
 
             _, entry = indexed_entries[position]
-            metadata_var.set(f"{entry.day_name} | {entry.created_at} | {entry.repo_label}")
+            evidence = self._entry_evidence_from_diff_excerpt(entry.diff_excerpt)
+            metadata_text = f"{entry.day_name} | {entry.created_at} | {entry.repo_label}"
+            if evidence:
+                metadata_text += f"\nEvidence: {evidence}"
+            metadata_var.set(metadata_text)
             editor.delete("1.0", tk.END)
             editor.insert("1.0", entry.summary)
 
@@ -2455,17 +2476,54 @@ class PyesisApp:
         editor.focus_set()
 
     def _refresh_editor(self) -> None:
+        self._last_rendered_week_start_iso = self._active_week_start().isoformat()
         self.editor.delete("1.0", tk.END)
-        if not self.config.entries:
-            self._update_backlog_button()
-            return
+        current_week_count = self._current_week_entry_count()
+        preview_now = self._preview_reference_now(current_week_count)
         for chunk in render_text_chunks(
             self.config,
             entry_tag_resolver=self._entry_render_tags,
             warning_comment_resolver=self._entry_warning_comment,
+            now=preview_now,
         ):
             self.editor.insert(tk.END, chunk.text, chunk.tags)
+        if current_week_count == 0 and preview_now is None:
+            self.editor.insert(
+                tk.END,
+                "No captured code changes for this week yet. Make a change and refresh to populate this week.\n",
+                ("empty-week-note",),
+            )
+        if current_week_count == 0 and preview_now is not None:
+            self.editor.insert(
+                tk.END,
+                "Showing your most recent captured week because this week has no captured entries yet.\n",
+                ("empty-week-note",),
+            )
         self._update_backlog_button()
+
+    def _current_week_entry_count(self) -> int:
+        return sum(1 for entry in self.config.entries if self._is_current_week_entry(entry))
+
+    def _latest_entry_datetime(self) -> datetime | None:
+        latest: datetime | None = None
+        for entry in self.config.entries:
+            entry_dt = self._entry_datetime(entry)
+            if entry_dt is None:
+                continue
+            if latest is None or entry_dt > latest:
+                latest = entry_dt
+        return latest
+
+    def _preview_reference_now(self, current_week_count: int) -> datetime | None:
+        if current_week_count > 0:
+            return None
+        return self._latest_entry_datetime()
+
+    def _refresh_editor_if_week_changed(self) -> None:
+        current_week_start_iso = self._active_week_start().isoformat()
+        if current_week_start_iso == self._last_rendered_week_start_iso:
+            return
+        self._refresh_editor()
 
     def _entry_status_key(self, entry: EntryRecord) -> str:
         return f"{entry.repo_label}\0{entry.created_at}\0{entry.diff_hash}"
@@ -2566,6 +2624,15 @@ class PyesisApp:
     def _schedule_poll(self) -> None:
         self.root.after(self._next_poll_interval_ms(), self._scheduled_poll)
 
+    def _schedule_backlog_poll(self) -> None:
+        self.root.after(BACKLOG_POLL_SECONDS * 1000, self._scheduled_backlog_poll)
+
+    def _scheduled_backlog_poll(self) -> None:
+        try:
+            self._run_idle_backlog_enhancer()
+        finally:
+            self._schedule_backlog_poll()
+
     def _queue_startup_poll(self) -> None:
         if not self.config.repos:
             return
@@ -2583,6 +2650,20 @@ class PyesisApp:
                 continue
             if self._is_current_week_entry(entry):
                 return True
+        return any(
+            str(item.get("summarySource", "")).strip().lower() == HEURISTIC_MODE
+            for item in self._iter_current_week_buffer_items()
+        )
+
+    def _has_current_week_failed_backlog(self) -> bool:
+        for entry in self.config.entries:
+            if not self._is_current_week_entry(entry):
+                continue
+            if entry.summary_warning.strip():
+                return True
+        return any(str(item.get("summaryWarning", "")).strip() for item in self._iter_current_week_buffer_items())
+
+    def _iter_buffer_items(self):
         for buffer_file in sorted(BUFFER_DIR.glob("*.json")):
             try:
                 items = json.loads(buffer_file.read_text(encoding="utf-8"))
@@ -2591,13 +2672,31 @@ class PyesisApp:
             if not isinstance(items, list):
                 continue
             for item in items:
-                if not isinstance(item, dict):
-                    continue
-                if str(item.get("summarySource", "")).strip().lower() != HEURISTIC_MODE:
-                    continue
-                if self._is_current_week_buffer_item(item):
-                    return True
-        return False
+                if isinstance(item, dict):
+                    yield item
+
+    def _iter_current_week_buffer_items(self):
+        for item in self._iter_buffer_items():
+            if self._is_current_week_buffer_item(item):
+                yield item
+
+    def _has_current_week_ai_backlog(self) -> bool:
+        return self._has_current_week_heuristic_backlog() or self._has_current_week_failed_backlog()
+
+    def _run_idle_backlog_enhancer(self) -> None:
+        if self._poll_in_flight or self._enhancer_in_flight:
+            return
+        if self._current_ai_mode() == HEURISTIC_MODE:
+            return
+        if not self._has_current_week_ai_backlog():
+            return
+
+        # Idle backlog runs should be live so red/orange items are actually fixed.
+        if self.config.summary_enhancer_dry_run:
+            self.config.summary_enhancer_dry_run = False
+            save_config(self.config)
+
+        self._run_periodic_summary_enhancer(force_run=True, update_status=False)
 
     def _scheduled_poll(self) -> None:
         self.run_poll_once()
@@ -3147,6 +3246,8 @@ class PyesisApp:
         enhancement_report = self._poll_enhancement_report
         enhancement_error = self._poll_enhancement_error.strip()
 
+        self._refresh_editor_if_week_changed()
+
         now_time = datetime.now().strftime('%H:%M:%S')
         if self._poll_has_persistable_updates(captured, enhancement_report):
             self._persist()
@@ -3273,6 +3374,21 @@ class PyesisApp:
         if not report.ran:
             self._update_backlog_button()
             return
+
+        if not update_status:
+            now_time = datetime.now().strftime('%H:%M:%S')
+            idle_summary = (
+                f"idle backlog pass {now_time}: rewrote {report.total_rewritten}, "
+                f"deferred {report.skipped_gated}, "
+                f"weak {report.skipped_weak}, "
+                f"AI unavailable {report.skipped_ai_unavailable}"
+            )
+            self.poll_summary_var.set(idle_summary)
+            if report.total_rewritten or report.total_failed_marked:
+                self._refresh_editor()
+            self._update_backlog_button()
+            return
+
         if (report.total_rewritten or report.total_failed_marked) and update_status:
             mode_label = "dry-run" if report.dry_run else "live"
             self._refresh_editor()

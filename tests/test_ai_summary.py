@@ -9,6 +9,7 @@ from pyesis.ai_summary import (
     _build_ai_user_prompt,
     _coalesce_changes,
     _is_summary_excluded_path,
+    _normalize_acronyms_in_text,
     _ollama_model_candidates,
     _ollama_structured_summary,
     _parse_ai_json_payload,
@@ -19,6 +20,16 @@ from pyesis.git_monitor import summarize_changed_files, summarize_file_changes
 
 
 class AISummaryTests(unittest.TestCase):
+    def test_normalize_acronyms_uppercases_words_only(self) -> None:
+        text = "I updated smlAutoComplete to call oauth endpoint and align ui behavior for api responses."
+
+        normalized = _normalize_acronyms_in_text(text)
+
+        self.assertIn("smlAutoComplete", normalized)
+        self.assertIn("OAUTH endpoint", normalized)
+        self.assertIn("UI behavior", normalized)
+        self.assertIn("API responses", normalized)
+
     def test_heuristic_summary_uses_added_symbol_anchor(self) -> None:
         diff_text = (
             "diff --git a/pyesis/diff_buffer.py b/pyesis/diff_buffer.py\n"
@@ -32,7 +43,37 @@ class AISummaryTests(unittest.TestCase):
         result = build_summary("Pyesis", diff_text, repo_path="/tmp/repo", mode="heuristic")
 
         self.assertIn("summarySource", result.text)
+        self.assertIn("Evidence:", result.text)
+        self.assertIn("pyesis/diff_buffer.py:2", result.text)
         self.assertNotIn("refined logic", result.text.lower())
+
+    def test_summary_does_not_repeat_by_or_to_connectors(self) -> None:
+        diff_text = (
+            "diff --git a/pyesis/diff_buffer.py b/pyesis/diff_buffer.py\n"
+            "+++ b/pyesis/diff_buffer.py\n"
+            "@@ -1,3 +1,4 @@\n"
+            " class DiffLedgerItem(TypedDict):\n"
+            "+    summarySource: str\n"
+            "     rewrittenBy: str\n"
+        )
+        changes = _coalesce_changes(summarize_file_changes(diff_text))
+
+        repaired = _structured_summary_from_json(
+            {
+                "who": "I",
+                "what": "I updated summary storage",
+                "where": "pyesis/diff_buffer.py",
+                "when": "Not available from the diff.",
+                "why": "to keep summary metadata explicit",
+                "how": "By adding summarySource",
+            },
+            changes,
+            "Pyesis",
+        )
+
+        text = repaired.to_text().lower()
+        self.assertNotIn("to to", text)
+        self.assertNotIn("by by", text)
 
     def test_heuristic_summary_avoids_cleaning_layout_phrase_for_modified_signature(self) -> None:
         diff_text = (
@@ -50,6 +91,20 @@ class AISummaryTests(unittest.TestCase):
         self.assertNotIn("cleaning up code layout", result.text.lower())
         self.assertNotIn("introduced configapps", result.text.lower())
         self.assertIn("ConfigApps", result.text)
+
+    def test_heuristic_summary_avoids_short_ambiguous_symbol_anchor(self) -> None:
+        diff_text = (
+            "diff --git a/wwwroot/js/global/sml/Form/smlAutoComplete.js b/wwwroot/js/global/sml/Form/smlAutoComplete.js\n"
+            "+++ b/wwwroot/js/global/sml/Form/smlAutoComplete.js\n"
+            "@@ -10,0 +11,2 @@\n"
+            "+const sac = createAutoComplete(config);\n"
+            "+sac.bindEvents();\n"
+        )
+
+        result = build_summary("Cats", diff_text, repo_path="/tmp/cats", mode="heuristic")
+
+        self.assertNotIn(" added sac ", f" {result.text.lower()} ")
+        self.assertIn("smlAutoComplete.js", result.text)
 
     def test_low_quality_ai_fields_are_repaired_from_diff(self) -> None:
         diff_text = (
