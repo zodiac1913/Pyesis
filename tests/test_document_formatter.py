@@ -152,7 +152,102 @@ class DocumentFormatterTests(unittest.TestCase):
 
         rendered_text = "".join(chunk.text for chunk in chunks)
         self.assertIn("Before: var variable=3*SomeVariable;", rendered_text)
-        self.assertIn("After:  var variable=3*(SomeVariable.NotEmpty()?SomeVariable:1);", rendered_text)
+        self.assertIn("After: var variable=3*(SomeVariable.NotEmpty()?SomeVariable:1);", rendered_text)
+
+    def test_render_text_chunks_adds_generic_before_after_for_modified_line(self) -> None:
+        entry = EntryRecord(
+            repo_label="Cats",
+            repo_path="/tmp/cats",
+            created_at="2026-06-29T06:37:47",
+            day_name="Monday",
+            week_start_iso="2026-06-26T00:00:00",
+            summary="I updated ConfigApps return typing.",
+            diff_hash="hash-signature",
+            diff_excerpt=(
+                "diff --git a/Controllers/Configurer/Configs/AppConfig.cs b/Controllers/Configurer/Configs/AppConfig.cs\n"
+                "+++ b/Controllers/Configurer/Configs/AppConfig.cs\n"
+                "@@ -1,3 +1,3 @@\n"
+                "-        public CCReport<AppFacadeDTO> ConfigApps(CCReport<AppFacadeDTO> ctx)\n"
+                "+        public CfgReport<AppFacadeDTO> ConfigApps(CfgReport<AppFacadeDTO> ctx)\n"
+                "         {\n"
+            ),
+            summary_source="heuristic",
+            author="Backup",
+        )
+        config = AppConfig(week_end_day="Thursday", entries=[entry])
+
+        with patch("pyesis.document_formatter.datetime") as mock_datetime:
+            mock_datetime.now.return_value = datetime(2026, 6, 29, 12, 0, 0)
+            mock_datetime.fromisoformat.side_effect = datetime.fromisoformat
+            chunks = render_text_chunks(config)
+
+        rendered_text = "".join(chunk.text for chunk in chunks)
+        self.assertIn("Before: public CCReport<AppFacadeDTO> ConfigApps(CCReport<AppFacadeDTO> ctx)", rendered_text)
+        self.assertIn("After: public CfgReport<AppFacadeDTO> ConfigApps(CfgReport<AppFacadeDTO> ctx)", rendered_text)
+
+    def test_render_text_chunks_adds_line_number_evidence_when_summary_only_has_inline_path_evidence(self) -> None:
+        entry = EntryRecord(
+            repo_label="Pyesis",
+            repo_path="/tmp/pyesis",
+            created_at="2026-06-29T06:37:47",
+            day_name="Monday",
+            week_start_iso="2026-06-26T00:00:00",
+            summary='I updated parser logic. Evidence: pyesis/ai_summary.py "partial_json = _parse_ai_partial_json_object_payload(text)".',
+            diff_hash="hash-inline-evidence",
+            diff_excerpt=(
+                "diff --git a/pyesis/ai_summary.py b/pyesis/ai_summary.py\n"
+                "+++ b/pyesis/ai_summary.py\n"
+                "@@ -10,3 +10,4 @@\n"
+                " def parse_text(text: str) -> object:\n"
+                "+    partial_json = _parse_ai_partial_json_object_payload(text)\n"
+                "     return text\n"
+            ),
+            summary_source="ollama",
+            author="AI",
+        )
+        config = AppConfig(week_end_day="Thursday", entries=[entry])
+
+        with patch("pyesis.document_formatter.datetime") as mock_datetime:
+            mock_datetime.now.return_value = datetime(2026, 6, 29, 12, 0, 0)
+            mock_datetime.fromisoformat.side_effect = datetime.fromisoformat
+            chunks = render_text_chunks(config)
+
+        rendered_text = "".join(chunk.text for chunk in chunks)
+        self.assertIn("\t\t• I updated parser logic.\n", rendered_text)
+        self.assertIn('Evidence: pyesis/ai_summary.py:11 "partial_json = _parse_ai_partial_json_object_payload(text)"', rendered_text)
+
+    def test_render_text_chunks_moves_inline_line_number_evidence_to_own_line(self) -> None:
+        entry = EntryRecord(
+            repo_label="Cats",
+            repo_path="/tmp/cats",
+            created_at="2026-07-07T05:36:42",
+            day_name="Tuesday",
+            week_start_iso="2026-07-03T00:00:00",
+            summary='I updated Controllers/Configurer/Controllers/AppController.cs around \'ControllerName = app.ControllerName ?? "",\'. Evidence: Controllers/Configurer/Controllers/AppController.cs:64 "ControllerName = app.ControllerName ?? "",".',
+            diff_hash="hash-controller",
+            diff_excerpt=(
+                "diff --git a/Controllers/Configurer/Controllers/AppController.cs b/Controllers/Configurer/Controllers/AppController.cs\n"
+                "+++ b/Controllers/Configurer/Controllers/AppController.cs\n"
+                "@@ -44,40 +44,42 @@ public partial class ConfigurerController : CATSController\n"
+                "     public async Task<IActionResult> ApiConfigurerAppsTableRows()\n"
+                "+                ControllerName = app.ControllerName ?? \"\",\n"
+                "+                ActionName = app.ActionName ?? \"\",\n"
+            ),
+            summary_source="ollama",
+            author="AI",
+        )
+        config = AppConfig(week_end_day="Thursday", entries=[entry])
+
+        with patch("pyesis.document_formatter.datetime") as mock_datetime:
+            mock_datetime.now.return_value = datetime(2026, 7, 7, 12, 0, 0)
+            mock_datetime.fromisoformat.side_effect = datetime.fromisoformat
+            chunks = render_text_chunks(config)
+
+        rendered_text = "".join(chunk.text for chunk in chunks)
+        self.assertIn("I updated Controllers/Configurer/Controllers/AppController.cs around 'ControllerName = app.ControllerName ?? \"\",'.", rendered_text)
+        self.assertIn('Evidence: Controllers/Configurer/Controllers/AppController.cs:64 "ControllerName = app.ControllerName ?? "",', rendered_text)
+        self.assertNotIn("\t\t• I updated Controllers/Configurer/Controllers/AppController.cs around 'ControllerName = app.ControllerName ?? "",'. Evidence:", rendered_text)
+        self.assertIn('After: ControllerName = app.ControllerName ?? "",', rendered_text)
 
 
 if __name__ == "__main__":

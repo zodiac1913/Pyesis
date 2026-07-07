@@ -208,6 +208,16 @@ class AISummaryTests(unittest.TestCase):
         self.assertEqual(payload["where"], "pyesis/diff_buffer.py")
         self.assertEqual(payload["why"], "track summary source metadata")
 
+    def test_ai_json_parser_salvages_truncated_json_object(self) -> None:
+        payload = _parse_ai_json_payload(
+            '{"who":"I","what":"I added summarySource in pyesis/diff_buffer.py","where":"pyesis/diff_buffer.py","when":"Not available from the diff.","why":"track summary source metadata","how":"adding the summarySource field'
+        )
+
+        self.assertIsInstance(payload, dict)
+        self.assertEqual(payload["who"], "I")
+        self.assertEqual(payload["where"], "pyesis/diff_buffer.py")
+        self.assertIn("summarySource", payload["what"])
+
     def test_ollama_model_candidates_parse_unique_list(self) -> None:
         self.assertEqual(
             _ollama_model_candidates("qwen3-coder:30b, llama3.1:70b, qwen3-coder:30b"),
@@ -454,6 +464,48 @@ class AISummaryTests(unittest.TestCase):
         self.assertEqual(result.source, "heuristic")
         self.assertIn("content preview:", result.warning)
         self.assertIn("The provided code snippet is from a Python module", result.warning)
+
+    def test_build_summary_salvages_truncated_ollama_json_response(self) -> None:
+        diff_text = (
+            "diff --git a/pyesis/diff_buffer.py b/pyesis/diff_buffer.py\n"
+            "+++ b/pyesis/diff_buffer.py\n"
+            "@@ -1,5 +1,6 @@\n"
+            " class DiffLedgerItem(TypedDict):\n"
+            "+    summarySource: str\n"
+            "     rewrittenBy: str\n"
+        )
+
+        response_payload = {
+            "message": {
+                "content": '{"who":"I","what":"I added summarySource in pyesis/diff_buffer.py","where":"pyesis/diff_buffer.py","when":"Not available from the diff.","why":"track summary source metadata","how":"adding the summarySource field'
+            }
+        }
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return json.dumps(response_payload).encode("utf-8")
+
+        with patch("pyesis.ai_summary.request.urlopen", return_value=FakeResponse()):
+            with patch.dict(
+                "os.environ",
+                {
+                    "PYESIS_OLLAMA_URL": "http://localhost:11434/api/chat",
+                    "PYESIS_OLLAMA_MODEL": "qwen3-coder:30b",
+                    "PYESIS_OLLAMA_KEEP_ALIVE": "5m",
+                },
+                clear=False,
+            ):
+                result = build_summary("Pyesis", diff_text, repo_path="/tmp/repo", mode="ollama")
+
+        self.assertEqual(result.source, "ollama")
+        self.assertEqual(result.warning, "")
+        self.assertIn("summarySource", result.text)
 
     def test_heuristic_summary_uses_async_snippet_instead_of_async_flow_filler(self) -> None:
         diff_text = (

@@ -2479,45 +2479,22 @@ class PyesisApp:
         self._last_rendered_week_start_iso = self._active_week_start().isoformat()
         self.editor.delete("1.0", tk.END)
         current_week_count = self._current_week_entry_count()
-        preview_now = self._preview_reference_now(current_week_count)
         for chunk in render_text_chunks(
             self.config,
             entry_tag_resolver=self._entry_render_tags,
             warning_comment_resolver=self._entry_warning_comment,
-            now=preview_now,
         ):
             self.editor.insert(tk.END, chunk.text, chunk.tags)
-        if current_week_count == 0 and preview_now is None:
+        if current_week_count == 0:
             self.editor.insert(
                 tk.END,
                 "No captured code changes for this week yet. Make a change and refresh to populate this week.\n",
-                ("empty-week-note",),
-            )
-        if current_week_count == 0 and preview_now is not None:
-            self.editor.insert(
-                tk.END,
-                "Showing your most recent captured week because this week has no captured entries yet.\n",
                 ("empty-week-note",),
             )
         self._update_backlog_button()
 
     def _current_week_entry_count(self) -> int:
         return sum(1 for entry in self.config.entries if self._is_current_week_entry(entry))
-
-    def _latest_entry_datetime(self) -> datetime | None:
-        latest: datetime | None = None
-        for entry in self.config.entries:
-            entry_dt = self._entry_datetime(entry)
-            if entry_dt is None:
-                continue
-            if latest is None or entry_dt > latest:
-                latest = entry_dt
-        return latest
-
-    def _preview_reference_now(self, current_week_count: int) -> datetime | None:
-        if current_week_count > 0:
-            return None
-        return self._latest_entry_datetime()
 
     def _refresh_editor_if_week_changed(self) -> None:
         current_week_start_iso = self._active_week_start().isoformat()

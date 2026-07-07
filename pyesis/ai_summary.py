@@ -799,6 +799,9 @@ def _parse_ai_json_payload(content: str) -> object:
     except json.JSONDecodeError:
         extracted = _extract_json_object(text)
         if extracted is None:
+            partial_json = _parse_ai_partial_json_object_payload(text)
+            if partial_json is not None:
+                return partial_json
             python_literal = _parse_ai_python_literal_payload(text)
             if python_literal is not None:
                 return python_literal
@@ -809,6 +812,9 @@ def _parse_ai_json_payload(content: str) -> object:
         try:
             return json.loads(extracted)
         except json.JSONDecodeError:
+            partial_json = _parse_ai_partial_json_object_payload(extracted)
+            if partial_json is not None:
+                return partial_json
             python_literal = _parse_ai_python_literal_payload(extracted)
             if python_literal is not None:
                 return python_literal
@@ -843,6 +849,87 @@ def _parse_ai_labeled_payload(text: str) -> dict[str, str] | None:
             payload[key] = value
 
     return payload if "what" in payload else None
+
+
+def _parse_ai_partial_json_object_payload(text: str) -> dict[str, str] | None:
+    start = text.find("{")
+    if start < 0:
+        return None
+
+    payload: dict[str, str] = {}
+    index = start + 1
+    text_len = len(text)
+
+    while index < text_len:
+        while index < text_len and text[index] in " \t\r\n,":
+            index += 1
+        if index >= text_len or text[index] == "}":
+            break
+        if text[index] != '"':
+            break
+
+        key_result = _parse_partial_json_string(text, index)
+        if key_result is None:
+            break
+        key, index = key_result
+
+        while index < text_len and text[index].isspace():
+            index += 1
+        if index >= text_len or text[index] != ":":
+            break
+        index += 1
+
+        while index < text_len and text[index].isspace():
+            index += 1
+        if index >= text_len:
+            break
+        if text[index] != '"':
+            break
+
+        value_result = _parse_partial_json_string(text, index)
+        if value_result is None:
+            break
+        value, index = value_result
+        value = re.sub(r"\s+", " ", value).strip()
+        if value:
+            payload[key] = value
+
+    return payload if "what" in payload else None
+
+
+def _parse_partial_json_string(text: str, start: int) -> tuple[str, int] | None:
+    if start >= len(text) or text[start] != '"':
+        return None
+
+    index = start + 1
+    escape = False
+    parts: list[str] = []
+    while index < len(text):
+        char = text[index]
+        if escape:
+            parts.append("\\" + char)
+            escape = False
+            index += 1
+            continue
+        if char == "\\":
+            escape = True
+            index += 1
+            continue
+        if char == '"':
+            return _decode_partial_json_string("".join(parts)), index + 1
+        parts.append(char)
+        index += 1
+
+    return _decode_partial_json_string("".join(parts)), index
+
+
+def _decode_partial_json_string(raw: str) -> str:
+    try:
+        return json.loads(f'"{raw}"')
+    except json.JSONDecodeError:
+        repaired = raw.replace("\\n", " ").replace("\\r", " ").replace("\\t", " ")
+        repaired = repaired.replace('\\"', '"').replace("\\\\", "\\")
+        return repaired
 
 
 def _extract_json_object(text: str) -> str | None:
@@ -1195,6 +1282,7 @@ def _coalesce_changes(changes: list[FileChangeSummary]) -> list[FileChangeSummar
                 removed_lines=change.removed_lines,
                 added_samples=list(change.added_samples),
                 removed_samples=list(change.removed_samples),
+                added_line_samples=list(change.added_line_samples),
             )
             order.append(key)
             continue
@@ -1203,6 +1291,7 @@ def _coalesce_changes(changes: list[FileChangeSummary]) -> list[FileChangeSummar
         existing.removed_lines += change.removed_lines
         _merge_samples(existing.added_samples, change.added_samples)
         _merge_samples(existing.removed_samples, change.removed_samples)
+        _merge_line_samples(existing.added_line_samples, change.added_line_samples)
 
     return [merged[key] for key in order]
 
@@ -1212,6 +1301,15 @@ def _merge_samples(target: list[str], incoming: list[str], limit: int = 12) -> N
         if snippet in target:
             continue
         target.append(snippet)
+        if len(target) >= limit:
+            break
+
+
+def _merge_line_samples(target: list[tuple[int, str]], incoming: list[tuple[int, str]], limit: int = 12) -> None:
+    for sample in incoming:
+        if sample in target:
+            continue
+        target.append(sample)
         if len(target) >= limit:
             break
 

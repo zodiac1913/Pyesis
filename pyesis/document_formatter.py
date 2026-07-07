@@ -134,16 +134,13 @@ def _append_day_repo_entries(
         chunks.append(RenderedTextChunk(f"\t• {repo_label}:\n"))
         for entry in repo_entries:
             tags = _resolved_entry_tags(entry, entry_tag_resolver)
-            for line in _summary_lines(entry.summary):
+            for line in _summary_lines(_summary_body_text(entry.summary)):
                 chunks.append(RenderedTextChunk(f"\t\t• {line}\n", tags=tags))
             evidence = _entry_evidence_line(entry)
             if evidence:
                 chunks.append(RenderedTextChunk(f"\t\t  Evidence: {evidence}\n", tags=tags + ("evidence",)))
-            null_check_pair = _null_check_rewrite_pair(entry.diff_excerpt)
-            if null_check_pair is not None:
-                before_line, after_line = null_check_pair
-                chunks.append(RenderedTextChunk(f"\t\t  Before: {before_line}\n", tags=tags + ("evidence",)))
-                chunks.append(RenderedTextChunk(f"\t\t  After:  {after_line}\n", tags=tags + ("evidence",)))
+            for label, change_line in _change_detail_lines(entry.diff_excerpt):
+                chunks.append(RenderedTextChunk(f"\t\t  {label}: {change_line}\n", tags=tags + ("evidence",)))
             warning_comment = _resolved_warning_comment(entry, warning_comment_resolver)
             if warning_comment:
                 chunks.append(RenderedTextChunk(f"\t\t  {warning_comment}\n", tags=tags + ("ai-comment",)))
@@ -212,7 +209,7 @@ def _write_week_block(
 
 def _write_repo_entries(document: Document, repo_entries: list[EntryRecord]) -> None:
     for entry in repo_entries:
-        for idx, line in enumerate(_summary_lines(entry.summary)):
+        for idx, line in enumerate(_summary_lines(_summary_body_text(entry.summary))):
             style = "List Bullet 2" if idx == 0 else LIST_BULLET_LEVEL_THREE
             entry_paragraph = document.add_paragraph(style=style)
             entry_paragraph.paragraph_format.left_indent = None
@@ -224,17 +221,11 @@ def _write_repo_entries(document: Document, repo_entries: list[EntryRecord]) -> 
             evidence_paragraph.paragraph_format.left_indent = None
             evidence_paragraph.paragraph_format.first_line_indent = None
             evidence_paragraph.add_run(f"Evidence: {evidence}")
-        null_check_pair = _null_check_rewrite_pair(entry.diff_excerpt)
-        if null_check_pair is not None:
-            before_line, after_line = null_check_pair
-            before_paragraph = document.add_paragraph(style=LIST_BULLET_LEVEL_THREE)
-            before_paragraph.paragraph_format.left_indent = None
-            before_paragraph.paragraph_format.first_line_indent = None
-            before_paragraph.add_run(f"Before: {before_line}")
-            after_paragraph = document.add_paragraph(style=LIST_BULLET_LEVEL_THREE)
-            after_paragraph.paragraph_format.left_indent = None
-            after_paragraph.paragraph_format.first_line_indent = None
-            after_paragraph.add_run(f"After:  {after_line}")
+        for label, change_line in _change_detail_lines(entry.diff_excerpt):
+            paragraph = document.add_paragraph(style=LIST_BULLET_LEVEL_THREE)
+            paragraph.paragraph_format.left_indent = None
+            paragraph.paragraph_format.first_line_indent = None
+            paragraph.add_run(f"{label}: {change_line}")
 
 
 def _summary_lines(summary: str) -> list[str]:
@@ -243,8 +234,9 @@ def _summary_lines(summary: str) -> list[str]:
 
 
 def _entry_evidence_line(entry: EntryRecord) -> str:
-    if "evidence:" in entry.summary.lower():
-        return ""
+    inline_evidence = _summary_inline_evidence(entry.summary)
+    if inline_evidence and _evidence_has_line_number(inline_evidence):
+        return inline_evidence
 
     changes = summarize_file_changes(entry.diff_excerpt)
     for change in changes:
@@ -253,25 +245,61 @@ def _entry_evidence_line(entry: EntryRecord) -> str:
             return f"{change.path}:{line_no} \"{snippet}\""
         if change.added_samples:
             return f"{change.path} \"{change.added_samples[0]}\""
-    return ""
+    return inline_evidence
 
 
-def _null_check_rewrite_pair(diff_excerpt: str) -> tuple[str, str] | None:
+def _summary_body_text(summary: str) -> str:
+    body, _separator, _evidence = summary.partition(" Evidence: ")
+    stripped = body.strip()
+    return stripped or summary.strip()
+
+
+def _summary_inline_evidence(summary: str) -> str:
+    _body, separator, evidence = summary.partition(" Evidence: ")
+    if not separator:
+        return ""
+    return evidence.strip().rstrip(".")
+
+
+def _evidence_has_line_number(evidence: str) -> bool:
+    return bool(re.search(r"^[^\s:]+:\d+\s+\"", evidence.strip(), flags=re.IGNORECASE))
+
+
+def _change_detail_lines(diff_excerpt: str) -> list[tuple[str, str]]:
     removed_lines: list[str] = []
     added_lines: list[str] = []
+    fallback_pair: tuple[str, str] | None = None
+    added_fallback = ""
+    removed_fallback = ""
 
-    def flush() -> tuple[str, str] | None:
-        nonlocal removed_lines, added_lines
-        pair = _first_null_check_pair(removed_lines, added_lines)
+    def collect_change_details() -> list[tuple[str, str]]:
+        if removed_lines and added_lines:
+            pair = _first_null_check_pair(removed_lines, added_lines) or _first_changed_line_pair(removed_lines, added_lines)
+            if pair is not None:
+                return [("Before", pair[0]), ("After", pair[1])]
+        if added_lines:
+            return [("After", added_lines[0])]
+        if removed_lines:
+            return [("Before", removed_lines[0])]
+        return []
+
+    def flush() -> list[tuple[str, str]]:
+        nonlocal removed_lines, added_lines, fallback_pair, added_fallback, removed_fallback
+        details = collect_change_details()
+        if not details:
+            if added_lines and not added_fallback:
+                added_fallback = added_lines[0]
+            if removed_lines and not removed_fallback:
+                removed_fallback = removed_lines[0]
         removed_lines = []
         added_lines = []
-        return pair
+        return details
 
     for raw_line in diff_excerpt.splitlines():
         if raw_line.startswith(("@@", " ")):
-            pair = flush()
-            if pair is not None:
-                return pair
+            details = flush()
+            if details:
+                return details
             continue
 
         if raw_line.startswith(("diff --git ", "index ", "--- ", "+++ ", "\\")):
@@ -282,7 +310,16 @@ def _null_check_rewrite_pair(diff_excerpt: str) -> tuple[str, str] | None:
         if raw_line.startswith("+"):
             added_lines.append(raw_line[1:].strip())
 
-    return flush()
+    details = flush()
+    if details:
+        return details
+    if fallback_pair is not None:
+        return [("Before", fallback_pair[0]), ("After", fallback_pair[1])]
+    if added_fallback:
+        return [("After", added_fallback)]
+    if removed_fallback:
+        return [("Before", removed_fallback)]
+    return []
 
 
 def _first_null_check_pair(removed_lines: list[str], added_lines: list[str]) -> tuple[str, str] | None:
@@ -297,6 +334,20 @@ def _first_null_check_pair(removed_lines: list[str], added_lines: list[str]) -> 
                 continue
             if _looks_like_null_check_change(before_line, after_line):
                 return before_line, after_line
+    return None
+
+
+def _first_changed_line_pair(removed_lines: list[str], added_lines: list[str]) -> tuple[str, str] | None:
+    if not removed_lines or not added_lines:
+        return None
+
+    for before_line in removed_lines:
+        if not before_line:
+            continue
+        for after_line in added_lines:
+            if not after_line or before_line == after_line:
+                continue
+            return before_line, after_line
     return None
 
 

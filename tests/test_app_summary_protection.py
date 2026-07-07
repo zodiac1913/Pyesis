@@ -29,6 +29,26 @@ class DummyRoot:
         self.after_calls.append((delay_ms, callback))
 
 
+class DummyEditor:
+    def __init__(self) -> None:
+        self.ops: list[tuple[str, str, tuple[str, ...] | None]] = []
+
+    def delete(self, start: str, end: str) -> None:
+        self.ops.append(("delete", "", None))
+
+    def insert(self, _index: str, text: str, tags=None) -> None:
+        if tags is None:
+            normalized_tags = None
+        elif isinstance(tags, tuple):
+            normalized_tags = tags
+        else:
+            normalized_tags = tuple(tags)
+        self.ops.append(("insert", text, normalized_tags))
+
+    def contents(self) -> str:
+        return "".join(text for op, text, _tags in self.ops if op == "insert")
+
+
 class ImmediateThread:
     def __init__(self, target=None, args=(), kwargs=None, daemon=None) -> None:
         self._target = target
@@ -350,6 +370,39 @@ class AppSummaryProtectionTests(unittest.TestCase):
         app._queue_startup_poll()
 
         self.assertEqual(app.root.after_calls, [])
+
+    def test_refresh_editor_does_not_show_previous_week_when_current_week_is_empty(self) -> None:
+        app = self._make_app()
+        app.editor = DummyEditor()
+        app._last_rendered_week_start_iso = ""
+        app._update_backlog_button = lambda: None
+        app._entry_render_tags = lambda _entry: ()
+        app._entry_warning_comment = lambda _entry: ""
+        app.config.entries = [
+            EntryRecord(
+                repo_label="Pyesis",
+                repo_path="/tmp/pyesis",
+                created_at="2026-06-29T10:05:00",
+                day_name="Monday",
+                week_start_iso="2026-06-26T00:00:00",
+                summary="I fixed the previous week issue.",
+                diff_hash="old-week",
+                diff_excerpt="diff --git a/file b/file\n+++ b/file\n",
+                summary_source="heuristic",
+                author="Backup",
+            )
+        ]
+
+        with patch("pyesis.app.datetime") as mock_datetime:
+            mock_datetime.now.return_value = datetime(2026, 7, 7, 12, 0, 0)
+            mock_datetime.fromisoformat.side_effect = datetime.fromisoformat
+            PyesisApp._refresh_editor(app)
+
+        rendered = app.editor.contents()
+        self.assertIn("(2026 Jul 09)", rendered)
+        self.assertIn("No captured code changes for this week yet.", rendered)
+        self.assertNotIn("Showing your most recent captured week", rendered)
+        self.assertNotIn("I fixed the previous week issue.", rendered)
 
     def test_entry_warning_comment_and_progress_tracking(self) -> None:
         app = self._make_app()
