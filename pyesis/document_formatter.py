@@ -134,7 +134,7 @@ def _append_day_repo_entries(
         chunks.append(RenderedTextChunk(f"\t• {repo_label}:\n"))
         for entry in repo_entries:
             tags = _resolved_entry_tags(entry, entry_tag_resolver)
-            for line in _summary_lines(_summary_body_text(entry.summary)):
+            for line in _summary_lines(_summary_body_text(entry.summary, entry.diff_excerpt)):
                 chunks.append(RenderedTextChunk(f"\t\t• {line}\n", tags=tags))
             evidence = _entry_evidence_line(entry)
             if evidence:
@@ -209,7 +209,7 @@ def _write_week_block(
 
 def _write_repo_entries(document: Document, repo_entries: list[EntryRecord]) -> None:
     for entry in repo_entries:
-        for idx, line in enumerate(_summary_lines(_summary_body_text(entry.summary))):
+        for idx, line in enumerate(_summary_lines(_summary_body_text(entry.summary, entry.diff_excerpt))):
             style = "List Bullet 2" if idx == 0 else LIST_BULLET_LEVEL_THREE
             entry_paragraph = document.add_paragraph(style=style)
             entry_paragraph.paragraph_format.left_indent = None
@@ -235,7 +235,7 @@ def _summary_lines(summary: str) -> list[str]:
 
 def _entry_evidence_line(entry: EntryRecord) -> str:
     inline_evidence = _summary_inline_evidence(entry.summary)
-    if inline_evidence and _evidence_has_line_number(inline_evidence):
+    if inline_evidence and _evidence_has_line_number(inline_evidence) and _evidence_matches_changed_line(inline_evidence, entry.diff_excerpt):
         return inline_evidence
 
     changes = summarize_file_changes(entry.diff_excerpt)
@@ -248,10 +248,13 @@ def _entry_evidence_line(entry: EntryRecord) -> str:
     return inline_evidence
 
 
-def _summary_body_text(summary: str) -> str:
+def _summary_body_text(summary: str, diff_excerpt: str = "") -> str:
     body, _separator, _evidence = summary.partition(" Evidence: ")
     stripped = body.strip()
-    return stripped or summary.strip()
+    resolved = stripped or summary.strip()
+    if not diff_excerpt.strip():
+        return resolved
+    return _strip_unverified_around_claims(resolved, diff_excerpt)
 
 
 def _summary_inline_evidence(summary: str) -> str:
@@ -265,10 +268,82 @@ def _evidence_has_line_number(evidence: str) -> bool:
     return bool(re.search(r"^[^\s:]+:\d+\s+\"", evidence.strip(), flags=re.IGNORECASE))
 
 
+def _evidence_matches_changed_line(evidence: str, diff_excerpt: str) -> bool:
+    match = re.match(r'^(?P<path>[^\s:]+):(?P<line>\d+)\s+\"(?P<snippet>.*)\"$', evidence.strip())
+    if not match:
+        return False
+
+    evidence_path = match.group("path").replace("\\", "/").strip().lower()
+    evidence_line = int(match.group("line"))
+    evidence_snippet = _normalize_evidence_snippet(match.group("snippet"))
+    if not evidence_snippet:
+        return False
+
+    for change in summarize_file_changes(diff_excerpt):
+        change_path = change.path.replace("\\", "/").strip().lower()
+        if change_path != evidence_path:
+            continue
+        for line_no, snippet in change.added_line_samples:
+            if line_no != evidence_line:
+                continue
+            if _normalize_evidence_snippet(snippet) == evidence_snippet:
+                return True
+    return False
+
+
+def _normalize_evidence_snippet(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip())
+
+
+def _strip_unverified_around_claims(summary_body: str, diff_excerpt: str) -> str:
+    changed_snippets = _changed_snippet_set(diff_excerpt)
+    if not changed_snippets:
+        return summary_body
+
+    marker = " around '"
+    cursor = 0
+    parts: list[str] = []
+
+    while True:
+        start = summary_body.find(marker, cursor)
+        if start < 0:
+            parts.append(summary_body[cursor:])
+            break
+
+        snippet_start = start + len(marker)
+        snippet_end = summary_body.find("'", snippet_start)
+        if snippet_end < 0:
+            parts.append(summary_body[cursor:])
+            break
+
+        parts.append(summary_body[cursor:start])
+        snippet = _normalize_evidence_snippet(summary_body[snippet_start:snippet_end])
+        if snippet in changed_snippets:
+            parts.append(summary_body[start:snippet_end + 1])
+        cursor = snippet_end + 1
+
+    return re.sub(r"\s+", " ", "".join(parts)).strip()
+
+
+def _changed_snippet_set(diff_excerpt: str) -> set[str]:
+    snippets: set[str] = set()
+    for change in summarize_file_changes(diff_excerpt):
+        _add_normalized_snippets(snippets, (snippet for _line_no, snippet in change.added_line_samples))
+        _add_normalized_snippets(snippets, change.added_samples)
+        _add_normalized_snippets(snippets, change.removed_samples)
+    return snippets
+
+
+def _add_normalized_snippets(target: set[str], source: list[str] | tuple[str, ...] | object) -> None:
+    for snippet in source:
+        normalized = _normalize_evidence_snippet(str(snippet))
+        if normalized:
+            target.add(normalized)
+
+
 def _change_detail_lines(diff_excerpt: str) -> list[tuple[str, str]]:
     removed_lines: list[str] = []
     added_lines: list[str] = []
-    fallback_pair: tuple[str, str] | None = None
     added_fallback = ""
     removed_fallback = ""
 
@@ -278,13 +353,13 @@ def _change_detail_lines(diff_excerpt: str) -> list[tuple[str, str]]:
             if pair is not None:
                 return [("Before", pair[0]), ("After", pair[1])]
         if added_lines:
-            return [("After", added_lines[0])]
+            return [("Added", added_lines[0])]
         if removed_lines:
-            return [("Before", removed_lines[0])]
+            return [("Removed", removed_lines[0])]
         return []
 
     def flush() -> list[tuple[str, str]]:
-        nonlocal removed_lines, added_lines, fallback_pair, added_fallback, removed_fallback
+        nonlocal removed_lines, added_lines, added_fallback, removed_fallback
         details = collect_change_details()
         if not details:
             if added_lines and not added_fallback:
@@ -313,12 +388,10 @@ def _change_detail_lines(diff_excerpt: str) -> list[tuple[str, str]]:
     details = flush()
     if details:
         return details
-    if fallback_pair is not None:
-        return [("Before", fallback_pair[0]), ("After", fallback_pair[1])]
     if added_fallback:
-        return [("After", added_fallback)]
+        return [("Added", added_fallback)]
     if removed_fallback:
-        return [("Before", removed_fallback)]
+        return [("Removed", removed_fallback)]
     return []
 
 

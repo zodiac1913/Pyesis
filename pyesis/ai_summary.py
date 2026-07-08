@@ -17,6 +17,13 @@ SYSTEM_PROMPT = (
     "When asked for JSON, return exactly one JSON object with double-quoted keys and string values only. "
     "Do not use single quotes, code fences, comments, markdown, or explanatory text before or after the JSON object. "
     "Use up to five sentence(s), past tense, concrete wording, and no markdown bullet prefix. "
+    "Before returning the final answer, do a grammar pass and rewrite anything that is not natural English. "
+    "The main clause must read as first-person past tense, for example 'I added...', 'I changed...', or 'I hardened...'. "
+    "After connectors, use natural English forms such as 'to change...' or 'by changing...'. "
+    "Never output malformed phrasing like 'I hardening', 'I expanding', 'by I changed', or 'to I changed'. "
+    "Before returning the final answer, verify that every claimed concrete change is supported by an actual added or removed line in the diff. "
+    "Do not cite unchanged context lines as evidence. If a specific line, symbol, or literal is not clearly changed in a '+' or '-' diff line, do not mention it as a changed line. "
+    "If the diff only supports a broader file-level statement, use a broader file-level statement instead of inventing a precise changed line. "
     "Assume each diff is usually a single file change and name the file directly when the evidence supports it. "
     "Prefer explicit verbs like added, removed, renamed, refactored, and mention what changed. "
     "Avoid vague wording like updated or worked on unless details are unavailable. When details are unavailable try to explain file changes. "
@@ -63,6 +70,7 @@ INTENT_PAST_TENSE_PREFIXES = {
     "adjusting ": "adjusted ",
     "tightening ": "tightened ",
     "changing ": "changed ",
+    "hardening ": "hardened ",
     "cleaning ": "cleaned ",
 }
 INTENT_PURPOSE_PREFIXES = {
@@ -71,8 +79,47 @@ INTENT_PURPOSE_PREFIXES = {
     "adjusting ": "adjust ",
     "tightening ": "tighten ",
     "changing ": "change ",
+    "hardening ": "harden ",
     "cleaning ": "clean ",
     "improving ": "improve ",
+}
+PAST_TO_BASE_VERBS = {
+    "added": "add",
+    "updated": "update",
+    "adjusted": "adjust",
+    "tightened": "tighten",
+    "changed": "change",
+    "removed": "remove",
+    "renamed": "rename",
+    "hardened": "harden",
+    "cleaned": "clean",
+    "improved": "improve",
+}
+GERUND_TO_BASE_VERBS = {
+    "adding": "add",
+    "updating": "update",
+    "adjusting": "adjust",
+    "tightening": "tighten",
+    "changing": "change",
+    "removing": "remove",
+    "renaming": "rename",
+    "hardening": "harden",
+    "cleaning": "clean",
+    "improving": "improve",
+    "editing": "edit",
+}
+BASE_TO_GERUND_VERBS = {
+    "add": "adding",
+    "update": "updating",
+    "adjust": "adjusting",
+    "tighten": "tightening",
+    "change": "changing",
+    "remove": "removing",
+    "rename": "renaming",
+    "harden": "hardening",
+    "clean": "cleaning",
+    "improve": "improving",
+    "edit": "editing",
 }
 APP_FILENAME = "app.py"
 PYPROJECT_TOML = "pyproject.toml"
@@ -361,6 +408,9 @@ def _compose_description(summary: StructuredSummary) -> str:
     how_text = _sentence_without_period(summary.how)
     normalized_what = _normalized_clause(what_text)
 
+    if normalized_what.startswith("updated work in "):
+        return what_text.strip() + "."
+
     parts = [what_text]
     added_why = False
     if (
@@ -386,9 +436,46 @@ def _compose_description(summary: StructuredSummary) -> str:
 
 def _clause_with_connector(connector: str, clause: str) -> str:
     cleaned = clause.strip()
-    if re.match(rf"(?i)^{re.escape(connector)}\b", cleaned):
-        return cleaned
-    return f"{connector} {cleaned}"
+    prefix_match = re.match(rf"(?i)^{re.escape(connector)}\s+", cleaned)
+    if prefix_match:
+        cleaned = cleaned[prefix_match.end():].strip()
+
+    normalized = _normalize_connector_clause_body(connector, cleaned)
+    return f"{connector} {normalized}".strip()
+
+
+def _normalize_connector_clause_body(connector: str, body: str) -> str:
+    text = body.strip()
+    match = re.match(r"(?i)^i\s+([a-z]+)\b(.*)$", text)
+    if not match:
+        return text
+
+    verb = match.group(1).lower()
+    tail = match.group(2)
+    if connector == "by":
+        return f"{_verb_to_gerund(verb)}{tail}".strip()
+    if connector == "to":
+        return f"{_verb_to_base(verb)}{tail}".strip()
+    return text
+
+
+def _verb_to_base(verb: str) -> str:
+    token = verb.strip().lower()
+    if token in PAST_TO_BASE_VERBS:
+        return PAST_TO_BASE_VERBS[token]
+    if token in GERUND_TO_BASE_VERBS:
+        return GERUND_TO_BASE_VERBS[token]
+    return token
+
+
+def _verb_to_gerund(verb: str) -> str:
+    base = _verb_to_base(verb)
+    mapped = BASE_TO_GERUND_VERBS.get(base)
+    if mapped:
+        return mapped
+    if base.endswith("e") and len(base) > 2:
+        return base[:-1] + "ing"
+    return base + "ing"
 
 
 def _cleanup_repeated_connectors(text: str) -> str:
@@ -426,9 +513,6 @@ def _first_evidence_reference(changes: list[FileChangeSummary]) -> str:
         if change.added_line_samples:
             line_no, snippet = change.added_line_samples[0]
             return f"{change.path}:{line_no} \"{snippet}\""
-        if change.added_samples:
-            snippet = change.added_samples[0]
-            return f"{change.path} \"{snippet}\""
     return ""
 
 
@@ -623,9 +707,6 @@ def _anchored_change_phrase(change: FileChangeSummary) -> str:
     if import_targets:
         return f"updated imports in {path} to use {_join_with_and(import_targets[:3])}"
 
-    sample = _best_sample_snippet(change)
-    if sample:
-        return f"updated {path} around '{sample}'"
     return ""
 
 
@@ -767,6 +848,8 @@ def _is_low_quality_ai_field(field_name: str, value: str) -> bool:
         return True
     if field_name == "what" and not normalized.startswith("i "):
         return True
+    if field_name == "what" and re.match(r"^i\s+(adding|updating|adjusting|tightening|changing|hardening|cleaning)\b", normalized):
+        return True
     if field_name in {"what", "why", "how"} and _contains_low_quality_marker(normalized):
         return True
     return False
@@ -779,7 +862,21 @@ def _is_low_quality_summary_text(text: str) -> bool:
 
 def _summary_relevant_changes(changes: list[FileChangeSummary]) -> list[FileChangeSummary]:
     filtered = [change for change in changes if not _is_summary_excluded_path(change.path)]
-    return filtered or changes
+    if not filtered:
+        return []
+
+    signal_only = [change for change in filtered if _has_summary_signal(change)]
+    return signal_only
+
+
+def _has_summary_signal(change: FileChangeSummary) -> bool:
+    if change.added_line_samples:
+        return True
+    if any(sample.strip() for sample in change.added_samples):
+        return True
+    if any(sample.strip() for sample in change.removed_samples):
+        return True
+    return False
 
 
 def _is_summary_excluded_path(path: str) -> bool:
@@ -980,6 +1077,13 @@ def _build_ai_user_prompt(repo_label: str, diff_text: str, repo_path: str | None
         "Use key thoughts of who, what, where, when, why, and how. "
         "Do not omit any key. If the diff does not provide a field, say 'Not available from the diff.' "
         "Keep values concise but detailed to the level given, and make 'what' a first-person summary of the code changes. "
+        "Before returning the JSON, do a grammar pass so the wording reads as natural English. "
+        "The 'what' field must read as first-person past tense, for example 'I added...', 'I changed...', or 'I hardened...'. "
+        "After connectors, use natural forms like 'to change...' or 'by changing...'. "
+        "Do not output malformed wording like 'I hardening', 'I expanding', 'by I changed', or 'to I changed'. "
+        "Verify that each claimed concrete change is supported by an actual added or removed line in the diff. "
+        "Do not cite unchanged context lines as changed lines. If a specific line or symbol is not clearly changed in a '+' or '-' diff line, do not mention it as changed evidence. "
+        "If the diff only supports a broader file-level statement, prefer the broader statement over a false precise claim. "
         "In the 'what' field, name at least one concrete anchor from the diff when available: a function, class, field, import, config key, path, route, selector, or literal label. "
         "If the change digest shows an anchor, reuse that anchor explicitly instead of paraphrasing it away. "
         "Do not mention line counts, generic implementation-quality phrases, or wording like 'changing code around'. "

@@ -245,9 +245,49 @@ class DocumentFormatterTests(unittest.TestCase):
 
         rendered_text = "".join(chunk.text for chunk in chunks)
         self.assertIn("I updated Controllers/Configurer/Controllers/AppController.cs around 'ControllerName = app.ControllerName ?? \"\",'.", rendered_text)
-        self.assertIn('Evidence: Controllers/Configurer/Controllers/AppController.cs:64 "ControllerName = app.ControllerName ?? "",', rendered_text)
+        self.assertIn('Evidence: Controllers/Configurer/Controllers/AppController.cs:45 "ControllerName = app.ControllerName ?? "",', rendered_text)
         self.assertNotIn("\t\t• I updated Controllers/Configurer/Controllers/AppController.cs around 'ControllerName = app.ControllerName ?? "",'. Evidence:", rendered_text)
-        self.assertIn('After: ControllerName = app.ControllerName ?? "",', rendered_text)
+        self.assertIn('Added: ControllerName = app.ControllerName ?? "",', rendered_text)
+
+    def test_render_text_chunks_removes_unverified_around_claim_and_invalid_inline_evidence(self) -> None:
+        entry = EntryRecord(
+            repo_label="Cats",
+            repo_path="/tmp/cats",
+            created_at="2026-07-07T09:33:39",
+            day_name="Tuesday",
+            week_start_iso="2026-07-03T00:00:00",
+            summary=(
+                'I updated Controllers/Configurer/Controllers/AppController.cs around '\
+                '\'ControllerName = app.ControllerName ?? "",\'. '
+                'Evidence: Controllers/Configurer/Controllers/AppController.cs:64 '
+                '"ControllerName = app.ControllerName ?? "",".'
+            ),
+            diff_hash="hash-controller-noise",
+            diff_excerpt=(
+                "diff --git a/Controllers/Configurer/Controllers/AppController.cs b/Controllers/Configurer/Controllers/AppController.cs\n"
+                "+++ b/Controllers/Configurer/Controllers/AppController.cs\n"
+                "@@ -20,3 +20,4 @@ public partial class ConfigurerController : CATSController\n"
+                "-    public async Task<IActionResult> ApiConfigurerAppsTableRows()\n"
+                "+    private List<object> BuildAppsGridRows()\n"
+                "     {\n"
+            ),
+            summary_source="ollama",
+            author="AI",
+        )
+        config = AppConfig(week_end_day="Thursday", entries=[entry])
+
+        with patch("pyesis.document_formatter.datetime") as mock_datetime:
+            mock_datetime.now.return_value = datetime(2026, 7, 7, 12, 0, 0)
+            mock_datetime.fromisoformat.side_effect = datetime.fromisoformat
+            chunks = render_text_chunks(config)
+
+        rendered_text = "".join(chunk.text for chunk in chunks)
+        self.assertIn("I updated Controllers/Configurer/Controllers/AppController.cs.", rendered_text)
+        self.assertNotIn("around 'ControllerName = app.ControllerName ?? \"\",'", rendered_text)
+        self.assertIn(
+            'Evidence: Controllers/Configurer/Controllers/AppController.cs:20 "private List<object> BuildAppsGridRows()"',
+            rendered_text,
+        )
 
 
 if __name__ == "__main__":

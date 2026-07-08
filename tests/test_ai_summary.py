@@ -8,18 +8,23 @@ from pyesis.ai_summary import (
     ProviderStructuredSummary,
     _build_ai_user_prompt,
     _coalesce_changes,
+    _first_evidence_reference,
     _is_summary_excluded_path,
     _normalize_acronyms_in_text,
     _ollama_model_candidates,
     _ollama_structured_summary,
     _parse_ai_json_payload,
     _structured_summary_from_json,
+    _to_past_tense,
     build_summary,
 )
-from pyesis.git_monitor import summarize_changed_files, summarize_file_changes
+from pyesis.git_monitor import FileChangeSummary, summarize_changed_files, summarize_file_changes
 
 
 class AISummaryTests(unittest.TestCase):
+    def test_to_past_tense_converts_hardening(self) -> None:
+        self.assertEqual(_to_past_tense("hardening null recovery"), "hardened null recovery")
+
     def test_normalize_acronyms_uppercases_words_only(self) -> None:
         text = "I updated smlAutoComplete to call oauth endpoint and align ui behavior for api responses."
 
@@ -106,6 +111,56 @@ class AISummaryTests(unittest.TestCase):
         self.assertNotIn(" added sac ", f" {result.text.lower()} ")
         self.assertIn("smlAutoComplete.js", result.text)
 
+    def test_heuristic_summary_ignores_whitespace_only_hunk(self) -> None:
+        diff_text = (
+            "diff --git a/wwwroot/css/site.css b/wwwroot/css/site.css\n"
+            "+++ b/wwwroot/css/site.css\n"
+            "@@ -29,20 +29,21 @@ html {\n"
+            "   }\n"
+            " }\n"
+            "+\n"
+        )
+
+        result = build_summary("Cats", diff_text, repo_path="/tmp/cats", mode="heuristic")
+
+        self.assertIn("Updated work in Cats.", result.text)
+        self.assertNotIn("validation-required", result.text)
+        self.assertNotIn("site.css", result.text)
+        self.assertNotIn("Evidence:", result.text)
+
+    def test_evidence_reference_requires_line_numbered_added_line(self) -> None:
+        diff_text = (
+            "diff --git a/Controllers/Configurer/Controllers/AppController.cs b/Controllers/Configurer/Controllers/AppController.cs\n"
+            "+++ b/Controllers/Configurer/Controllers/AppController.cs\n"
+            "@@ -40,0 +41,2 @@\n"
+            "+private List<object> BuildAppsGridRows()\n"
+            "+{\n"
+        )
+
+        changes = _coalesce_changes(summarize_file_changes(diff_text))
+        evidence = _first_evidence_reference(changes)
+
+        self.assertIn("AppController.cs:41", evidence)
+        self.assertIn("BuildAppsGridRows", evidence)
+
+    def test_evidence_reference_omits_line_less_sample_fallback(self) -> None:
+        changes = [
+            # Simulate legacy/coalesced data that only has sample text but no line-numbered added sample.
+            FileChangeSummary(
+                path="Controllers/Configurer/Controllers/AppController.cs",
+                action="modified",
+                added_lines=1,
+                removed_lines=0,
+                added_samples=["ControllerName = app.ControllerName ?? \"\", "],
+                removed_samples=[],
+                added_line_samples=[],
+            )
+        ]
+
+        evidence = _first_evidence_reference(changes)
+
+        self.assertEqual(evidence, "")
+
     def test_low_quality_ai_fields_are_repaired_from_diff(self) -> None:
         diff_text = (
             "diff --git a/pyesis/diff_buffer.py b/pyesis/diff_buffer.py\n"
@@ -134,6 +189,57 @@ class AISummaryTests(unittest.TestCase):
         self.assertIn("summarySource", repaired_text)
         self.assertNotIn("refined logic", repaired_text.lower())
         self.assertNotIn("changing code around", repaired_text.lower())
+
+    def test_gerund_leading_what_clause_is_repaired(self) -> None:
+        diff_text = (
+            "diff --git a/Controllers/Configurer/Controllers/AppController.cs b/Controllers/Configurer/Controllers/AppController.cs\n"
+            "+++ b/Controllers/Configurer/Controllers/AppController.cs\n"
+            "@@ -22,1 +22,1 @@\n"
+            "+if (appSec == null) { return BadRequest(); }\n"
+        )
+        changes = _coalesce_changes(summarize_file_changes(diff_text))
+
+        repaired = _structured_summary_from_json(
+            {
+                "who": "I",
+                "what": "I hardening null recovery in Controllers/Configurer/Controllers/AppController.cs",
+                "where": "Controllers/Configurer/Controllers/AppController.cs",
+                "when": "Not available from the diff.",
+                "why": "clarify behavior",
+                "how": "changing code around 'if (appSec == null) { return BadRequest(); }'",
+            },
+            changes,
+            "Cats",
+        )
+
+        repaired_text = repaired.to_text().lower()
+        self.assertNotIn("i hardening", repaired_text)
+
+    def test_compose_description_normalizes_by_i_changed(self) -> None:
+        diff_text = (
+            "diff --git a/Views/Configurer/Apps.cshtml b/Views/Configurer/Apps.cshtml\n"
+            "+++ b/Views/Configurer/Apps.cshtml\n"
+            "@@ -100,1 +100,1 @@\n"
+            "+data-api=\"/Configurer/ApiConfigurerAppsCCReportingSearch\"\n"
+        )
+        changes = _coalesce_changes(summarize_file_changes(diff_text))
+
+        repaired = _structured_summary_from_json(
+            {
+                "who": "I",
+                "what": "I updated the data-API attribute in Views/Configurer/Apps.cshtml",
+                "where": "Views/Configurer/Apps.cshtml",
+                "when": "Not available from the diff.",
+                "why": "clarify behavior",
+                "how": "I changed the value of the data-API attribute",
+            },
+            changes,
+            "Cats",
+        )
+
+        repaired_text = repaired.to_text().lower()
+        self.assertIn("by changing the value of the data-api attribute", repaired_text)
+        self.assertNotIn("by i changed", repaired_text)
 
     def test_summary_excludes_ai_attempt_log_path(self) -> None:
         self.assertTrue(_is_summary_excluded_path("logs/ai_attempts.jsonl"))
@@ -166,6 +272,11 @@ class AISummaryTests(unittest.TestCase):
 
         self.assertIn("name at least one concrete anchor", prompt)
         self.assertIn("Forbidden phrases", prompt)
+        self.assertIn("do a grammar pass", prompt)
+        self.assertIn("I hardening", prompt)
+        self.assertIn("by I changed", prompt)
+        self.assertIn("actual added or removed line in the diff", prompt)
+        self.assertIn("Do not cite unchanged context lines", prompt)
         self.assertIn("refined logic", prompt)
         self.assertIn("summarySource", prompt)
         self.assertIn("Return exactly one JSON object and nothing else", prompt)
