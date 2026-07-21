@@ -46,7 +46,7 @@ from pyesis.config import (
     load_config,
     save_config,
 )
-from pyesis.diff_buffer import BUFFER_DIR, find_item, mark_as_shown, purge_old_daily_buffers, remember_diff
+from pyesis.diff_buffer import BUFFER_DIR, find_item, list_buffer_day_keys, load_buffer_items, mark_as_shown, purge_old_daily_buffers, remember_diff
 from pyesis.document_formatter import export_docx, render_plain_text, render_text_chunks
 from pyesis.github_auth import (
     GITHUB_DOTCOM_AUTH_MODE,
@@ -86,6 +86,7 @@ REMOVALS_TOKEN = " removals"
 DIFF_PATH_PREFIX = "+++ b/"
 AI_ATTEMPT_LOG_VIEW_LIMIT = 200
 LISTBOX_SELECT_EVENT = "<<ListboxSelect>>"
+AGING_ACTION_BUTTON_STYLE = "AgingAction.TButton"
 
 
 def _ollama_tags_url(base_url: str) -> str:
@@ -270,6 +271,7 @@ class PyesisApp:
         self._apply_fonts()
         self._apply_theme()
         self._migrate_entries(allow_ai_rewrite=False)
+        self._recover_shown_buffer_entries()
         self._refresh_repo_list()
         self._refresh_editor()
         self._maybe_auto_export_daily()
@@ -301,6 +303,48 @@ class PyesisApp:
         pos_x = max(0, (screen_w - width) // 2)
         pos_y = max(0, (screen_h - height) // 3)
         self.root.geometry(f"{width}x{height}+{pos_x}+{pos_y}")
+
+    def _dialog_geometry_near_root(self, dialog: tk.Toplevel, width: int, height: int) -> str:
+        try:
+            self.root.update_idletasks()
+        except tk.TclError:
+            pass
+
+        screen_origin_x = int(dialog.winfo_vrootx())
+        screen_origin_y = int(dialog.winfo_vrooty())
+        screen_width = max(width, int(dialog.winfo_vrootwidth()) or int(dialog.winfo_screenwidth()))
+        screen_height = max(height, int(dialog.winfo_vrootheight()) or int(dialog.winfo_screenheight()))
+
+        parent_width = max(int(self.root.winfo_width()), int(self.root.winfo_reqwidth()), width)
+        parent_height = max(int(self.root.winfo_height()), int(self.root.winfo_reqheight()), height)
+        parent_x = int(self.root.winfo_rootx())
+        parent_y = int(self.root.winfo_rooty())
+
+        pos_x = parent_x + (parent_width - width) // 2
+        pos_y = parent_y + max(20, (parent_height - height) // 3)
+
+        max_x = screen_origin_x + max(0, screen_width - width)
+        max_y = screen_origin_y + max(0, screen_height - height)
+        pos_x = min(max(pos_x, screen_origin_x), max_x)
+        pos_y = min(max(pos_y, screen_origin_y), max_y)
+        return f"{width}x{height}+{pos_x}+{pos_y}"
+
+    def _present_dialog(self, dialog: tk.Toplevel, width: int, height: int) -> None:
+        dialog.geometry(self._dialog_geometry_near_root(dialog, width, height))
+        dialog.update_idletasks()
+        dialog.deiconify()
+        dialog.lift()
+        try:
+            dialog.focus_force()
+        except tk.TclError:
+            pass
+        if sys.platform != "darwin":
+            return
+        try:
+            dialog.attributes("-topmost", True)
+            dialog.after(250, lambda: dialog.attributes("-topmost", False))
+        except tk.TclError:
+            pass
 
     def _apply_ai_environment_defaults(self) -> None:
         ollama_model = self.config.ai_ollama_model.strip() or DEFAULT_OLLAMA_SUMMARY_MODEL
@@ -378,9 +422,21 @@ class PyesisApp:
         normalized = summary_source.strip().lower()
         if normalized:
             return normalized
+        if author.strip().lower() in HUMAN_SUMMARY_AUTHORS:
+            return "manual"
         if author == "Backup":
             return HEURISTIC_MODE
-        return self._current_ai_mode()
+        return HEURISTIC_MODE
+
+    def _is_trusted_ai_entry(self, entry: EntryRecord) -> bool:
+        if entry.summary_warning.strip():
+            return False
+        summary_source = (entry.summary_source or "").strip().lower()
+        if summary_source == "manual" or entry.author.strip().lower() in HUMAN_SUMMARY_AUTHORS:
+            return True
+        if not summary_source or summary_source == HEURISTIC_MODE:
+            return False
+        return summary_source in {OLLAMA_MODE, OPENAI_COMPATIBLE_MODE, GITHUB_GPT_MODE}
 
     def _has_openai_api_key(self) -> bool:
         return bool(os.getenv("PYESIS_AI_API_KEY", "").strip())
@@ -771,6 +827,7 @@ class PyesisApp:
             textvariable=self.summary_refresh_button_var,
             underline=0,
             width=16,
+            style=AGING_ACTION_BUTTON_STYLE,
             command=self._refresh_current_week_weak_summaries,
         )
         self.summary_refresh_button.grid(row=0, column=6, sticky="e", padx=(6, 0))
@@ -780,6 +837,7 @@ class PyesisApp:
             textvariable=self.backlog_button_var,
             underline=0,
             width=18,
+            style=AGING_ACTION_BUTTON_STYLE,
             command=self._force_upgrade_heuristic_backlog,
         )
         self.backlog_button.grid(row=0, column=7, sticky="e", padx=(6, 0))
@@ -1003,6 +1061,57 @@ class PyesisApp:
         if rewritten != original_entries:
             self.config.entries = rewritten
             save_config(self.config)
+
+    def _recover_shown_buffer_entries(self) -> int:
+        known_hashes = {entry.diff_hash for entry in self.config.entries if entry.diff_hash.strip()}
+        recovered = 0
+
+        for day_key in list_buffer_day_keys():
+            for item in load_buffer_items(day_key):
+                if not item["shown"]:
+                    continue
+                diff_hash = item["diffHash"].strip()
+                if diff_hash and diff_hash in known_hashes:
+                    continue
+                summary_text = item["gitDiffDescription"].strip()
+                if not summary_text:
+                    continue
+                created_at_raw = item["datetime"].strip()
+                try:
+                    created_at = datetime.fromisoformat(created_at_raw)
+                except ValueError:
+                    continue
+
+                repo = RepoConfig(path=item["repoPath"], label=item["repo"])
+                entry = self._build_entry(
+                    repo,
+                    created_at,
+                    summary_text,
+                    item["gitDiffText"],
+                    diff_hash,
+                    item["author"],
+                    self._summary_mode_or_default(item["summarySource"], item["author"]),
+                    item["requestedSummarySource"],
+                    item["summaryWarning"],
+                    item["fallbackSummarySource"],
+                    item["summaryTimingMs"],
+                    item["summaryProviderDetails"],
+                    item["lastAiAttemptAt"],
+                )
+
+                if any(self._is_duplicate_entry(existing, entry) for existing in self.config.entries):
+                    if diff_hash:
+                        known_hashes.add(diff_hash)
+                    continue
+
+                self._merge_or_append_captured_entry(entry)
+                if diff_hash:
+                    known_hashes.add(diff_hash)
+                recovered += 1
+
+        if recovered:
+            save_config(self.config)
+        return recovered
 
     def _week_day_names(self) -> list[str]:
         return ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
@@ -1662,7 +1771,7 @@ class PyesisApp:
         screen_h = dialog.winfo_screenheight()
         width = min(max(700, int(screen_w * 0.5)), screen_w - 120)
         height = min(max(760, int(screen_h * 0.78)), screen_h - 120)
-        dialog.geometry(f"{width}x{height}")
+        self._present_dialog(dialog, width, height)
         dialog.minsize(640, 620)
 
         shell = ttk.Frame(dialog, padding=12)
@@ -2196,6 +2305,12 @@ class PyesisApp:
             background=[("active", palette["surface_alt"])],
             foreground=[("disabled", palette["muted_fg"])],
         )
+        self.style.configure(AGING_ACTION_BUTTON_STYLE, background="#b3b3b3", foreground="#4a4a4a")
+        self.style.map(
+            AGING_ACTION_BUTTON_STYLE,
+            background=[("active", "#a6a6a6"), ("disabled", "#d4d4d4")],
+            foreground=[("disabled", "#8a8a8a")],
+        )
         self.style.configure(
             "TEntry",
             fieldbackground=palette["input_bg"],
@@ -2435,15 +2550,15 @@ class PyesisApp:
                 summary=new_summary,
                 diff_hash=current_entry.diff_hash,
                 diff_excerpt=current_entry.diff_excerpt,
-                summary_source=current_entry.summary_source,
-                author=current_entry.author,
-                rewritten_by=current_entry.rewritten_by,
-                rewritten_at=current_entry.rewritten_at,
+                summary_source="manual",
+                author="Manual",
+                rewritten_by="",
+                rewritten_at="",
                 requested_summary_source=current_entry.requested_summary_source,
-                summary_warning=current_entry.summary_warning,
-                fallback_summary_source=current_entry.fallback_summary_source,
-                summary_timing_ms=current_entry.summary_timing_ms,
-                summary_provider_details=current_entry.summary_provider_details,
+                summary_warning="",
+                fallback_summary_source="",
+                summary_timing_ms=0,
+                summary_provider_details="",
             )
             self.config.entries[config_index] = updated_entry
             indexed_entries[pos] = (config_index, updated_entry)
@@ -2511,10 +2626,9 @@ class PyesisApp:
             return ("ai-working-bright",) if self._ai_working_pulse_on else ("ai-working-dim",)
         if entry.summary_warning.strip():
             return ("ai-failed",)
-        summary_source = (entry.summary_source or "").strip().lower()
-        if summary_source:
-            return ("heuristic",) if summary_source == HEURISTIC_MODE else ()
-        return ("heuristic",) if entry.author == "Backup" else ()
+        if self._is_trusted_ai_entry(entry):
+            return ()
+        return ("heuristic",)
 
     def _entry_warning_comment(self, entry: EntryRecord) -> str:
         warning = re.sub(r"\s+", " ", entry.summary_warning.strip())
@@ -3121,6 +3235,7 @@ class PyesisApp:
                 continue
 
             self._merge_or_append_captured_entry(new_entry)
+            save_config(self.config)
             mark_as_shown(repo.label, file_diff_text, self._buffer_day)
             captured = True
 

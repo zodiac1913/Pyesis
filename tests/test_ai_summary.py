@@ -18,10 +18,36 @@ from pyesis.ai_summary import (
     _to_past_tense,
     build_summary,
 )
-from pyesis.git_monitor import FileChangeSummary, summarize_changed_files, summarize_file_changes
+from pyesis.config import RepoConfig
+from pyesis.git_monitor import FileChangeSummary, capture_snapshot, summarize_changed_files, summarize_file_changes
 
 
 class AISummaryTests(unittest.TestCase):
+    def test_capture_snapshot_includes_untracked_file_diffs(self) -> None:
+        repo = RepoConfig(path="/tmp/cats", label="Cats")
+
+        with (
+            patch("pyesis.git_monitor._run_diff", side_effect=["diff --git a/file1 b/file1\n+++ b/file1\n@@ -1 +1 @@\n+tracked\n", ""]),
+            patch("pyesis.git_monitor._run_untracked_diffs", return_value="diff --git a/new.html b/new.html\nnew file mode 100644\n--- /dev/null\n+++ b/new.html\n@@ -0,0 +1 @@\n+<html>\n"),
+        ):
+            snapshot = capture_snapshot(repo)
+
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        self.assertIn("+++ b/file1", snapshot.diff_text)
+        self.assertIn("+++ b/new.html", snapshot.diff_text)
+
+    def test_capture_snapshot_returns_none_when_tracked_and_untracked_diffs_are_empty(self) -> None:
+        repo = RepoConfig(path="/tmp/cats", label="Cats")
+
+        with (
+            patch("pyesis.git_monitor._run_diff", side_effect=["", ""]),
+            patch("pyesis.git_monitor._run_untracked_diffs", return_value=""),
+        ):
+            snapshot = capture_snapshot(repo)
+
+        self.assertIsNone(snapshot)
+
     def test_to_past_tense_converts_hardening(self) -> None:
         self.assertEqual(_to_past_tense("hardening null recovery"), "hardened null recovery")
 

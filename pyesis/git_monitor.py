@@ -15,6 +15,7 @@ DIFF_START = "diff --git "
 PLUS_PATH_PREFIX = "+++ b/"
 MINUS_PATH_PREFIX = "--- a/"
 RENAME_TO_PREFIX = "rename to "
+DEV_NULL_PATH = "/dev/null"
 DEFAULT_EXCLUDES = [
     "pyesis_state.json",
     "diff_buffers/**",
@@ -47,7 +48,7 @@ class FileChangeSummary:
     added_line_samples: list[tuple[int, str]] = field(default_factory=list)
 
 
-def _run_git(repo_path: str, *args: str) -> str:
+def _run_git(repo_path: str, *args: str, allowed_returncodes: tuple[int, ...] = (0,)) -> str:
     kwargs = {
         "cwd": repo_path,
         "capture_output": True,
@@ -63,7 +64,7 @@ def _run_git(repo_path: str, *args: str) -> str:
         ["git", *args],
         **kwargs,
     )
-    if completed.returncode != 0:
+    if completed.returncode not in allowed_returncodes:
         raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or "git command failed")
     return completed.stdout
 
@@ -82,9 +83,12 @@ def validate_repo(path: str) -> tuple[bool, str]:
 
 
 def capture_snapshot(repo: RepoConfig) -> DiffSnapshot | None:
-    diff_text = _run_diff(repo.path, "diff")
-    if not diff_text.strip():
-        diff_text = _run_diff(repo.path, "diff", "--cached")
+    diff_parts = [
+        _run_diff(repo.path, "diff").strip(),
+        _run_diff(repo.path, "diff", "--cached").strip(),
+        _run_untracked_diffs(repo.path).strip(),
+    ]
+    diff_text = "\n".join(part for part in diff_parts if part)
     if not diff_text.strip():
         return None
 
@@ -100,6 +104,38 @@ def capture_snapshot(repo: RepoConfig) -> DiffSnapshot | None:
 def _run_diff(repo_path: str, *prefix_args: str) -> str:
     exclude_args = [f":(exclude){pattern}" for pattern in DEFAULT_EXCLUDES]
     return _run_git(repo_path, *prefix_args, f"-U{DIFF_CONTEXT_LINES}", "--", ".", *exclude_args)
+
+
+def _run_untracked_diffs(repo_path: str) -> str:
+    chunks: list[str] = []
+    for rel_path in _list_untracked_files(repo_path):
+        chunks.append(_run_untracked_diff(repo_path, rel_path).strip())
+    return "\n".join(chunk for chunk in chunks if chunk)
+
+
+def _list_untracked_files(repo_path: str) -> list[str]:
+    output = _run_git(repo_path, "ls-files", "--others", "--exclude-standard", "--", ".")
+    paths: list[str] = []
+    for raw_line in output.splitlines():
+        path = raw_line.strip()
+        if not path or _is_excluded_path(path):
+            continue
+        paths.append(path)
+    return paths
+
+
+def _run_untracked_diff(repo_path: str, rel_path: str) -> str:
+    return _run_git(
+        repo_path,
+        "diff",
+        "--no-index",
+        "--relative",
+        f"-U{DIFF_CONTEXT_LINES}",
+        "--",
+        DEV_NULL_PATH,
+        rel_path,
+        allowed_returncodes=(0, 1),
+    )
 
 
 def has_snapshot_changed(snapshot: DiffSnapshot, existing_entries: list[EntryRecord]) -> bool:
@@ -194,9 +230,9 @@ def _updated_chunk_path(current_path: str, line: str) -> str:
         return line.removeprefix(RENAME_TO_PREFIX).strip()
     if line.startswith(PLUS_PATH_PREFIX):
         path = line.removeprefix(PLUS_PATH_PREFIX).strip()
-        if path != "/dev/null":
+        if path != DEV_NULL_PATH:
             return path
-    if line.startswith(MINUS_PATH_PREFIX) and current_path == "/dev/null":
+    if line.startswith(MINUS_PATH_PREFIX) and current_path == DEV_NULL_PATH:
         return line.removeprefix(MINUS_PATH_PREFIX).strip()
     return current_path
 

@@ -58,6 +58,24 @@ def clear_buffers_for_day(day_key: str | None = None) -> None:
     _buffer_path(target_day).unlink(missing_ok=True)
 
 
+def list_buffer_day_keys() -> list[str]:
+    if not BUFFER_DIR.exists():
+        return []
+    day_keys: list[str] = []
+    for path in sorted(BUFFER_DIR.glob("*.json")):
+        try:
+            datetime.fromisoformat(path.stem)
+        except ValueError:
+            continue
+        day_keys.append(path.stem)
+    return day_keys
+
+
+def load_buffer_items(day_key: str | None = None) -> list[DiffLedgerItem]:
+    active_day = day_key or _today_key()
+    return _read_items(_buffer_path(active_day))
+
+
 def _read_items(path: Path) -> list[DiffLedgerItem]:
     if not path.exists():
         return []

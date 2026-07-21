@@ -74,6 +74,8 @@ class AppSummaryProtectionTests(unittest.TestCase):
         app.summary_refresh_button_var = DummyVar()
         app.backlog_button = None
         app.summary_refresh_button = None
+        app._active_ai_entry_keys = set()
+        app._ai_working_pulse_on = False
         app._enhancer_in_flight = False
         app._refresh_editor = lambda: None
         return app
@@ -515,6 +517,64 @@ class AppSummaryProtectionTests(unittest.TestCase):
         self.assertEqual(app.config.entries[1].summary, strong_ai_entry.summary)
         self.assertEqual(app.status_var.get(), "No current-week weak summaries to refresh")
         self.assertFalse(mock_save.called)
+
+    def test_manual_entries_are_treated_as_trusted_final_entries(self) -> None:
+        app = self._make_app()
+        entry = EntryRecord(
+            repo_label="Pyesis",
+            repo_path="/tmp/pyesis",
+            created_at="2026-07-21T09:00:00",
+            day_name="Tuesday",
+            week_start_iso="2026-07-17T00:00:00",
+            summary="I clarified the writeup manually.",
+            diff_hash="manual-1",
+            diff_excerpt="diff --git a/pyesis/app.py b/pyesis/app.py\n+++ b/pyesis/app.py\n",
+            summary_source="manual",
+            author="Manual",
+        )
+
+        self.assertTrue(app._is_trusted_ai_entry(entry))
+        self.assertEqual(app._entry_render_tags(entry), ())
+
+    def test_missing_summary_source_defaults_to_heuristic_not_current_ai_mode(self) -> None:
+        app = self._make_app()
+        app.config.ai_mode = GITHUB_GPT_MODE
+
+        self.assertEqual(app._summary_mode_or_default("", "AI"), HEURISTIC_MODE)
+
+    def test_recover_shown_buffer_entries_rehydrates_missing_state_entry(self) -> None:
+        app = self._make_app()
+        shown_item = {
+            "datetime": "2026-07-21T09:02:51",
+            "repo": "Cats",
+            "gitDiffText": "diff --git a/wwwroot/compliance-bookmarklet.html b/wwwroot/compliance-bookmarklet.html\n+++ b/wwwroot/compliance-bookmarklet.html\n@@ -0,0 +1 @@\n+<!doctype html>\n",
+            "gitDiffDescription": "I added bookmarklet installer markup in wwwroot/compliance-bookmarklet.html.",
+            "shown": True,
+            "diffHash": "recover-hash-1",
+            "repoPath": "/Users/rxjr/Desktop/Dev/cms-dotnet-cats-source",
+            "author": "AI",
+            "summarySource": "ollama",
+            "rewrittenBy": "",
+            "rewrittenAt": "",
+            "requestedSummarySource": "ollama",
+            "summaryWarning": "",
+            "fallbackSummarySource": "",
+            "summaryTimingMs": 1200,
+            "summaryProviderDetails": "qwen2.5-coder:latest",
+            "lastAiAttemptAt": "2026-07-21T09:02:51",
+        }
+
+        with patch("pyesis.app.list_buffer_day_keys", return_value=["2026-07-21"]), patch(
+            "pyesis.app.load_buffer_items",
+            return_value=[shown_item],
+        ), patch("pyesis.app.save_config") as mock_save:
+            recovered = app._recover_shown_buffer_entries()
+
+        self.assertEqual(recovered, 1)
+        self.assertEqual(len(app.config.entries), 1)
+        self.assertEqual(app.config.entries[0].diff_hash, "recover-hash-1")
+        self.assertEqual(app.config.entries[0].summary_source, "ollama")
+        self.assertTrue(mock_save.called)
 
 
 if __name__ == "__main__":
