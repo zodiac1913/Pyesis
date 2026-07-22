@@ -136,6 +136,9 @@ ENV/
 env.bak/
 venv.bak/
 
+logs/
+
+
 # Spyder project settings
 .spyderproject
 .spyproject
@@ -186,3 +189,6 @@ diff_buffers/
 # Local app state (never commit)
 pyesis_state.json
 pyesis_state.backup_*.json
+
+logs/ai_attempts.jsonl
+/logs
