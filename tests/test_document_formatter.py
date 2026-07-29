@@ -94,6 +94,34 @@ class DocumentFormatterTests(unittest.TestCase):
         comment_chunk = next(chunk for chunk in chunks if "[[Ollama summary failed: offline]]" in chunk.text)
         self.assertEqual(comment_chunk.tags, ("ai-failed", "ai-comment"))
 
+    def test_render_text_chunks_assigns_distinct_day_and_repo_heading_tags(self) -> None:
+        entry = EntryRecord(
+            repo_label="Pyesis",
+            repo_path="/tmp/pyesis",
+            created_at="2026-06-29T06:37:47",
+            day_name="Monday",
+            week_start_iso="2026-06-26T00:00:00",
+            summary="I tightened preview rendering in pyesis/app.py.",
+            diff_hash="hash-heading-tags",
+            diff_excerpt="diff --git a/pyesis/app.py b/pyesis/app.py\n+++ b/pyesis/app.py\n",
+            summary_source="ollama",
+            author="AI",
+        )
+        config = AppConfig(week_end_day="Thursday", entries=[entry])
+
+        with patch("pyesis.document_formatter.datetime") as mock_datetime:
+            mock_datetime.now.return_value = datetime(2026, 6, 29, 12, 0, 0)
+            mock_datetime.fromisoformat.side_effect = datetime.fromisoformat
+            chunks = render_text_chunks(config)
+
+        day_chunk = next(chunk for chunk in chunks if chunk.text == "@Monday\n")
+        repo_chunk = next(chunk for chunk in chunks if chunk.text == "\t• Pyesis:\n")
+        item_chunk = next(chunk for chunk in chunks if chunk.text == "\t\t• I tightened preview rendering in pyesis/app.py.\n")
+
+        self.assertEqual(day_chunk.tags, ("day-heading",))
+        self.assertEqual(repo_chunk.tags, ("repo-heading",))
+        self.assertEqual(item_chunk.tags, ())
+
     def test_render_text_chunks_adds_evidence_from_diff_when_summary_has_none(self) -> None:
         entry = EntryRecord(
             repo_label="Pyesis",

@@ -238,6 +238,8 @@ class PyesisApp:
         self.repo_path_var = tk.StringVar()
         self.repo_label_var = tk.StringVar()
         self.poll_seconds_var = tk.StringVar(value="120")
+        if hasattr(self.repo_path_var, "trace_add"):
+            self.repo_path_var.trace_add("write", self._on_repo_path_changed)
         self.repo_items: dict[str, RepoConfig] = {}
         self._selected_repo_index: int | None = None
         self.repo_action_button: ttk.Button | None = None
@@ -743,19 +745,27 @@ class PyesisApp:
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(0, weight=1)
         ttk.Label(header, text="Observed Repositories").grid(row=0, column=0, sticky="w")
+        repo_list_shell = ttk.Frame(sidebar)
+        repo_list_shell.grid(row=1, column=0, sticky="nsew", pady=(6, 12))
+        repo_list_shell.rowconfigure(0, weight=1)
+        repo_list_shell.columnconfigure(0, weight=1)
         self.repo_list = tk.Listbox(
-            sidebar,
+            repo_list_shell,
             height=12,
             width=38,
             exportselection=False,
             activestyle="dotbox",
             selectborderwidth=2,
         )
-        self.repo_list.grid(row=1, column=0, sticky="nsew", pady=(6, 12))
+        self.repo_list.grid(row=0, column=0, sticky="nsew")
+        repo_list_scrollbar = ttk.Scrollbar(repo_list_shell, orient="vertical", command=self.repo_list.yview)
+        repo_list_scrollbar.grid(row=0, column=1, sticky="ns", padx=(6, 0))
+        self.repo_list.configure(yscrollcommand=repo_list_scrollbar.set)
         self.repo_list.bind(LISTBOX_SELECT_EVENT, self._on_repo_selected)
         sidebar.rowconfigure(1, weight=1)
 
-        ttk.Button(sidebar, text="Browse Repo", underline=0, command=self._browse_repo).grid(row=2, column=0, sticky="ew")
+        self.repo_action_button = ttk.Button(sidebar, text="Browse Repo", underline=0, command=self._browse_repo)
+        self.repo_action_button.grid(row=2, column=0, sticky="ew")
         ttk.Label(sidebar, text="Repository path").grid(row=3, column=0, sticky="w", pady=(8, 2))
         ttk.Entry(sidebar, textvariable=self.repo_path_var).grid(row=4, column=0, sticky="ew", pady=(0, 6))
         ttk.Label(sidebar, text="Display label (optional)").grid(row=5, column=0, sticky="w", pady=(0, 2))
@@ -767,36 +777,34 @@ class PyesisApp:
         poll_row.columnconfigure(1, weight=1)
         ttk.Entry(poll_row, textvariable=self.poll_seconds_var, width=7).grid(row=0, column=0, sticky="w")
         ttk.Button(poll_row, text="Refresh", command=self.run_poll_once).grid(row=0, column=1, sticky="e", padx=(8, 0))
-        self.repo_action_button = ttk.Button(sidebar, text="Add Repo", underline=0, command=self._add_or_update_repo)
-        self.repo_action_button.grid(row=9, column=0, sticky="ew")
-        ttk.Button(sidebar, text="Remove Selected", underline=0, command=self._remove_selected_repo).grid(row=10, column=0, sticky="ew", pady=(6, 12))
+        ttk.Button(sidebar, text="Remove Selected", underline=0, command=self._remove_selected_repo).grid(row=9, column=0, sticky="ew", pady=(6, 12))
 
-        ttk.Label(sidebar, text="Week end day").grid(row=11, column=0, sticky="w")
+        ttk.Label(sidebar, text="Week end day").grid(row=10, column=0, sticky="w")
         ttk.Combobox(
             sidebar,
             textvariable=self.week_end_var,
             values=["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"],
             state="readonly",
-        ).grid(row=12, column=0, sticky="ew", pady=(6, 12))
+        ).grid(row=11, column=0, sticky="ew", pady=(6, 12))
 
-        ttk.Label(sidebar, text="Theme").grid(row=13, column=0, sticky="w")
+        ttk.Label(sidebar, text="Theme").grid(row=12, column=0, sticky="w")
         theme_box = ttk.Combobox(
             sidebar,
             textvariable=self.theme_mode_var,
             values=["System", "Light", "Dark"],
             state="readonly",
         )
-        theme_box.grid(row=14, column=0, sticky="ew", pady=(6, 12))
+        theme_box.grid(row=13, column=0, sticky="ew", pady=(6, 12))
         theme_box.bind("<<ComboboxSelected>>", self._on_theme_changed)
 
-        ttk.Button(sidebar, text="Export DOCX", underline=0, command=self._export_docx).grid(row=15, column=0, sticky="ew", pady=(6, 0))
-        ttk.Button(sidebar, text="Edit Entry", underline=0, command=self._open_entry_editor).grid(row=16, column=0, sticky="ew", pady=(6, 0))
-        ttk.Label(sidebar, text="AI status").grid(row=17, column=0, sticky="w", pady=(12, 2))
-        ttk.Label(sidebar, textvariable=self.ai_status_var, style="AIStatus.TLabel", wraplength=260).grid(row=18, column=0, sticky="ew")
-        ttk.Label(sidebar, textvariable=self.ollama_activity_var, style="OllamaActivity.TLabel", wraplength=260).grid(row=19, column=0, sticky="ew", pady=(8, 0))
-        ttk.Label(sidebar, text="Last poll").grid(row=20, column=0, sticky="w", pady=(12, 2))
-        ttk.Label(sidebar, textvariable=self.poll_summary_var, style="PollSummary.TLabel", wraplength=260).grid(row=21, column=0, sticky="ew")
-        ttk.Label(sidebar, textvariable=self.status_var, wraplength=260).grid(row=22, column=0, sticky="ew", pady=(12, 0))
+        ttk.Button(sidebar, text="Export DOCX", underline=0, command=self._export_docx).grid(row=14, column=0, sticky="ew", pady=(6, 0))
+        ttk.Button(sidebar, text="Edit Entry", underline=0, command=self._open_entry_editor).grid(row=15, column=0, sticky="ew", pady=(6, 0))
+        ttk.Label(sidebar, text="AI status").grid(row=16, column=0, sticky="w", pady=(12, 2))
+        ttk.Label(sidebar, textvariable=self.ai_status_var, style="AIStatus.TLabel", wraplength=260).grid(row=17, column=0, sticky="ew")
+        ttk.Label(sidebar, textvariable=self.ollama_activity_var, style="OllamaActivity.TLabel", wraplength=260).grid(row=18, column=0, sticky="ew", pady=(8, 0))
+        ttk.Label(sidebar, text="Last poll").grid(row=19, column=0, sticky="w", pady=(12, 2))
+        ttk.Label(sidebar, textvariable=self.poll_summary_var, style="PollSummary.TLabel", wraplength=260).grid(row=20, column=0, sticky="ew")
+        ttk.Label(sidebar, textvariable=self.status_var, wraplength=260).grid(row=21, column=0, sticky="ew", pady=(12, 0))
 
         editor_header = ttk.Frame(editor_area)
         editor_header.grid(row=0, column=0, sticky="ew")
@@ -852,6 +860,10 @@ class PyesisApp:
             relief="flat",
         )
         self.editor.grid(row=0, column=0, sticky="nsew")
+        editor_scrollbar = ttk.Scrollbar(preview_shell, orient="vertical", command=self.editor.yview)
+        editor_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.editor.configure(yscrollcommand=editor_scrollbar.set)
+        self._update_repo_action_button()
         self._setup_editor_background()
 
     def _setup_editor_background(self) -> None:
@@ -905,18 +917,22 @@ class PyesisApp:
         self._open_github_repo()
         return "break"
 
+    def _on_repo_path_changed(self, *_args: object) -> None:
+        self._update_repo_action_button()
+
     def _browse_repo(self) -> None:
         selected = filedialog.askdirectory(title="Select repository")
         if selected:
             self.repo_path_var.set(selected)
             if not self.repo_label_var.get().strip():
                 self.repo_label_var.set(Path(selected).name)
+            self._update_repo_action_button()
 
     def _on_repo_selected(self, _event: tk.Event) -> None:
         selection = self.repo_list.curselection()
         if not selection:
             self._selected_repo_index = None
-            self._set_repo_action_button_text(False)
+            self._update_repo_action_button()
             return
 
         index = selection[0]
@@ -925,12 +941,14 @@ class PyesisApp:
         self.repo_path_var.set(repo.path)
         self.repo_label_var.set(repo.label)
         self.poll_seconds_var.set(str(repo.poll_seconds))
-        self._set_repo_action_button_text(True)
+        self._update_repo_action_button()
 
     def _selected_repo_index_from_selection(self) -> int | None:
-        selection = self.repo_list.curselection()
-        if selection:
-            return selection[0]
+        repo_list = getattr(self, "repo_list", None)
+        if repo_list is not None:
+            selection = repo_list.curselection()
+            if selection:
+                return selection[0]
 
         if self._selected_repo_index is None:
             return None
@@ -1024,12 +1042,18 @@ class PyesisApp:
         self.repo_path_var.set("")
         self.repo_label_var.set("")
         self.poll_seconds_var.set("120")
-        self._set_repo_action_button_text(False)
+        self._update_repo_action_button()
 
-    def _set_repo_action_button_text(self, is_update_mode: bool) -> None:
+    def _update_repo_action_button(self) -> None:
         if self.repo_action_button is None:
             return
-        self.repo_action_button.configure(text="Update Repo" if is_update_mode else "Add Repo")
+        if self._selected_repo_index_from_selection() is not None:
+            self.repo_action_button.configure(text="Update Repo", command=self._add_or_update_repo)
+            return
+        if self.repo_path_var.get().strip():
+            self.repo_action_button.configure(text="Add Repo", command=self._add_or_update_repo)
+            return
+        self.repo_action_button.configure(text="Browse Repo", command=self._browse_repo)
 
     def _migrate_entries(self, allow_ai_rewrite: bool = False) -> None:
         original_entries = list(self.config.entries)
@@ -2370,6 +2394,8 @@ class PyesisApp:
             highlightbackground=palette["surface"],
             highlightcolor=palette["surface"],
         )
+        self.editor.tag_configure("day-heading", foreground=palette["day_fg"])
+        self.editor.tag_configure("repo-heading", foreground=palette["repo_fg"])
         self.editor.tag_configure("heuristic", foreground=palette["heuristic_fg"])
         self.editor.tag_configure("ai-failed", foreground=palette["failed_fg"])
         self.editor.tag_configure("ai-working-bright", foreground=palette["working_fg_bright"])
@@ -2391,6 +2417,8 @@ class PyesisApp:
                 "accent": "#ffff00",
                 "accent_fg": "#000000",
                 "border": "#ffffff",
+                "day_fg": "#ffe066",
+                "repo_fg": "#7ce7ff",
                 "heuristic_fg": "#ff8c00",
                 "failed_fg": "#ff5c5c",
                 "working_fg_bright": "#ffffff",
@@ -2407,6 +2435,8 @@ class PyesisApp:
                 "accent": "#3b82f6",
                 "accent_fg": "#ffffff",
                 "border": "#384353",
+                "day_fg": "#ffd166",
+                "repo_fg": "#5ad1e6",
                 "heuristic_fg": "#ff9f1a",
                 "failed_fg": "#ff6b6b",
                 "working_fg_bright": "#e6ebf2",
@@ -2422,6 +2452,8 @@ class PyesisApp:
             "accent": "#0d6efd",
             "accent_fg": "#ffffff",
             "border": "#b8c4d2",
+            "day_fg": "#8b5e00",
+            "repo_fg": "#0d7490",
             "heuristic_fg": "#d96a00",
             "failed_fg": "#c62828",
             "working_fg_bright": "#1d2733",

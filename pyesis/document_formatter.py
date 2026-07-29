@@ -119,7 +119,7 @@ def _append_week_entries(
         entries = day_map.get(day_name)
         if not entries:
             continue
-        chunks.append(RenderedTextChunk(f"@{day_name}\n"))
+        chunks.append(RenderedTextChunk(f"@{day_name}\n", tags=("day-heading",)))
         _append_day_repo_entries(chunks, entries, entry_tag_resolver, warning_comment_resolver)
         chunks.append(RenderedTextChunk("\n"))
 
@@ -131,7 +131,7 @@ def _append_day_repo_entries(
     warning_comment_resolver,
 ) -> None:
     for repo_label, repo_entries in _group_entries_by_repo(entries).items():
-        chunks.append(RenderedTextChunk(f"\t• {repo_label}:\n"))
+        chunks.append(RenderedTextChunk(f"\t• {repo_label}:\n", tags=("repo-heading",)))
         for entry in repo_entries:
             tags = _resolved_entry_tags(entry, entry_tag_resolver)
             for line in _summary_lines(_summary_body_text(entry.summary, entry.diff_excerpt)):
