@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from html import escape
@@ -41,6 +41,7 @@ from pyesis.config import (
     GITHUB_GPT_DEFAULT_MODELS,
     OLLAMA_DEFAULT_TIMEOUT_SECONDS,
     RepoConfig,
+    _decode_entry,
     dedupe_entries,
     default_export_directory,
     load_config,
@@ -87,6 +88,7 @@ DIFF_PATH_PREFIX = "+++ b/"
 AI_ATTEMPT_LOG_VIEW_LIMIT = 200
 LISTBOX_SELECT_EVENT = "<<ListboxSelect>>"
 AGING_ACTION_BUTTON_STYLE = "AgingAction.TButton"
+IMPORT_WEEK_FAILED_TITLE = "Import failed"
 
 
 def _ollama_tags_url(base_url: str) -> str:
@@ -799,12 +801,14 @@ class PyesisApp:
 
         ttk.Button(sidebar, text="Export DOCX", underline=0, command=self._export_docx).grid(row=14, column=0, sticky="ew", pady=(6, 0))
         ttk.Button(sidebar, text="Edit Entry", underline=0, command=self._open_entry_editor).grid(row=15, column=0, sticky="ew", pady=(6, 0))
-        ttk.Label(sidebar, text="AI status").grid(row=16, column=0, sticky="w", pady=(12, 2))
-        ttk.Label(sidebar, textvariable=self.ai_status_var, style="AIStatus.TLabel", wraplength=260).grid(row=17, column=0, sticky="ew")
-        ttk.Label(sidebar, textvariable=self.ollama_activity_var, style="OllamaActivity.TLabel", wraplength=260).grid(row=18, column=0, sticky="ew", pady=(8, 0))
-        ttk.Label(sidebar, text="Last poll").grid(row=19, column=0, sticky="w", pady=(12, 2))
-        ttk.Label(sidebar, textvariable=self.poll_summary_var, style="PollSummary.TLabel", wraplength=260).grid(row=20, column=0, sticky="ew")
-        ttk.Label(sidebar, textvariable=self.status_var, wraplength=260).grid(row=21, column=0, sticky="ew", pady=(12, 0))
+        ttk.Button(sidebar, text="Export Week JSON", underline=7, command=self._export_week_json).grid(row=16, column=0, sticky="ew", pady=(6, 0))
+        ttk.Button(sidebar, text="Import Week JSON", underline=7, command=self._import_week_json).grid(row=17, column=0, sticky="ew", pady=(6, 0))
+        ttk.Label(sidebar, text="AI status").grid(row=18, column=0, sticky="w", pady=(12, 2))
+        ttk.Label(sidebar, textvariable=self.ai_status_var, style="AIStatus.TLabel", wraplength=260).grid(row=19, column=0, sticky="ew")
+        ttk.Label(sidebar, textvariable=self.ollama_activity_var, style="OllamaActivity.TLabel", wraplength=260).grid(row=20, column=0, sticky="ew", pady=(8, 0))
+        ttk.Label(sidebar, text="Last poll").grid(row=21, column=0, sticky="w", pady=(12, 2))
+        ttk.Label(sidebar, textvariable=self.poll_summary_var, style="PollSummary.TLabel", wraplength=260).grid(row=22, column=0, sticky="ew")
+        ttk.Label(sidebar, textvariable=self.status_var, wraplength=260).grid(row=23, column=0, sticky="ew", pady=(12, 0))
 
         editor_header = ttk.Frame(editor_area)
         editor_header.grid(row=0, column=0, sticky="ew")
@@ -898,6 +902,8 @@ class PyesisApp:
         self.root.bind_all("<Alt-c>", lambda _e: self.run_poll_once())
         self.root.bind_all("<Alt-e>", lambda _e: self._export_docx())
         self.root.bind_all("<Alt-d>", lambda _e: self._open_entry_editor())
+        self.root.bind_all("<Alt-x>", lambda _e: self._export_week_json())
+        self.root.bind_all("<Alt-j>", lambda _e: self._import_week_json())
         self.root.bind_all("<Alt-s>", lambda _e: self._open_settings())
         self.root.bind_all("<Alt-i>", lambda _e: self._open_readme_view())
         self.root.bind_all("<Alt-g>", lambda _e: self._open_github_repo())
@@ -3597,6 +3603,106 @@ class PyesisApp:
         target = export_docx(self.config, self._docx_output_dir())
         self.status_var.set(f"Exported {target.name}")
         messagebox.showinfo("Export complete", f"Saved {target}")
+
+    def _export_week_json(self) -> None:
+        """Export the current week's entries to a portable JSON file for cross-machine merging."""
+        week_entries = [e for e in self.config.entries if self._is_current_week_entry(e)]
+        if not week_entries:
+            messagebox.showinfo("Export Week JSON", "No entries found for the current week.")
+            return
+
+        week_start = self._active_week_start()
+        default_name = f"pyesis_week_{week_start.strftime('%Y-%m-%d')}.json"
+        export_dir = self._docx_output_dir()
+        export_dir.mkdir(parents=True, exist_ok=True)
+
+        target = filedialog.asksaveasfilename(
+            title="Export current week entries as JSON",
+            initialdir=str(export_dir),
+            initialfile=default_name,
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if not target:
+            return
+
+        payload = {
+            "pyesis_week_export": True,
+            "exported_at": datetime.now().isoformat(),
+            "week_start_iso": week_start.isoformat(),
+            "week_end_day": self.week_end_var.get(),
+            "entries": [asdict(e) for e in week_entries],
+        }
+
+        Path(target).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        self.status_var.set(f"Exported {len(week_entries)} entries to {Path(target).name}")
+        messagebox.showinfo(
+            "Export complete",
+            f"Saved {len(week_entries)} entr{'y' if len(week_entries) == 1 else 'ies'} to:\n{target}",
+        )
+
+    def _import_week_json(self) -> None:
+        """Import week entries from a previously exported JSON file, merging into current state."""
+        export_dir = self._docx_output_dir()
+        source = filedialog.askopenfilename(
+            title="Import week entries from JSON",
+            initialdir=str(export_dir),
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if not source:
+            return
+
+        try:
+            data = json.loads(Path(source).read_text(encoding="utf-8"))
+        except Exception as exc:
+            messagebox.showerror(IMPORT_WEEK_FAILED_TITLE, f"Could not read file:\n{exc}")
+            return
+
+        if not isinstance(data, dict) or not data.get("pyesis_week_export"):
+            messagebox.showerror(
+                IMPORT_WEEK_FAILED_TITLE,
+                "This file does not appear to be a Pyesis week export.\n"
+                "Use 'Export Week JSON' on your work machine to create one.",
+            )
+            return
+
+        raw_entries = data.get("entries", [])
+        if not isinstance(raw_entries, list) or not raw_entries:
+            messagebox.showinfo("Import Week JSON", "No entries found in the selected file.")
+            return
+
+        # Warn if the file's week doesn't match the current week
+        file_week_start = str(data.get("week_start_iso", "")).strip()
+        current_week_start = self._active_week_start().isoformat()
+        if file_week_start and file_week_start != current_week_start:
+            proceed = messagebox.askyesno(
+                "Week mismatch",
+                f"The file contains entries from week starting {file_week_start[:10]},\n"
+                f"but the current week starts {current_week_start[:10]}.\n\n"
+                "Import anyway?",
+            )
+            if not proceed:
+                return
+
+        try:
+            imported = [_decode_entry(item) for item in raw_entries if isinstance(item, dict)]
+        except Exception as exc:
+            messagebox.showerror(IMPORT_WEEK_FAILED_TITLE, f"Could not parse entries:\n{exc}")
+            return
+
+        before = len(self.config.entries)
+        self.config.entries = dedupe_entries(self.config.entries + imported)
+        after = len(self.config.entries)
+        added = after - before
+
+        self._persist()
+        self._refresh_editor()
+        self.status_var.set(f"Imported {added} new entr{'y' if added == 1 else 'ies'} from {Path(source).name}")
+        messagebox.showinfo(
+            "Import complete",
+            f"Added {added} new entr{'y' if added == 1 else 'ies'} "
+            f"({len(imported)} in file, {len(imported) - added} already present / deduplicated).",
+        )
 
     def _open_docx_folder(self) -> None:
         target_dir = self._docx_output_dir()
