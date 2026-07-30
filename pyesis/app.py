@@ -266,6 +266,7 @@ class PyesisApp:
         self._ai_recovery_probe_in_flight = False
         self._ai_last_warning = ""
         self._last_rendered_week_start_iso = ""
+        self._editor_scroll_initialized = False
         self._buffer_day = datetime.now().strftime("%Y-%m-%d")
         purge_old_daily_buffers(7, self._buffer_day)
         self.style = ttk.Style(self.root)
@@ -2639,7 +2640,16 @@ class PyesisApp:
         load_position(0)
         editor.focus_set()
 
+    def _is_editor_view_near_bottom(self, end_fraction: float) -> bool:
+        return end_fraction >= 0.995
+
     def _refresh_editor(self) -> None:
+        previous_scroll_first = 0.0
+        keep_bottom_magnet = False
+        if self._editor_scroll_initialized:
+            previous_scroll_first, previous_scroll_end = self.editor.yview()
+            keep_bottom_magnet = self._is_editor_view_near_bottom(previous_scroll_end)
+
         self._last_rendered_week_start_iso = self._active_week_start().isoformat()
         self.editor.delete("1.0", tk.END)
         current_week_count = self._current_week_entry_count()
@@ -2655,6 +2665,14 @@ class PyesisApp:
                 "No captured code changes for this week yet. Make a change and refresh to populate this week.\n",
                 ("empty-week-note",),
             )
+
+        self.editor.update_idletasks()
+        if keep_bottom_magnet:
+            self.editor.yview_moveto(1.0)
+        elif self._editor_scroll_initialized:
+            self.editor.yview_moveto(max(0.0, min(1.0, previous_scroll_first)))
+
+        self._editor_scroll_initialized = True
         self._update_backlog_button()
 
     def _current_week_entry_count(self) -> int:

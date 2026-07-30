@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026.7.30.1 - 2026-07-30
+
+### Fixed
+- Weekly preview refresh now preserves the user's scroll position.
+- Added bottom-magnet behavior so views at the bottom stay pinned through refreshes until the user scrolls away.
+
 ## 2026.6.4.1 - 2026-06-04
 
 ### Changed
