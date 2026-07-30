@@ -238,6 +238,8 @@ class PyesisApp:
         self.repo_path_var = tk.StringVar()
         self.repo_label_var = tk.StringVar()
         self.poll_seconds_var = tk.StringVar(value="120")
+        if hasattr(self.repo_path_var, "trace_add"):
+            self.repo_path_var.trace_add("write", self._on_repo_path_changed)
         self.repo_items: dict[str, RepoConfig] = {}
         self._selected_repo_index: int | None = None
         self.repo_action_button: ttk.Button | None = None
@@ -245,6 +247,8 @@ class PyesisApp:
         self.backlog_button_var = tk.StringVar(value="Upgrade Oranges")
         self.summary_refresh_button: ttk.Button | None = None
         self.summary_refresh_button_var = tk.StringVar(value="Refresh Weak")
+        self.settings_backlog_button: ttk.Button | None = None
+        self.settings_summary_refresh_button: ttk.Button | None = None
         self._poll_in_flight = False
         self._poll_thread: threading.Thread | None = None
         self._poll_results: list[SnapshotCaptureResult] = []
@@ -741,19 +745,27 @@ class PyesisApp:
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(0, weight=1)
         ttk.Label(header, text="Observed Repositories").grid(row=0, column=0, sticky="w")
+        repo_list_shell = ttk.Frame(sidebar)
+        repo_list_shell.grid(row=1, column=0, sticky="nsew", pady=(6, 12))
+        repo_list_shell.rowconfigure(0, weight=1)
+        repo_list_shell.columnconfigure(0, weight=1)
         self.repo_list = tk.Listbox(
-            sidebar,
+            repo_list_shell,
             height=12,
             width=38,
             exportselection=False,
             activestyle="dotbox",
             selectborderwidth=2,
         )
-        self.repo_list.grid(row=1, column=0, sticky="nsew", pady=(6, 12))
+        self.repo_list.grid(row=0, column=0, sticky="nsew")
+        repo_list_scrollbar = ttk.Scrollbar(repo_list_shell, orient="vertical", command=self.repo_list.yview)
+        repo_list_scrollbar.grid(row=0, column=1, sticky="ns", padx=(6, 0))
+        self.repo_list.configure(yscrollcommand=repo_list_scrollbar.set)
         self.repo_list.bind(LISTBOX_SELECT_EVENT, self._on_repo_selected)
         sidebar.rowconfigure(1, weight=1)
 
-        ttk.Button(sidebar, text="Browse Repo", underline=0, command=self._browse_repo).grid(row=2, column=0, sticky="ew")
+        self.repo_action_button = ttk.Button(sidebar, text="Browse Repo", underline=0, command=self._browse_repo)
+        self.repo_action_button.grid(row=2, column=0, sticky="ew")
         ttk.Label(sidebar, text="Repository path").grid(row=3, column=0, sticky="w", pady=(8, 2))
         ttk.Entry(sidebar, textvariable=self.repo_path_var).grid(row=4, column=0, sticky="ew", pady=(0, 6))
         ttk.Label(sidebar, text="Display label (optional)").grid(row=5, column=0, sticky="w", pady=(0, 2))
@@ -765,36 +777,34 @@ class PyesisApp:
         poll_row.columnconfigure(1, weight=1)
         ttk.Entry(poll_row, textvariable=self.poll_seconds_var, width=7).grid(row=0, column=0, sticky="w")
         ttk.Button(poll_row, text="Refresh", command=self.run_poll_once).grid(row=0, column=1, sticky="e", padx=(8, 0))
-        self.repo_action_button = ttk.Button(sidebar, text="Add Repo", underline=0, command=self._add_or_update_repo)
-        self.repo_action_button.grid(row=9, column=0, sticky="ew")
-        ttk.Button(sidebar, text="Remove Selected", underline=0, command=self._remove_selected_repo).grid(row=10, column=0, sticky="ew", pady=(6, 12))
+        ttk.Button(sidebar, text="Remove Selected", underline=0, command=self._remove_selected_repo).grid(row=9, column=0, sticky="ew", pady=(6, 12))
 
-        ttk.Label(sidebar, text="Week end day").grid(row=11, column=0, sticky="w")
+        ttk.Label(sidebar, text="Week end day").grid(row=10, column=0, sticky="w")
         ttk.Combobox(
             sidebar,
             textvariable=self.week_end_var,
             values=["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"],
             state="readonly",
-        ).grid(row=12, column=0, sticky="ew", pady=(6, 12))
+        ).grid(row=11, column=0, sticky="ew", pady=(6, 12))
 
-        ttk.Label(sidebar, text="Theme").grid(row=13, column=0, sticky="w")
+        ttk.Label(sidebar, text="Theme").grid(row=12, column=0, sticky="w")
         theme_box = ttk.Combobox(
             sidebar,
             textvariable=self.theme_mode_var,
             values=["System", "Light", "Dark"],
             state="readonly",
         )
-        theme_box.grid(row=14, column=0, sticky="ew", pady=(6, 12))
+        theme_box.grid(row=13, column=0, sticky="ew", pady=(6, 12))
         theme_box.bind("<<ComboboxSelected>>", self._on_theme_changed)
 
-        ttk.Button(sidebar, text="Export DOCX", underline=0, command=self._export_docx).grid(row=15, column=0, sticky="ew", pady=(6, 0))
-        ttk.Button(sidebar, text="Edit Entry", underline=0, command=self._open_entry_editor).grid(row=16, column=0, sticky="ew", pady=(6, 0))
-        ttk.Label(sidebar, text="AI status").grid(row=17, column=0, sticky="w", pady=(12, 2))
-        ttk.Label(sidebar, textvariable=self.ai_status_var, style="AIStatus.TLabel", wraplength=260).grid(row=18, column=0, sticky="ew")
-        ttk.Label(sidebar, textvariable=self.ollama_activity_var, style="OllamaActivity.TLabel", wraplength=260).grid(row=19, column=0, sticky="ew", pady=(8, 0))
-        ttk.Label(sidebar, text="Last poll").grid(row=20, column=0, sticky="w", pady=(12, 2))
-        ttk.Label(sidebar, textvariable=self.poll_summary_var, style="PollSummary.TLabel", wraplength=260).grid(row=21, column=0, sticky="ew")
-        ttk.Label(sidebar, textvariable=self.status_var, wraplength=260).grid(row=22, column=0, sticky="ew", pady=(12, 0))
+        ttk.Button(sidebar, text="Export DOCX", underline=0, command=self._export_docx).grid(row=14, column=0, sticky="ew", pady=(6, 0))
+        ttk.Button(sidebar, text="Edit Entry", underline=0, command=self._open_entry_editor).grid(row=15, column=0, sticky="ew", pady=(6, 0))
+        ttk.Label(sidebar, text="AI status").grid(row=16, column=0, sticky="w", pady=(12, 2))
+        ttk.Label(sidebar, textvariable=self.ai_status_var, style="AIStatus.TLabel", wraplength=260).grid(row=17, column=0, sticky="ew")
+        ttk.Label(sidebar, textvariable=self.ollama_activity_var, style="OllamaActivity.TLabel", wraplength=260).grid(row=18, column=0, sticky="ew", pady=(8, 0))
+        ttk.Label(sidebar, text="Last poll").grid(row=19, column=0, sticky="w", pady=(12, 2))
+        ttk.Label(sidebar, textvariable=self.poll_summary_var, style="PollSummary.TLabel", wraplength=260).grid(row=20, column=0, sticky="ew")
+        ttk.Label(sidebar, textvariable=self.status_var, wraplength=260).grid(row=21, column=0, sticky="ew", pady=(12, 0))
 
         editor_header = ttk.Frame(editor_area)
         editor_header.grid(row=0, column=0, sticky="ew")
@@ -822,33 +832,11 @@ class PyesisApp:
         ai_log_button = ttk.Button(editor_header, text="AI Log", underline=3, width=9, command=self._open_ai_attempt_log)
         ai_log_button.grid(row=0, column=5, sticky="e", padx=(6, 0))
 
-        self.summary_refresh_button = ttk.Button(
-            editor_header,
-            textvariable=self.summary_refresh_button_var,
-            underline=0,
-            width=16,
-            style=AGING_ACTION_BUTTON_STYLE,
-            command=self._refresh_current_week_weak_summaries,
-        )
-        self.summary_refresh_button.grid(row=0, column=6, sticky="e", padx=(6, 0))
-
-        self.backlog_button = ttk.Button(
-            editor_header,
-            textvariable=self.backlog_button_var,
-            underline=0,
-            width=18,
-            style=AGING_ACTION_BUTTON_STYLE,
-            command=self._force_upgrade_heuristic_backlog,
-        )
-        self.backlog_button.grid(row=0, column=7, sticky="e", padx=(6, 0))
-
         ToolTip(github_button, "Open GitHub Repository (Ctrl+Shift+G)")
         ToolTip(docs_button, lambda: f"Pyesis docx file folder ({self._docx_output_dir()})")
         ToolTip(info_button, "Open README (F1)")
         ToolTip(settings_button, "Settings (Ctrl+,)")
         ToolTip(ai_log_button, "Open AI attempt log (Alt+L)")
-        ToolTip(self.summary_refresh_button, "Rewrite weak current-week summaries with improved heuristic wording (Alt+Shift+W)")
-        ToolTip(self.backlog_button, "Force AI rewrite for current-week orange summaries (Alt+W)")
 
         preview_shell = ttk.Frame(editor_area)
         preview_shell.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
@@ -872,6 +860,10 @@ class PyesisApp:
             relief="flat",
         )
         self.editor.grid(row=0, column=0, sticky="nsew")
+        editor_scrollbar = ttk.Scrollbar(preview_shell, orient="vertical", command=self.editor.yview)
+        editor_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.editor.configure(yscrollcommand=editor_scrollbar.set)
+        self._update_repo_action_button()
         self._setup_editor_background()
 
     def _setup_editor_background(self) -> None:
@@ -925,18 +917,22 @@ class PyesisApp:
         self._open_github_repo()
         return "break"
 
+    def _on_repo_path_changed(self, *_args: object) -> None:
+        self._update_repo_action_button()
+
     def _browse_repo(self) -> None:
         selected = filedialog.askdirectory(title="Select repository")
         if selected:
             self.repo_path_var.set(selected)
             if not self.repo_label_var.get().strip():
                 self.repo_label_var.set(Path(selected).name)
+            self._update_repo_action_button()
 
     def _on_repo_selected(self, _event: tk.Event) -> None:
         selection = self.repo_list.curselection()
         if not selection:
             self._selected_repo_index = None
-            self._set_repo_action_button_text(False)
+            self._update_repo_action_button()
             return
 
         index = selection[0]
@@ -945,12 +941,14 @@ class PyesisApp:
         self.repo_path_var.set(repo.path)
         self.repo_label_var.set(repo.label)
         self.poll_seconds_var.set(str(repo.poll_seconds))
-        self._set_repo_action_button_text(True)
+        self._update_repo_action_button()
 
     def _selected_repo_index_from_selection(self) -> int | None:
-        selection = self.repo_list.curselection()
-        if selection:
-            return selection[0]
+        repo_list = getattr(self, "repo_list", None)
+        if repo_list is not None:
+            selection = repo_list.curselection()
+            if selection:
+                return selection[0]
 
         if self._selected_repo_index is None:
             return None
@@ -1044,12 +1042,18 @@ class PyesisApp:
         self.repo_path_var.set("")
         self.repo_label_var.set("")
         self.poll_seconds_var.set("120")
-        self._set_repo_action_button_text(False)
+        self._update_repo_action_button()
 
-    def _set_repo_action_button_text(self, is_update_mode: bool) -> None:
+    def _update_repo_action_button(self) -> None:
         if self.repo_action_button is None:
             return
-        self.repo_action_button.configure(text="Update Repo" if is_update_mode else "Add Repo")
+        if self._selected_repo_index_from_selection() is not None:
+            self.repo_action_button.configure(text="Update Repo", command=self._add_or_update_repo)
+            return
+        if self.repo_path_var.get().strip():
+            self.repo_action_button.configure(text="Add Repo", command=self._add_or_update_repo)
+            return
+        self.repo_action_button.configure(text="Browse Repo", command=self._browse_repo)
 
     def _migrate_entries(self, allow_ai_rewrite: bool = False) -> None:
         original_entries = list(self.config.entries)
@@ -1807,10 +1811,15 @@ class PyesisApp:
         def unbind_mousewheel(_event: tk.Event) -> None:
             canvas.unbind_all(MOUSEWHEEL_EVENT)
 
+        def clear_action_button_refs(_event: tk.Event | None = None) -> None:
+            self.settings_summary_refresh_button = None
+            self.settings_backlog_button = None
+
         frame.bind("<Configure>", sync_scroll_region)
         canvas.bind("<Configure>", sync_frame_width)
         canvas.bind("<Enter>", bind_mousewheel)
         canvas.bind("<Leave>", unbind_mousewheel)
+        dialog.bind("<Destroy>", clear_action_button_refs, add="+")
 
         time_var = tk.StringVar(value=self.config.auto_export_time)
         export_dir_var = tk.StringVar(value=self.config.export_directory or default_export_directory())
@@ -1887,15 +1896,40 @@ class PyesisApp:
         ttk.Label(frame, text="Pick provider and model per machine; heavier models can be slower or memory-intensive.").grid(row=12, column=0, sticky="w")
         ttk.Checkbutton(frame, text="Use heuristic fallback when AI fails", variable=ai_fallback_var).grid(row=13, column=0, sticky="w")
         ttk.Checkbutton(frame, text="Write AI attempt audit log", variable=ai_attempt_logging_var).grid(row=14, column=0, sticky="w")
-        ollama_status = "detected on this machine" if ollama_present else "not detected; defaulting to GitHub GPT"
-        ttk.Label(frame, text=f"Ollama status: {ollama_status}").grid(row=15, column=0, sticky="w", pady=(6, 2))
-        ttk.Label(frame, text="GitHub tokens can come from the environment or be stored securely in macOS Keychain below.").grid(row=16, column=0, sticky="w", pady=(0, 12))
+        ttk.Label(frame, text="Current-week summary maintenance").grid(row=15, column=0, sticky="w", pady=(10, 0))
+        maintenance_actions = ttk.Frame(frame)
+        maintenance_actions.grid(row=16, column=0, sticky="w", pady=(6, 0))
+        self.settings_summary_refresh_button = ttk.Button(
+            maintenance_actions,
+            textvariable=self.summary_refresh_button_var,
+            underline=0,
+            width=16,
+            style=AGING_ACTION_BUTTON_STYLE,
+            command=self._refresh_current_week_weak_summaries,
+        )
+        self.settings_summary_refresh_button.grid(row=0, column=0, padx=(0, 6))
+        self.settings_backlog_button = ttk.Button(
+            maintenance_actions,
+            textvariable=self.backlog_button_var,
+            underline=0,
+            width=18,
+            style=AGING_ACTION_BUTTON_STYLE,
+            command=self._force_upgrade_heuristic_backlog,
+        )
+        self.settings_backlog_button.grid(row=0, column=1)
+        ttk.Label(frame, text="Keeps the main window cleaner while preserving the manual maintenance actions and shortcuts.").grid(row=17, column=0, sticky="w", pady=(4, 12))
+        ToolTip(self.settings_summary_refresh_button, "Rewrite weak current-week summaries with improved heuristic wording (Alt+Shift+W)")
+        ToolTip(self.settings_backlog_button, "Force AI rewrite for current-week orange summaries (Alt+W)")
 
-        ttk.Label(frame, text="Ollama URL").grid(row=17, column=0, sticky="w")
-        ttk.Entry(frame, textvariable=ollama_url_var, width=42).grid(row=18, column=0, sticky="ew", pady=(4, 6))
-        ttk.Label(frame, text="Ollama model").grid(row=19, column=0, sticky="w")
+        ollama_status = "detected on this machine" if ollama_present else "not detected; defaulting to GitHub GPT"
+        ttk.Label(frame, text=f"Ollama status: {ollama_status}").grid(row=18, column=0, sticky="w", pady=(6, 2))
+        ttk.Label(frame, text="GitHub tokens can come from the environment or be stored securely in macOS Keychain below.").grid(row=19, column=0, sticky="w", pady=(0, 12))
+
+        ttk.Label(frame, text="Ollama URL").grid(row=20, column=0, sticky="w")
+        ttk.Entry(frame, textvariable=ollama_url_var, width=42).grid(row=21, column=0, sticky="ew", pady=(4, 6))
+        ttk.Label(frame, text="Ollama model").grid(row=22, column=0, sticky="w")
         ollama_model_row = ttk.Frame(frame)
-        ollama_model_row.grid(row=20, column=0, sticky="ew", pady=(4, 4))
+        ollama_model_row.grid(row=23, column=0, sticky="ew", pady=(4, 4))
         ollama_model_row.columnconfigure(0, weight=1)
         ollama_model_box = ttk.Combobox(
             ollama_model_row,
@@ -1916,37 +1950,37 @@ class PyesisApp:
             ),
         )
         ollama_refresh_button.grid(row=0, column=1, padx=(6, 0))
-        ttk.Label(frame, textvariable=ollama_model_status_var, wraplength=560, justify="left").grid(row=21, column=0, sticky="w", pady=(0, 6))
-        ttk.Label(frame, text="Ollama keep alive").grid(row=22, column=0, sticky="w")
-        ttk.Entry(frame, textvariable=ollama_keep_alive_var, width=18).grid(row=23, column=0, sticky="w", pady=(4, 12))
-        ttk.Label(frame, text="Ollama timeout (seconds)").grid(row=24, column=0, sticky="w")
-        ttk.Spinbox(frame, from_=30, to=1800, textvariable=ollama_timeout_var, width=8).grid(row=25, column=0, sticky="w", pady=(4, 12))
+        ttk.Label(frame, textvariable=ollama_model_status_var, wraplength=560, justify="left").grid(row=24, column=0, sticky="w", pady=(0, 6))
+        ttk.Label(frame, text="Ollama keep alive").grid(row=25, column=0, sticky="w")
+        ttk.Entry(frame, textvariable=ollama_keep_alive_var, width=18).grid(row=26, column=0, sticky="w", pady=(4, 12))
+        ttk.Label(frame, text="Ollama timeout (seconds)").grid(row=27, column=0, sticky="w")
+        ttk.Spinbox(frame, from_=30, to=1800, textvariable=ollama_timeout_var, width=8).grid(row=28, column=0, sticky="w", pady=(4, 12))
 
-        ttk.Label(frame, text="OpenAI-compatible URL").grid(row=26, column=0, sticky="w")
-        ttk.Entry(frame, textvariable=openai_url_var, width=42).grid(row=27, column=0, sticky="ew", pady=(4, 6))
-        ttk.Label(frame, text="OpenAI-compatible model").grid(row=28, column=0, sticky="w")
-        ttk.Entry(frame, textvariable=openai_model_var, width=42).grid(row=29, column=0, sticky="ew", pady=(4, 12))
+        ttk.Label(frame, text="OpenAI-compatible URL").grid(row=29, column=0, sticky="w")
+        ttk.Entry(frame, textvariable=openai_url_var, width=42).grid(row=30, column=0, sticky="ew", pady=(4, 6))
+        ttk.Label(frame, text="OpenAI-compatible model").grid(row=31, column=0, sticky="w")
+        ttk.Entry(frame, textvariable=openai_model_var, width=42).grid(row=32, column=0, sticky="ew", pady=(4, 12))
 
-        ttk.Label(frame, text="GitHub account type").grid(row=30, column=0, sticky="w")
+        ttk.Label(frame, text="GitHub account type").grid(row=33, column=0, sticky="w")
         ttk.Combobox(
             frame,
             textvariable=github_auth_mode_var,
             values=[GITHUB_DOTCOM_AUTH_MODE, GITHUB_ENTERPRISE_AUTH_MODE],
             state="readonly",
-        ).grid(row=31, column=0, sticky="ew", pady=(4, 6))
-        ttk.Label(frame, text="GitHub Enterprise host (used only for Enterprise sign-in)").grid(row=32, column=0, sticky="w")
-        ttk.Entry(frame, textvariable=github_auth_endpoint_var, width=42).grid(row=33, column=0, sticky="ew", pady=(4, 6))
-        ttk.Label(frame, textvariable=github_auth_status_var, wraplength=560, justify="left").grid(row=34, column=0, sticky="w")
-        ttk.Label(frame, text="GitHub OAuth client ID").grid(row=35, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(frame, textvariable=github_oauth_client_id_var, width=42).grid(row=36, column=0, sticky="ew", pady=(4, 6))
+        ).grid(row=34, column=0, sticky="ew", pady=(4, 6))
+        ttk.Label(frame, text="GitHub Enterprise host (used only for Enterprise sign-in)").grid(row=35, column=0, sticky="w")
+        ttk.Entry(frame, textvariable=github_auth_endpoint_var, width=42).grid(row=36, column=0, sticky="ew", pady=(4, 6))
+        ttk.Label(frame, textvariable=github_auth_status_var, wraplength=560, justify="left").grid(row=37, column=0, sticky="w")
+        ttk.Label(frame, text="GitHub OAuth client ID").grid(row=38, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(frame, textvariable=github_oauth_client_id_var, width=42).grid(row=39, column=0, sticky="ew", pady=(4, 6))
         ttk.Label(
             frame,
             textvariable=github_login_help_var,
             wraplength=560,
             justify="left",
-        ).grid(row=37, column=0, sticky="w")
+        ).grid(row=40, column=0, sticky="w")
         auth_actions = ttk.Frame(frame)
-        auth_actions.grid(row=38, column=0, sticky="w", pady=(8, 8))
+        auth_actions.grid(row=41, column=0, sticky="w", pady=(8, 8))
         sign_in_button = ttk.Button(
             auth_actions,
             text="Sign in with GitHub",
@@ -1977,19 +2011,19 @@ class PyesisApp:
         github_oauth_client_id_var.trace_add("write", refresh_github_login_controls)
         refresh_github_login_controls()
 
-        ttk.Label(frame, text="Or store or replace a token manually").grid(row=39, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(frame, textvariable=github_auth_token_var, width=42, show="*").grid(row=40, column=0, sticky="ew", pady=(4, 6))
-        ttk.Checkbutton(frame, text="Clear stored GitHub token on save", variable=github_auth_clear_var).grid(row=41, column=0, sticky="w", pady=(0, 12))
+        ttk.Label(frame, text="Or store or replace a token manually").grid(row=42, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(frame, textvariable=github_auth_token_var, width=42, show="*").grid(row=43, column=0, sticky="ew", pady=(4, 6))
+        ttk.Checkbutton(frame, text="Clear stored GitHub token on save", variable=github_auth_clear_var).grid(row=44, column=0, sticky="w", pady=(0, 12))
 
-        ttk.Label(frame, text="GitHub GPT URL").grid(row=42, column=0, sticky="w")
-        ttk.Entry(frame, textvariable=github_gpt_url_var, width=42).grid(row=43, column=0, sticky="ew", pady=(4, 6))
-        ttk.Label(frame, text="GitHub GPT model").grid(row=44, column=0, sticky="w")
+        ttk.Label(frame, text="GitHub GPT URL").grid(row=45, column=0, sticky="w")
+        ttk.Entry(frame, textvariable=github_gpt_url_var, width=42).grid(row=46, column=0, sticky="ew", pady=(4, 6))
+        ttk.Label(frame, text="GitHub GPT model").grid(row=47, column=0, sticky="w")
         ttk.Combobox(
             frame,
             textvariable=github_gpt_model_var,
             values=list(GITHUB_GPT_DEFAULT_MODELS),
             state="readonly",
-        ).grid(row=45, column=0, sticky="ew", pady=(4, 12))
+        ).grid(row=48, column=0, sticky="ew", pady=(4, 12))
 
         self._refresh_ollama_model_choices(
             ollama_url_var,
@@ -1998,6 +2032,7 @@ class PyesisApp:
             ollama_model_status_var,
             ollama_refresh_button,
         )
+        self._update_backlog_button()
 
         controls = ttk.Frame(shell)
         controls.grid(row=1, column=0, columnspan=2, sticky="e", pady=(12, 0))
@@ -2359,6 +2394,8 @@ class PyesisApp:
             highlightbackground=palette["surface"],
             highlightcolor=palette["surface"],
         )
+        self.editor.tag_configure("day-heading", foreground=palette["day_fg"])
+        self.editor.tag_configure("repo-heading", foreground=palette["repo_fg"])
         self.editor.tag_configure("heuristic", foreground=palette["heuristic_fg"])
         self.editor.tag_configure("ai-failed", foreground=palette["failed_fg"])
         self.editor.tag_configure("ai-working-bright", foreground=palette["working_fg_bright"])
@@ -2380,6 +2417,8 @@ class PyesisApp:
                 "accent": "#ffff00",
                 "accent_fg": "#000000",
                 "border": "#ffffff",
+                "day_fg": "#ffe066",
+                "repo_fg": "#7ce7ff",
                 "heuristic_fg": "#ff8c00",
                 "failed_fg": "#ff5c5c",
                 "working_fg_bright": "#ffffff",
@@ -2396,6 +2435,8 @@ class PyesisApp:
                 "accent": "#3b82f6",
                 "accent_fg": "#ffffff",
                 "border": "#384353",
+                "day_fg": "#ffd166",
+                "repo_fg": "#5ad1e6",
                 "heuristic_fg": "#ff9f1a",
                 "failed_fg": "#ff6b6b",
                 "working_fg_bright": "#e6ebf2",
@@ -2411,6 +2452,8 @@ class PyesisApp:
             "accent": "#0d6efd",
             "accent_fg": "#ffffff",
             "border": "#b8c4d2",
+            "day_fg": "#8b5e00",
+            "repo_fg": "#0d7490",
             "heuristic_fg": "#d96a00",
             "failed_fg": "#c62828",
             "working_fg_bright": "#1d2733",
@@ -2680,15 +2723,22 @@ class PyesisApp:
         weak_count = self._refreshable_current_week_summary_count()
         refresh_label = f"Refresh {weak_count} Weak" if weak_count else "Refresh Weak"
         self.summary_refresh_button_var.set(refresh_label)
-        if self.summary_refresh_button is not None:
-            refresh_state = "disabled" if weak_count == 0 or self._enhancer_in_flight else "normal"
-            self.summary_refresh_button.configure(state=refresh_state)
-        if self.backlog_button is None:
-            return
+        refresh_state = "disabled" if weak_count == 0 or self._enhancer_in_flight else "normal"
+        summary_refresh_button = getattr(self, "summary_refresh_button", None)
+        if summary_refresh_button is not None:
+            summary_refresh_button.configure(state=refresh_state)
+        settings_summary_refresh_button = getattr(self, "settings_summary_refresh_button", None)
+        if settings_summary_refresh_button is not None:
+            settings_summary_refresh_button.configure(state=refresh_state)
         state = "normal"
         if count == 0 or self._current_ai_mode() == HEURISTIC_MODE or self._enhancer_in_flight:
             state = "disabled"
-        self.backlog_button.configure(state=state)
+        backlog_button = getattr(self, "backlog_button", None)
+        if backlog_button is not None:
+            backlog_button.configure(state=state)
+        settings_backlog_button = getattr(self, "settings_backlog_button", None)
+        if settings_backlog_button is not None:
+            settings_backlog_button.configure(state=state)
 
     def _force_upgrade_heuristic_backlog(self):
         if self._enhancer_in_flight:

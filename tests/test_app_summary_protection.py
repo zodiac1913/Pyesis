@@ -49,6 +49,18 @@ class DummyEditor:
         return "".join(text for op, text, _tags in self.ops if op == "insert")
 
 
+class DummyButton:
+    def __init__(self) -> None:
+        self.text = ""
+        self.command = None
+
+    def configure(self, **kwargs) -> None:
+        if "text" in kwargs:
+            self.text = kwargs["text"]
+        if "command" in kwargs:
+            self.command = kwargs["command"]
+
+
 class ImmediateThread:
     def __init__(self, target=None, args=(), kwargs=None, daemon=None) -> None:
         self._target = target
@@ -70,15 +82,41 @@ class AppSummaryProtectionTests(unittest.TestCase):
         app.config = AppConfig(entries=[])
         app.week_end_var = DummyVar(app.config.week_end_day)
         app.status_var = DummyVar()
+        app.repo_path_var = DummyVar()
+        app.repo_label_var = DummyVar()
+        app.poll_seconds_var = DummyVar("120")
         app.backlog_button_var = DummyVar()
         app.summary_refresh_button_var = DummyVar()
         app.backlog_button = None
         app.summary_refresh_button = None
+        app.repo_action_button = None
+        app._selected_repo_index = None
         app._active_ai_entry_keys = set()
         app._ai_working_pulse_on = False
         app._enhancer_in_flight = False
         app._refresh_editor = lambda: None
         return app
+
+    def test_repo_action_button_shows_add_when_path_present_without_selection(self) -> None:
+        app = self._make_app()
+        button = DummyButton()
+        app.repo_action_button = button
+        app.repo_path_var.set("/tmp/pyesis")
+
+        app._update_repo_action_button()
+
+        self.assertEqual(button.text, "Add Repo")
+
+    def test_repo_action_button_shows_update_for_selected_repo(self) -> None:
+        app = self._make_app()
+        button = DummyButton()
+        app.repo_action_button = button
+        app.config.repos = [RepoConfig(path="/tmp/pyesis", label="Pyesis", poll_seconds=120)]
+        app._selected_repo_index = 0
+
+        app._update_repo_action_button()
+
+        self.assertEqual(button.text, "Update Repo")
 
     def test_dead_github_mode_yields_to_live_ollama_for_status_and_order(self) -> None:
         app = self._make_app()
@@ -395,9 +433,12 @@ class AppSummaryProtectionTests(unittest.TestCase):
             )
         ]
 
-        with patch("pyesis.app.datetime") as mock_datetime:
-            mock_datetime.now.return_value = datetime(2026, 7, 7, 12, 0, 0)
-            mock_datetime.fromisoformat.side_effect = datetime.fromisoformat
+        frozen_now = datetime(2026, 7, 7, 12, 0, 0)
+        with patch("pyesis.app.datetime") as mock_app_datetime, patch("pyesis.document_formatter.datetime") as mock_formatter_datetime:
+            mock_app_datetime.now.return_value = frozen_now
+            mock_app_datetime.fromisoformat.side_effect = datetime.fromisoformat
+            mock_formatter_datetime.now.return_value = frozen_now
+            mock_formatter_datetime.fromisoformat.side_effect = datetime.fromisoformat
             PyesisApp._refresh_editor(app)
 
         rendered = app.editor.contents()
