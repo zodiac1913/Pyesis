@@ -141,6 +141,7 @@ AI_REPO_CONTEXT_CHAR_LIMIT = 7000
 REPO_CONTEXT_SUFFIXES = (".py", ".cs", ".js", ".ts", ".tsx", ".jsx", ".md", ".toml", ".json", ".yml", ".yaml")
 DEFAULT_OLLAMA_SUMMARY_MODEL = "qwen3-coder:30b"
 DEFAULT_OLLAMA_TIMEOUT_SECONDS = 180
+JSON_CONTENT_TYPE = "application/json"
 HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 GOOD_WRITING_EXAMPLES = (
     "In Controllers/Configurer/ConfigurerController.cs, I hardened AppSec recovery by adding a null check around appSecDto, rebuilding appSec only when session data exists, and cleaning up the AppSec and role-handling flow so the code is easier to read.",
@@ -202,6 +203,13 @@ class AISummaryResult:
         return bool(self.fallback_source)
 
 
+@dataclass(frozen=True)
+class AIWeeklyReportResult:
+    text: str
+    timing_ms: int = 0
+    provider_details: str = ""
+
+
 @dataclass
 class StructuredSummary:
     who: str
@@ -260,6 +268,85 @@ def _normalize_ai_mode(value: str) -> str:
     if normalized in SUPPORTED_AI_MODES:
         return normalized
     return HEURISTIC_MODE
+
+
+def build_weekly_report(evidence_text: str) -> AIWeeklyReportResult:
+    return _ollama_weekly_report(evidence_text)
+
+
+def _weekly_report_system_prompt() -> str:
+    return (
+        "Write a thorough weekly engineering report from evidence-based git work tracking. "
+        "Organize the report by day, then by repository, using clear section headers. "
+        "Stay grounded in the supplied evidence only and do not invent work that is not supported. "
+        "Explain concrete changes, likely intent, and notable outcomes in precise engineering language. "
+        "Call out warnings or uncertainty only when the evidence explicitly shows them. "
+        "Treat each evidence item as its own sentence or short paragraph unless adjacent items are clearly related enough to combine without losing specificity or order. "
+        "Keep the original day order, then repository order, and generally keep the original item order inside each repo section. "
+        "Return plain text with readable sections and paragraphs, not JSON. "
+        "Do not use markdown markers such as #, ##, ###, bullets, code fences, or backticks. "
+        "Use explicit section lines like 'Day: Monday' and 'Repo: ExampleRepo'."
+    )
+
+
+def _build_weekly_report_user_prompt(evidence_text: str) -> str:
+    return (
+        "Using the weekly evidence below, write a detailed weekly report sectioned by day and then repo. "
+        "For each evidence item, write one sentence or at most a short paragraph that explains that item in plain engineering language. "
+        "Keep items in the same general order they appear under each repo unless two adjacent items are clearly related enough to combine. "
+        "If you combine related items, keep the combination tight and do not absorb unrelated work into it. "
+        "Do not collapse a whole repo day into one broad blended paragraph when the evidence contains distinct items. "
+        "Do not repeat evidence field labels like 'Summary:' in the report body. "
+        "Prefer complete prose over bullet fragments, and keep the report suitable for a human weekly status write-up. "
+        "Use 'Day:' and 'Repo:' section lines and do not emit markdown markers.\n\n"
+        "Weekly evidence:\n"
+        f"{evidence_text.strip()}"
+    )
+
+
+def _ollama_weekly_report(evidence_text: str) -> AIWeeklyReportResult:
+    if not evidence_text.strip():
+        raise RuntimeError("Missing weekly evidence")
+
+    url = os.getenv("PYESIS_OLLAMA_URL", "http://localhost:11434/api/chat").strip()
+    model = os.getenv("PYESIS_OLLAMA_MODEL", DEFAULT_OLLAMA_SUMMARY_MODEL).strip()
+    keep_alive = os.getenv("PYESIS_OLLAMA_KEEP_ALIVE", "5m").strip()
+    timeout = max(30, int(os.getenv("PYESIS_OLLAMA_TIMEOUT_SECONDS", str(DEFAULT_OLLAMA_TIMEOUT_SECONDS)) or DEFAULT_OLLAMA_TIMEOUT_SECONDS))
+    if not url or not model:
+        raise RuntimeError("Missing Ollama configuration")
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": _weekly_report_system_prompt()},
+            {"role": "user", "content": _build_weekly_report_user_prompt(evidence_text)},
+        ],
+        "stream": False,
+        "options": {"temperature": 0.2},
+    }
+    if keep_alive:
+        payload["keep_alive"] = keep_alive
+
+    body = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": JSON_CONTENT_TYPE}
+    req = request.Request(url, data=body, headers=headers, method="POST")
+    started_at = perf_counter()
+    try:
+        with request.urlopen(req, timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except error.URLError as exc:
+        elapsed_ms = int(round((perf_counter() - started_at) * 1000))
+        raise RuntimeError(f"{exc} ({elapsed_ms} ms)") from exc
+
+    message = data.get("message", {})
+    content = str(message.get("content", "")).strip()
+    if not content:
+        raise RuntimeError(f"Empty Ollama response for model {model}")
+    return AIWeeklyReportResult(
+        text=content,
+        timing_ms=int(round((perf_counter() - started_at) * 1000)),
+        provider_details=model,
+    )
 
 
 def _ai_provider_label(mode: str) -> str:
@@ -1777,7 +1864,7 @@ def _chat_completions_structured_summary(
         "temperature": 0.2,
     }
     body = json.dumps(payload).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
+    headers = {"Content-Type": JSON_CONTENT_TYPE}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
@@ -1870,7 +1957,7 @@ def _ollama_request_structured_summary(
         payload["keep_alive"] = keep_alive
 
     body = json.dumps(payload).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
+    headers = {"Content-Type": JSON_CONTENT_TYPE}
 
     req = request.Request(url, data=body, headers=headers, method="POST")
     started_at = perf_counter()

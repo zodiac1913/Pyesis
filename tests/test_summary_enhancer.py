@@ -973,16 +973,23 @@ class SummaryEnhancerTests(unittest.TestCase):
         self.assertEqual(config.entries[0].last_ai_attempt_at, "2026-06-16T11:45:00")
 
         with patch("pyesis.summary_enhancer.build_summary") as second_attempt:
+            second_attempt.return_value = AISummaryResult(
+                text="I retried the AI summary immediately after the failure and replaced the fallback wording with a live Ollama rewrite.",
+                source="ollama",
+                requested_source="ollama",
+            )
             second_report = run_periodic_enhancer(
                 config,
                 now=datetime(2026, 6, 16, 11, 47, 0),
             )
 
         self.assertTrue(second_report.ran)
-        self.assertEqual(second_report.rewritten_state, 0)
-        self.assertFalse(second_attempt.called)
+        self.assertEqual(second_report.rewritten_state, 1)
+        self.assertTrue(second_attempt.called)
+        self.assertEqual(config.entries[0].summary_source, "ollama")
+        self.assertEqual(config.entries[0].author, "AI")
 
-    def test_failed_ai_upgrade_retries_after_cooldown_within_ten_minutes(self) -> None:
+    def test_failed_ai_upgrade_retries_on_next_pass_without_cooldown(self) -> None:
         entry = EntryRecord(
             repo_label="RepoRetryWindow",
             repo_path="repos/repo-retry-window",
@@ -1006,30 +1013,21 @@ class SummaryEnhancerTests(unittest.TestCase):
         config.ai_ollama_model = "qwen3-coder:30b"
         config.entries = [entry]
 
-        with patch("pyesis.summary_enhancer.build_summary") as early_attempt:
-            early_report = run_periodic_enhancer(
-                config,
-                now=datetime(2026, 6, 16, 11, 47, 0),
-            )
-
-        self.assertTrue(early_report.ran)
-        self.assertEqual(early_report.rewritten_state, 0)
-        self.assertFalse(early_attempt.called)
-
         with patch("pyesis.summary_enhancer.build_summary") as retry_attempt:
             retry_attempt.return_value = AISummaryResult(
-                text="I documented the fresh retry path and the AI rewrite completed before the orange window expired.",
+                text="I documented the fresh retry path and the AI rewrite completed on the next enhancer pass.",
                 source="ollama",
                 requested_source="ollama",
             )
 
             retry_report = run_periodic_enhancer(
                 config,
-                now=datetime(2026, 6, 16, 11, 48, 0),
+                now=datetime(2026, 6, 16, 11, 47, 0),
             )
 
         self.assertTrue(retry_report.ran)
         self.assertEqual(retry_report.rewritten_state, 1)
+        self.assertTrue(retry_attempt.called)
         self.assertEqual(config.entries[0].summary_source, "ollama")
         self.assertEqual(config.entries[0].author, "AI")
 

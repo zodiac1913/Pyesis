@@ -28,11 +28,13 @@ import markdown
 from pyesis.ai_summary import (
     AI_PROVIDER_LABELS,
     AISummaryResult,
+    AIWeeklyReportResult,
     GITHUB_GPT_MODE,
     HEURISTIC_MODE,
     OLLAMA_MODE,
     OPENAI_COMPATIBLE_MODE,
     _is_low_quality_summary_text,
+    build_weekly_report,
     build_summary,
 )
 from pyesis.config import (
@@ -48,7 +50,7 @@ from pyesis.config import (
     save_config,
 )
 from pyesis.diff_buffer import BUFFER_DIR, find_item, list_buffer_day_keys, load_buffer_items, mark_as_shown, purge_old_daily_buffers, remember_diff
-from pyesis.document_formatter import export_docx, render_plain_text, render_text_chunks
+from pyesis.document_formatter import export_ai_weekly_report_docx, export_docx, render_plain_text, render_text_chunks, render_weekly_evidence_text
 from pyesis.github_auth import (
     GITHUB_DOTCOM_AUTH_MODE,
     GITHUB_ENTERPRISE_AUTH_MODE,
@@ -89,6 +91,7 @@ AI_ATTEMPT_LOG_VIEW_LIMIT = 200
 LISTBOX_SELECT_EVENT = "<<ListboxSelect>>"
 AGING_ACTION_BUTTON_STYLE = "AgingAction.TButton"
 IMPORT_WEEK_FAILED_TITLE = "Import failed"
+AI_WEEKLY_REPORT_TITLE = "AI Weekly Report"
 
 
 def _ollama_tags_url(base_url: str) -> str:
@@ -828,17 +831,21 @@ class PyesisApp:
         docs_button = ttk.Button(editor_header, text="Docs", underline=0, width=8, command=self._open_docx_folder)
         docs_button.grid(row=0, column=2, sticky="e", padx=(0, 6))
 
+        ai_weekly_button = ttk.Button(editor_header, text="AI Weekly", underline=3, width=10, command=self._open_ai_weekly_report)
+        ai_weekly_button.grid(row=0, column=3, sticky="e", padx=(0, 6))
+
         info_button = ttk.Button(editor_header, text="ⓘ Info", underline=2, width=8, command=self._open_readme_view)
-        info_button.grid(row=0, column=3, sticky="e", padx=(0, 6))
+        info_button.grid(row=0, column=4, sticky="e", padx=(0, 6))
 
         settings_button = ttk.Button(editor_header, text="⚙ Settings", underline=2, width=11, command=self._open_settings)
-        settings_button.grid(row=0, column=4, sticky="e")
+        settings_button.grid(row=0, column=5, sticky="e")
 
         ai_log_button = ttk.Button(editor_header, text="AI Log", underline=3, width=9, command=self._open_ai_attempt_log)
-        ai_log_button.grid(row=0, column=5, sticky="e", padx=(6, 0))
+        ai_log_button.grid(row=0, column=6, sticky="e", padx=(6, 0))
 
         ToolTip(github_button, "Open GitHub Repository (Ctrl+Shift+G)")
         ToolTip(docs_button, lambda: f"Pyesis docx file folder ({self._docx_output_dir()})")
+        ToolTip(ai_weekly_button, "AI Weekly Report from Ollama")
         ToolTip(info_button, "Open README (F1)")
         ToolTip(settings_button, "Settings (Ctrl+,)")
         ToolTip(ai_log_button, "Open AI attempt log (Alt+L)")
@@ -1903,7 +1910,7 @@ class PyesisApp:
         ttk.Label(frame, text="Pick provider and model per machine; heavier models can be slower or memory-intensive.").grid(row=12, column=0, sticky="w")
         ttk.Checkbutton(frame, text="Use heuristic fallback when AI fails", variable=ai_fallback_var).grid(row=13, column=0, sticky="w")
         ttk.Checkbutton(frame, text="Write AI attempt audit log", variable=ai_attempt_logging_var).grid(row=14, column=0, sticky="w")
-        ttk.Label(frame, text="Current-week summary maintenance").grid(row=15, column=0, sticky="w", pady=(10, 0))
+        ttk.Label(frame, text="Current-week summary maintenance").grid(row=15, column=0, sticky="w", pady=(10, 0)) 
         maintenance_actions = ttk.Frame(frame)
         maintenance_actions.grid(row=16, column=0, sticky="w", pady=(6, 0))
         self.settings_summary_refresh_button = ttk.Button(
@@ -1926,7 +1933,7 @@ class PyesisApp:
         self.settings_backlog_button.grid(row=0, column=1)
         ttk.Label(frame, text="Keeps the main window cleaner while preserving the manual maintenance actions and shortcuts.").grid(row=17, column=0, sticky="w", pady=(4, 12))
         ToolTip(self.settings_summary_refresh_button, "Rewrite weak current-week summaries with improved heuristic wording (Alt+Shift+W)")
-        ToolTip(self.settings_backlog_button, "Force AI rewrite for current-week orange summaries (Alt+W)")
+        ToolTip(self.settings_backlog_button, "Force AI rewrite for current-week orange summaries (Alt+W)") 
 
         ollama_status = "detected on this machine" if ollama_present else "not detected; defaulting to GitHub GPT"
         ttk.Label(frame, text=f"Ollama status: {ollama_status}").grid(row=18, column=0, sticky="w", pady=(6, 2))
@@ -3621,6 +3628,41 @@ class PyesisApp:
         target = export_docx(self.config, self._docx_output_dir())
         self.status_var.set(f"Exported {target.name}")
         messagebox.showinfo("Export complete", f"Saved {target}")
+        self._open_created_document(target)
+
+    def _current_week_entries(self) -> list[EntryRecord]:
+        return [entry for entry in self.config.entries if self._is_current_week_entry(entry)]
+
+    def _open_ai_weekly_report(self) -> None:
+        self.config.week_end_day = self.week_end_var.get()
+        week_entries = self._current_week_entries()
+        if not week_entries:
+            messagebox.showinfo(AI_WEEKLY_REPORT_TITLE, "No entries found for the current week.")
+            return
+
+        self._apply_ai_environment_defaults()
+        evidence_text = render_weekly_evidence_text(self.config)
+        self.status_var.set("Generating AI weekly report from current-week evidence...")
+        self.ollama_activity_var.set("[WORKING] Generating weekly report with Ollama")
+        try:
+            result = build_weekly_report(evidence_text)
+        except Exception as exc:
+            self.ollama_activity_var.set(OLLAMA_IDLE_STATUS)
+            self.status_var.set("AI weekly report failed")
+            messagebox.showerror(AI_WEEKLY_REPORT_TITLE, str(exc))
+            return
+
+        self.ollama_activity_var.set(OLLAMA_IDLE_STATUS)
+        week_start_iso = self._active_week_start().isoformat()
+        target = export_ai_weekly_report_docx(
+            result.text,
+            self._docx_output_dir(),
+            week_start_iso,
+            provider_details=result.provider_details,
+        )
+        self.status_var.set(f"AI weekly report exported to {target.name}")
+        messagebox.showinfo(AI_WEEKLY_REPORT_TITLE, f"Saved {target}")
+        self._open_created_document(target)
 
     def _export_week_json(self) -> None:
         """Export the current week's entries to a portable JSON file for cross-machine merging."""
@@ -3741,6 +3783,22 @@ class PyesisApp:
             messagebox.showerror("Open folder failed", f"Could not open {target_dir}: {exc}")
             return
         self.status_var.set(f"Opened {target_dir}")
+
+    def _open_created_document(self, target: Path) -> None:
+        try:
+            if sys.platform == "win32":
+                os.startfile(str(target))
+            elif sys.platform == "darwin":
+                open_cmd = shutil.which("open") or "/usr/bin/open"
+                completed = subprocess.run([open_cmd, str(target)], check=False)
+                if completed.returncode != 0:
+                    webbrowser.open(target.as_uri())
+            else:
+                completed = subprocess.run(["xdg-open", str(target)], check=False)
+                if completed.returncode != 0:
+                    webbrowser.open(target.as_uri())
+        except Exception as exc:
+            messagebox.showerror("Open document failed", f"Could not open {target}: {exc}")
 
     def _docx_output_dir(self) -> Path:
         configured = self.config.export_directory.strip()

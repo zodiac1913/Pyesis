@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from pathlib import Path
 import unittest
 from unittest.mock import patch
 import threading
 
-from pyesis.ai_summary import GITHUB_GPT_MODE, HEURISTIC_MODE, OLLAMA_MODE
+from pyesis.ai_summary import AIWeeklyReportResult, GITHUB_GPT_MODE, HEURISTIC_MODE, OLLAMA_MODE
 from pyesis.app import PyesisApp
 from pyesis.config import AppConfig, EntryRecord, RepoConfig
 
@@ -94,8 +95,96 @@ class AppSummaryProtectionTests(unittest.TestCase):
         app._active_ai_entry_keys = set()
         app._ai_working_pulse_on = False
         app._enhancer_in_flight = False
+        app.ollama_activity_var = DummyVar()
         app._refresh_editor = lambda: None
         return app
+
+    def test_export_docx_exports_and_opens_document(self) -> None:
+        app = self._make_app()
+        opened: list[Path] = []
+        app._persist = lambda: None
+        app._docx_output_dir = lambda: Path("/tmp/pyesis-docx")
+        app._open_created_document = lambda target: opened.append(target)
+
+        with patch("pyesis.app.export_docx", return_value=Path("/tmp/pyesis-docx/weekly_changes_20260702_120000.docx")) as mock_export, patch(
+            "pyesis.app.messagebox.showinfo"
+        ) as mock_info:
+            app._export_docx()
+
+        self.assertEqual(mock_export.call_args.args[0], app.config)
+        self.assertEqual(mock_export.call_args.args[1], Path("/tmp/pyesis-docx"))
+        self.assertEqual(app.status_var.get(), "Exported weekly_changes_20260702_120000.docx")
+        self.assertEqual(opened, [Path("/tmp/pyesis-docx/weekly_changes_20260702_120000.docx")])
+        self.assertTrue(mock_info.called)
+
+    def test_ai_weekly_report_requires_current_week_entries(self) -> None:
+        app = self._make_app()
+        app.config.entries = [
+            EntryRecord(
+                repo_label="Pyesis",
+                repo_path="/tmp/pyesis",
+                created_at="2026-06-29T10:05:00",
+                day_name="Monday",
+                week_start_iso="2026-06-26T00:00:00",
+                summary="I added strict JSON output guidance in pyesis/ai_summary.py.",
+                diff_hash="weekly-ai-old",
+                diff_excerpt="diff --git a/pyesis/ai_summary.py b/pyesis/ai_summary.py\n+++ b/pyesis/ai_summary.py\n@@ -1 +1 @@\n+prompt\n",
+                summary_source="ollama",
+                author="AI",
+            )
+        ]
+
+        with patch("pyesis.app.messagebox.showinfo") as mock_info, patch("pyesis.app.datetime") as mock_datetime:
+            mock_datetime.now.return_value = datetime(2026, 7, 7, 12, 0, 0)
+            mock_datetime.fromisoformat.side_effect = datetime.fromisoformat
+            app._open_ai_weekly_report()
+
+        self.assertTrue(mock_info.called)
+        self.assertIn("No entries found for the current week.", mock_info.call_args.args[1])
+
+    def test_ai_weekly_report_builds_from_current_week_evidence_and_opens_document(self) -> None:
+        app = self._make_app()
+        now = datetime(2026, 6, 29, 12, 0, 0)
+        app.config.entries = [
+            EntryRecord(
+                repo_label="Pyesis",
+                repo_path="/tmp/pyesis",
+                created_at="2026-06-29T10:05:00",
+                day_name="Monday",
+                week_start_iso="2026-06-26T00:00:00",
+                summary="I added strict JSON output guidance in pyesis/ai_summary.py.",
+                diff_hash="weekly-ai",
+                diff_excerpt="diff --git a/pyesis/ai_summary.py b/pyesis/ai_summary.py\n+++ b/pyesis/ai_summary.py\n@@ -1 +1 @@\n+prompt\n",
+                summary_source="ollama",
+                author="AI",
+            )
+        ]
+        export_results: list[object] = []
+        opened: list[Path] = []
+        app._apply_ai_environment_defaults = lambda: export_results.append("env")
+        app._docx_output_dir = lambda: Path("/tmp/pyesis-docx")
+        app._open_created_document = lambda target: opened.append(target)
+
+        with patch("pyesis.app.render_weekly_evidence_text", return_value="Day: Monday\nRepo: Pyesis\n- Summary: Added prompt"), patch(
+            "pyesis.app.build_weekly_report",
+            return_value=AIWeeklyReportResult(
+                text="Monday\nPyesis\nDetailed weekly report.",
+                timing_ms=1234,
+                provider_details="qwen3-coder:30b",
+            ),
+        ) as mock_build, patch("pyesis.app.export_ai_weekly_report_docx", return_value=Path("/tmp/pyesis-docx/weekly_ai_report_20260702.docx")) as mock_export, patch("pyesis.app.messagebox.showinfo") as mock_info, patch("pyesis.app.datetime") as mock_datetime:
+            mock_datetime.now.return_value = now
+            mock_datetime.fromisoformat.side_effect = datetime.fromisoformat
+            app._open_ai_weekly_report()
+
+        self.assertIn("env", export_results)
+        self.assertEqual(mock_build.call_args.args[0], "Day: Monday\nRepo: Pyesis\n- Summary: Added prompt")
+        self.assertEqual(mock_export.call_args.args[0], "Monday\nPyesis\nDetailed weekly report.")
+        self.assertEqual(mock_export.call_args.args[1], Path("/tmp/pyesis-docx"))
+        self.assertEqual(mock_export.call_args.args[2], "2026-06-26T00:00:00")
+        self.assertEqual(app.status_var.get(), "AI weekly report exported to weekly_ai_report_20260702.docx")
+        self.assertEqual(opened, [Path("/tmp/pyesis-docx/weekly_ai_report_20260702.docx")])
+        self.assertTrue(mock_info.called)
 
     def test_repo_action_button_shows_add_when_path_present_without_selection(self) -> None:
         app = self._make_app()

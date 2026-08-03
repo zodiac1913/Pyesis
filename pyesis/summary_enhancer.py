@@ -118,8 +118,6 @@ class BuilderCallResult:
     result: AISummaryResult | str
     gate_blocked: bool
     duration_seconds: float
-
-
 def _now_iso(now: datetime | None = None) -> str:
     return (now or datetime.now()).isoformat(timespec="seconds")
 
@@ -921,7 +919,7 @@ def run_periodic_enhancer(
         aggressive_prodding = bool(config.summary_enhancer_aggressive_prodding)
     else:
         aggressive_prodding = aggressive_prodding_override
-    allow_retry_failed_ai_upgrade = force_run or aggressive_prodding
+    allow_retry_failed_ai_upgrade = True
     builder = summary_builder or _default_builder(config)
 
     if not (resolved_state_path.exists() or resolved_state_path.parent.exists()):

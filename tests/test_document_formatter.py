@@ -1,14 +1,71 @@
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import patch
 
+from docx import Document
+
 from pyesis.config import AppConfig, EntryRecord
-from pyesis.document_formatter import render_plain_text, render_text_chunks
+from pyesis.document_formatter import export_ai_weekly_report_docx, render_plain_text, render_text_chunks, render_weekly_evidence_text
 
 
 class DocumentFormatterTests(unittest.TestCase):
+    def test_export_ai_weekly_report_docx_writes_word_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            target = export_ai_weekly_report_docx(
+                "## Monday\n### Pyesis\n- Summary: I added parser recovery details.\n- Summary: I clarified the import path changes.",
+                Path(tmp_dir),
+                "2026-06-26T00:00:00",
+                provider_details="qwen3-coder:30b",
+            )
+
+            self.assertEqual(target.name, "weekly_ai_report_20260702.docx")
+            self.assertTrue(target.exists())
+            document = Document(target)
+            paragraphs = [
+                (
+                    paragraph.text,
+                    paragraph.style.name,
+                    None if paragraph.paragraph_format.left_indent is None else round(paragraph.paragraph_format.left_indent.inches, 2),
+                )
+                for paragraph in document.paragraphs
+                if paragraph.text.strip()
+            ]
+
+        self.assertIn(("AI Weekly Report (2026 Jul 02)", "Heading 1", None), paragraphs)
+        self.assertIn(("Monday", "Normal", 0.25), paragraphs)
+        self.assertIn(("Pyesis", "Normal", 0.5), paragraphs)
+        self.assertIn(("I added parser recovery details.", "List Bullet", 0.75), paragraphs)
+        self.assertIn(("I clarified the import path changes.", "List Bullet", 0.75), paragraphs)
+        self.assertNotIn(("Summary: I added parser recovery details.", "List Bullet", 0.75), paragraphs)
+
+    def test_render_weekly_evidence_text_can_target_previous_week(self) -> None:
+        config = AppConfig(
+            week_end_day="Thursday",
+            entries=[
+                EntryRecord(
+                    repo_label="Pyesis",
+                    repo_path="/tmp/pyesis",
+                    created_at="2026-06-29T06:37:47",
+                    day_name="Monday",
+                    week_start_iso="2026-06-26T00:00:00",
+                    summary="I changed async flow in wwwroot/js/global/sml/Form/smlForm.js.",
+                    diff_hash="hash-cats",
+                    diff_excerpt="diff --git a/wwwroot/js/global/sml/Form/smlForm.js b/wwwroot/js/global/sml/Form/smlForm.js\n+++ b/wwwroot/js/global/sml/Form/smlForm.js\n",
+                    summary_source="ollama",
+                    author="AI",
+                )
+            ],
+        )
+
+        output = render_weekly_evidence_text(config, week_start_iso="2026-06-26T00:00:00")
+
+        self.assertIn("Week ending: 2026-07-02", output)
+        self.assertIn("Day: Monday", output)
+        self.assertIn("Repo: Pyesis", output)
     def test_render_plain_text_uses_configured_week_boundary_for_active_week(self) -> None:
         config = AppConfig(
             week_end_day="Thursday",

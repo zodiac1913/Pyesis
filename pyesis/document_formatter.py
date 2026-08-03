@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 
 from docx import Document
+from docx.shared import Inches
 
 from pyesis.config import AppConfig, EntryRecord
 from pyesis.git_monitor import summarize_file_changes
@@ -22,6 +23,11 @@ DAY_ORDER = [
     "Sunday",
 ]
 LIST_BULLET_LEVEL_THREE = "List Bullet 3"
+LIST_BULLET_STYLE = "List Bullet"
+LIST_NUMBER_STYLE = "List Number"
+AI_WEEKLY_DAY_INDENT = Inches(0.25)
+AI_WEEKLY_REPO_INDENT = Inches(0.5)
+AI_WEEKLY_ITEM_INDENT = Inches(0.75)
 
 
 @dataclass(frozen=True)
@@ -70,6 +76,14 @@ def _active_week_entries(
     return active_week_start_iso, grouped.get(active_week_start_iso, {})
 
 
+def _entries_for_week_start(
+    entries: list[EntryRecord],
+    week_start_iso: str,
+) -> dict[str, list[EntryRecord]]:
+    grouped = _group_entries(entries)
+    return grouped.get(week_start_iso, {})
+
+
 def _group_entries_by_repo(entries: list[EntryRecord]) -> dict[str, list[EntryRecord]]:
     by_repo: dict[str, list[EntryRecord]] = defaultdict(list)
     for entry in entries:
@@ -82,6 +96,71 @@ def _group_entries_by_repo(entries: list[EntryRecord]) -> dict[str, list[EntryRe
 
 def render_plain_text(config: AppConfig, now: datetime | None = None) -> str:
     return "".join(chunk.text for chunk in render_text_chunks(config, now=now)).rstrip("\n") + "\n"
+
+
+def render_weekly_evidence_text(
+    config: AppConfig,
+    now: datetime | None = None,
+    week_start_iso: str | None = None,
+) -> str:
+    if week_start_iso is None:
+        selected_week_start_iso, selected_week_entries = _active_week_entries(config.entries, config.week_end_day, now=now)
+    else:
+        selected_week_start_iso = week_start_iso
+        selected_week_entries = _entries_for_week_start(config.entries, selected_week_start_iso)
+
+    week_start = datetime.fromisoformat(selected_week_start_iso)
+    week_end = _week_end_date(week_start)
+
+    lines = _weekly_evidence_header_lines(week_start, week_end)
+
+    if not selected_week_entries:
+        lines.append("No captured entries for the current week.")
+        return "\n".join(lines).rstrip() + "\n"
+
+    for day_name in DAY_ORDER:
+        entries = selected_week_entries.get(day_name)
+        if not entries:
+            continue
+        lines.extend(_weekly_evidence_day_lines(day_name, entries))
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _weekly_evidence_header_lines(week_start: datetime, week_end: datetime) -> list[str]:
+    return [
+        f"Week ending: {week_end.strftime('%Y-%m-%d')}",
+        f"Week start: {week_start.strftime('%Y-%m-%d')}",
+        "",
+    ]
+
+
+def _weekly_evidence_day_lines(day_name: str, entries: list[EntryRecord]) -> list[str]:
+    lines = [f"Day: {day_name}"]
+    for repo_label, repo_entries in _group_entries_by_repo(entries).items():
+        lines.extend(_weekly_evidence_repo_lines(repo_label, repo_entries))
+    return lines
+
+
+def _weekly_evidence_repo_lines(repo_label: str, repo_entries: list[EntryRecord]) -> list[str]:
+    lines = [f"Repo: {repo_label}"]
+    for entry in repo_entries:
+        lines.extend(_weekly_evidence_entry_lines(entry))
+    lines.append("")
+    return lines
+
+
+def _weekly_evidence_entry_lines(entry: EntryRecord) -> list[str]:
+    lines = [f"- Summary: {_summary_body_text(entry.summary, entry.diff_excerpt)}"]
+    evidence = _entry_evidence_line(entry)
+    if evidence:
+        lines.append(f"  Evidence: {evidence}")
+    for label, change_line in _change_detail_lines(entry.diff_excerpt):
+        lines.append(f"  {label}: {change_line}")
+    warning = entry.summary_warning.strip()
+    if warning:
+        lines.append(f"  Warning: {warning}")
+    return lines
 
 
 def render_text_chunks(
@@ -180,6 +259,211 @@ def export_docx(config: AppConfig, output_dir: Path, file_name: str | None = Non
         target = output_dir / f"weekly_changes_{timestamp}.docx"
     document.save(target)
     return target
+
+
+def export_ai_weekly_report_docx(
+    report_text: str,
+    output_dir: Path,
+    week_start_iso: str,
+    provider_details: str = "",
+    file_name: str | None = None,
+) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    document = Document()
+    week_start = datetime.fromisoformat(week_start_iso)
+    week_end = _week_end_date(week_start)
+
+    document.add_heading(f"AI Weekly Report ({week_end.strftime('%Y %b %d')})", level=1)
+    if provider_details.strip():
+        document.add_paragraph(f"Generated with {provider_details.strip()}")
+
+    _write_ai_weekly_report(document, report_text)
+
+    if file_name:
+        target = output_dir / file_name
+    else:
+        target = output_dir / f"weekly_ai_report_{week_end.strftime('%Y%m%d')}.docx"
+    document.save(target)
+    return target
+
+
+def _write_ai_weekly_report(document: Document, report_text: str) -> None:
+    paragraph_parts: list[str] = []
+    current_day: str | None = None
+    current_repo: str | None = None
+    repo_has_body = False
+
+    def flush_paragraph() -> None:
+        nonlocal repo_has_body
+        if not paragraph_parts:
+            return
+        paragraph = document.add_paragraph(style=LIST_BULLET_STYLE)
+        paragraph.paragraph_format.left_indent = AI_WEEKLY_ITEM_INDENT
+        paragraph.paragraph_format.first_line_indent = None
+        paragraph.add_run(_clean_weekly_report_item_text(" ".join(paragraph_parts).strip()))
+        paragraph_parts.clear()
+        repo_has_body = True
+
+    for raw_line in report_text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            flush_paragraph()
+            continue
+
+        markdown_heading = _weekly_markdown_heading(stripped)
+        if markdown_heading:
+            flush_paragraph()
+            heading_level, heading_text = markdown_heading
+            heading_text = _clean_weekly_report_inline_text(heading_text)
+            day_heading = _parse_weekly_report_day_heading(heading_text)
+            if day_heading:
+                _add_ai_weekly_day_paragraph(document, day_heading)
+                current_day = day_heading
+                current_repo = None
+                repo_has_body = False
+                continue
+
+            if current_day and not current_repo:
+                _add_ai_weekly_repo_paragraph(document, heading_text)
+                current_repo = heading_text
+                repo_has_body = False
+                continue
+
+            paragraph = document.add_paragraph(heading_text)
+            paragraph.paragraph_format.left_indent = AI_WEEKLY_DAY_INDENT
+            del heading_level
+            continue
+
+        day_heading = _parse_weekly_report_day_heading(stripped)
+        if day_heading:
+            flush_paragraph()
+            _add_ai_weekly_day_paragraph(document, day_heading)
+            current_day = day_heading
+            current_repo = None
+            repo_has_body = False
+            continue
+
+        repo_heading = _parse_weekly_report_repo_heading(stripped)
+        if repo_heading:
+            flush_paragraph()
+            _add_ai_weekly_repo_paragraph(document, repo_heading)
+            current_repo = repo_heading
+            repo_has_body = False
+            continue
+
+        list_item = _weekly_report_list_item(stripped)
+        if list_item:
+            flush_paragraph()
+            style, body = list_item
+            paragraph = document.add_paragraph(_clean_weekly_report_item_text(body), style=style)
+            paragraph.paragraph_format.left_indent = AI_WEEKLY_ITEM_INDENT
+            paragraph.paragraph_format.first_line_indent = None
+            repo_has_body = True
+            continue
+
+        clean_line = _clean_weekly_report_inline_text(stripped)
+        if _looks_like_weekly_report_repo_heading(clean_line, current_day, current_repo, repo_has_body):
+            flush_paragraph()
+            _add_ai_weekly_repo_paragraph(document, clean_line)
+            current_repo = clean_line
+            repo_has_body = False
+            continue
+
+        paragraph_parts.append(clean_line)
+
+    flush_paragraph()
+
+
+def _add_ai_weekly_day_paragraph(document: Document, text: str) -> None:
+    paragraph = document.add_paragraph(text)
+    paragraph.paragraph_format.left_indent = AI_WEEKLY_DAY_INDENT
+    paragraph.paragraph_format.first_line_indent = None
+
+
+def _add_ai_weekly_repo_paragraph(document: Document, text: str) -> None:
+    paragraph = document.add_paragraph(text)
+    paragraph.paragraph_format.left_indent = AI_WEEKLY_REPO_INDENT
+    paragraph.paragraph_format.first_line_indent = None
+
+
+def _weekly_markdown_heading(text: str) -> tuple[int, str] | None:
+    if not text.startswith("#"):
+        return None
+    level = 0
+    for char in text:
+        if char != "#":
+            break
+        level += 1
+    if level == 0 or level > 6:
+        return None
+    heading_text = text[level:].strip()
+    if not heading_text:
+        return None
+    return level, heading_text
+
+
+def _weekly_report_list_item(text: str) -> tuple[str, str] | None:
+    if text.startswith(("- ", "* ")):
+        return LIST_BULLET_STYLE, text[2:].strip()
+
+    marker, separator, remainder = text.partition(".")
+    if separator and marker.isdigit() and remainder.startswith(" "):
+        return LIST_NUMBER_STYLE, remainder.strip()
+    return None
+
+
+def _parse_weekly_report_day_heading(text: str) -> str | None:
+    clean_text = _clean_weekly_report_inline_text(text).strip().rstrip(":")
+    if clean_text in DAY_ORDER:
+        return clean_text
+    if clean_text.startswith("Day:"):
+        candidate = clean_text.partition(":")[2].strip().rstrip(":")
+        if candidate in DAY_ORDER:
+            return candidate
+    if clean_text.startswith("@"):
+        candidate = clean_text[1:].strip().rstrip(":")
+        if candidate in DAY_ORDER:
+            return candidate
+    return None
+
+
+def _parse_weekly_report_repo_heading(text: str) -> str | None:
+    clean_text = _clean_weekly_report_inline_text(text).strip()
+    if not clean_text.startswith("Repo:"):
+        return None
+    repo_name = clean_text.partition(":")[2].strip().rstrip(":")
+    return repo_name or None
+
+
+def _looks_like_weekly_report_repo_heading(
+    text: str,
+    current_day: str | None,
+    current_repo: str | None,
+    repo_has_body: bool,
+) -> bool:
+    if not current_day or current_repo is not None or repo_has_body:
+        return False
+    if not text or text in DAY_ORDER:
+        return False
+    if len(text) > 80:
+        return False
+    return not any(mark in text for mark in (". ", ": ", "! ", "? ")) and not text.endswith((".", "!", "?"))
+
+
+def _clean_weekly_report_inline_text(text: str) -> str:
+    clean_text = text.strip()
+    clean_text = re.sub(r"^>+\s*", "", clean_text)
+    clean_text = re.sub(r"\*\*(.*?)\*\*", r"\1", clean_text)
+    clean_text = re.sub(r"__(.*?)__", r"\1", clean_text)
+    clean_text = re.sub(r"`([^`]*)`", r"\1", clean_text)
+    return clean_text.strip()
+
+
+def _clean_weekly_report_item_text(text: str) -> str:
+    clean_text = _clean_weekly_report_inline_text(text)
+    if clean_text[:8].lower() == "summary:":
+        return clean_text[8:].strip()
+    return clean_text
 
 
 def _write_week_block(

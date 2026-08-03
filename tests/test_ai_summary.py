@@ -5,8 +5,10 @@ import unittest
 from unittest.mock import patch
 
 from pyesis.ai_summary import (
+    AIWeeklyReportResult,
     ProviderStructuredSummary,
     _build_ai_user_prompt,
+    _build_weekly_report_user_prompt,
     _coalesce_changes,
     _first_evidence_reference,
     _is_summary_excluded_path,
@@ -16,6 +18,7 @@ from pyesis.ai_summary import (
     _parse_ai_json_payload,
     _structured_summary_from_json,
     _to_past_tense,
+    build_weekly_report,
     build_summary,
 )
 from pyesis.config import RepoConfig
@@ -360,6 +363,53 @@ class AISummaryTests(unittest.TestCase):
             _ollama_model_candidates("qwen3-coder:30b, llama3.1:70b, qwen3-coder:30b"),
             ["qwen3-coder:30b", "llama3.1:70b"],
         )
+
+    def test_weekly_report_prompt_includes_evidence(self) -> None:
+        prompt = _build_weekly_report_user_prompt("Day: Monday\nRepo: Pyesis\n- Summary: Added parser")
+
+        self.assertIn("write a detailed weekly report", prompt.lower())
+        self.assertIn("one sentence or at most a short paragraph", prompt)
+        self.assertIn("same general order", prompt)
+        self.assertIn("Do not repeat evidence field labels like 'Summary:'", prompt)
+        self.assertIn("do not emit markdown markers", prompt)
+        self.assertIn("Day: Monday", prompt)
+        self.assertIn("Repo: Pyesis", prompt)
+
+    def test_build_weekly_report_uses_ollama_chat(self) -> None:
+        response_payload = {
+            "message": {
+                "content": "Monday\nPyesis\nI added parser recovery details and clarified the import path changes."
+            }
+        }
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return json.dumps(response_payload).encode("utf-8")
+
+        with patch("pyesis.ai_summary.request.urlopen", return_value=FakeResponse()) as mock_urlopen:
+            with patch.dict(
+                "os.environ",
+                {
+                    "PYESIS_OLLAMA_URL": "http://localhost:11434/api/chat",
+                    "PYESIS_OLLAMA_MODEL": "qwen3-coder:30b",
+                    "PYESIS_OLLAMA_KEEP_ALIVE": "5m",
+                },
+                clear=False,
+            ):
+                result = build_weekly_report("Day: Monday\nRepo: Pyesis\n- Summary: Added parser")
+
+        request_payload = json.loads(mock_urlopen.call_args.args[0].data.decode("utf-8"))
+        self.assertIsInstance(result, AIWeeklyReportResult)
+        self.assertIn("Monday", result.text)
+        self.assertEqual(result.provider_details, "qwen3-coder:30b")
+        self.assertFalse(request_payload["stream"])
+        self.assertNotIn("format", request_payload)
 
     def test_ollama_structured_summary_falls_through_multiple_models(self) -> None:
         diff_text = (
