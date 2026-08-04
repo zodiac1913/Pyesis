@@ -3332,6 +3332,25 @@ class PyesisApp:
 
         return rewrite_gate
 
+    def _make_budgeted_poll_rewrite_gate(self, handled_repos: dict[str, int], captured_new_items: int):
+        # Reserve roughly one backlog attempt for every two fresh captures,
+        # which keeps at least about a third of poll AI work on orange/red items.
+        backlog_attempt_budget = None if captured_new_items <= 0 else max(1, (captured_new_items + 1) // 2)
+        handled_total = 0
+
+        def rewrite_gate(repo_label: str, _repo_path: str | None) -> bool:
+            nonlocal handled_total
+            if backlog_attempt_budget is not None and handled_total >= backlog_attempt_budget:
+                return False
+            handled_count = handled_repos.get(repo_label, 0)
+            if handled_count >= POLL_REWRITE_LIMIT:
+                return False
+            handled_repos[repo_label] = handled_count + 1
+            handled_total += 1
+            return True
+
+        return rewrite_gate
+
     def _set_ollama_activity(self, message: str) -> None:
         self.root.after(0, lambda text=message: self.ollama_activity_var.set(text))
 
@@ -3360,8 +3379,7 @@ class PyesisApp:
     def _poll_worker(self, repos: list[RepoConfig]) -> None:
         captured = 0
         errors: list[str] = []
-        handled_repos: dict[str, int] = {}
-        rewrite_gate = self._make_poll_rewrite_gate(handled_repos)
+        backlog_present_at_poll_start = self._has_current_week_ai_backlog()
 
         for repo in repos:
             try:
@@ -3380,7 +3398,12 @@ class PyesisApp:
                 errors.append(f"{repo.label}: capture failed: {exc}")
                 continue
 
-        enhancement_report, enhancement_error = self._run_poll_enhancer(rewrite_gate)
+        if backlog_present_at_poll_start:
+            handled_repos: dict[str, int] = {}
+            rewrite_gate = self._make_budgeted_poll_rewrite_gate(handled_repos, captured)
+            enhancement_report, enhancement_error = self._run_poll_enhancer(rewrite_gate)
+        else:
+            enhancement_report, enhancement_error = None, ""
 
         self._poll_captured_count = captured
         self._poll_errors = errors

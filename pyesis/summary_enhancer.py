@@ -289,8 +289,15 @@ def _is_new_since(last_run: datetime | None, timestamp: str) -> bool:
     return candidate >= last_run
 
 
-def _active_week_start(now: datetime) -> datetime:
-    return (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+def _active_week_start(week_end_day: str, now: datetime) -> datetime:
+    end_index = DAY_ORDER.index(week_end_day) if week_end_day in DAY_ORDER else DAY_ORDER.index("Thursday")
+    week_end = (now + timedelta(days=(end_index - now.weekday()) % 7)).replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    return week_end - timedelta(days=6)
 
 
 def _parse_hhmm(value: str) -> tuple[int, int] | None:
@@ -418,7 +425,7 @@ def _should_run_now(config: AppConfig, current_time: datetime) -> tuple[bool, da
     if not config.summary_enhancer_enabled:
         return False, None, "Enhancer skipped: disabled"
 
-    active_week_start = _active_week_start(current_time)
+    active_week_start = _active_week_start(config.week_end_day, current_time)
     if _is_week_frozen(config, current_time, active_week_start):
         return False, None, "Enhancer skipped: active week frozen after export cutoff"
 
@@ -912,7 +919,7 @@ def run_periodic_enhancer(
         return report
 
     report.ran = True
-    active_week_start = _active_week_start(current_time)
+    active_week_start = _active_week_start(config.week_end_day, current_time)
     rewritten_at = _now_iso(current_time)
     rewritten_by = (config.summary_enhancer_rewritten_by or DEFAULT_REWRITER_ID).strip() or DEFAULT_REWRITER_ID
     if aggressive_prodding_override is None:

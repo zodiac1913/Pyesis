@@ -352,6 +352,41 @@ class SummaryEnhancerTests(unittest.TestCase):
 
         self.assertFalse(report.ran)
 
+    def test_thursday_week_boundary_keeps_current_week_oranges_eligible(self) -> None:
+        config = self._base_config()
+        config.summary_enhancer_dry_run = False
+        config.week_end_day = "Thursday"
+        config.ai_mode = "ollama"
+        config.entries = [
+            EntryRecord(
+                repo_label="Cats",
+                repo_path="/tmp/cats",
+                created_at="2026-08-03T07:55:27",
+                day_name="Monday",
+                week_start_iso="2026-07-31T00:00:00",
+                summary="I added searchLabelAttribute in wwwroot/js/global/SML/Form/smlAutoComplete.js.",
+                diff_hash="week-boundary-orange",
+                diff_excerpt="diff --git a/wwwroot/js/global/SML/Form/smlAutoComplete.js b/wwwroot/js/global/SML/Form/smlAutoComplete.js\n+++ b/wwwroot/js/global/SML/Form/smlAutoComplete.js\n@@ -1 +1 @@\n+const searchLabelAttribute = `aria-label=\"Search\"`;\n",
+                summary_source="heuristic",
+                author="Backup",
+            )
+        ]
+
+        report = run_periodic_enhancer(
+            config,
+            summary_builder=lambda _repo, _diff, _path: AISummaryResult(
+                text="I changed the standalone autocomplete label path so lone-mode search always emits a direct aria-label.",
+                source="ollama",
+                requested_source="ollama",
+            ),
+            now=datetime(2026, 8, 4, 6, 5, 27),
+        )
+
+        self.assertTrue(report.ran)
+        self.assertEqual(report.rewritten_state, 1)
+        self.assertEqual(config.entries[0].summary_source, "ollama")
+        self.assertEqual(config.entries[0].author, "AI")
+
     def test_github_gpt_entries_are_not_rewritten(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp = Path(tmp_dir)

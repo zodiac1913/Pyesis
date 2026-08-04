@@ -419,6 +419,31 @@ class AppSummaryProtectionTests(unittest.TestCase):
         self.assertTrue(mock_run.called)
         self.assertNotIn("force_run", mock_run.call_args.kwargs)
 
+    def test_budgeted_poll_rewrite_gate_reserves_about_one_third_for_backlog(self) -> None:
+        app = self._make_app()
+        gate = app._make_budgeted_poll_rewrite_gate({}, 4)
+
+        self.assertTrue(gate("RepoA", "/tmp/repo-a"))
+        self.assertTrue(gate("RepoA", "/tmp/repo-a"))
+        self.assertFalse(gate("RepoA", "/tmp/repo-a"))
+
+    def test_poll_worker_skips_backlog_enhancer_when_poll_starts_clean(self) -> None:
+        app = self._make_app()
+        app._has_current_week_ai_backlog = lambda: False
+        app._capture_repo_snapshot_change = lambda _repo, _snapshot: True
+        enhancer_calls: list[object] = []
+        app._run_poll_enhancer = lambda _gate: enhancer_calls.append(object()) or (object(), "")
+
+        repo = RepoConfig(path="/tmp/repo-a", label="RepoA", poll_seconds=120)
+
+        with patch("pyesis.app.capture_snapshot", return_value=object()):
+            app._poll_worker([repo])
+
+        self.assertEqual(app._poll_captured_count, 1)
+        self.assertEqual(enhancer_calls, [])
+        self.assertIsNone(app._poll_enhancement_report)
+        self.assertEqual(app._poll_enhancement_error, "")
+
     def test_periodic_summary_enhancer_runs_in_background_and_completes_on_ui_thread(self) -> None:
         app = self._make_app()
         app.root = DummyRoot()
