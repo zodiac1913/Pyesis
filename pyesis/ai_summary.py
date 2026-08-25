@@ -766,11 +766,11 @@ def _fallback_reason_for_path(path: str) -> str:
 def _fallback_what_for_path(path: str) -> str:
     path_l = path.lower().replace("\\", "/")
     if path_l.endswith(APP_FILENAME):
-        return f"refined application flow in {path}"
+        return f"changed app behavior in {path}"
     if path_l.endswith((".py", ".js", ".ts", ".tsx", ".jsx", ".cs")):
-        return f"refined logic in {path}"
+        return f"changed {path}"
     if path_l.endswith(".cshtml"):
-        return f"refined page behavior in {path}"
+        return f"changed page markup in {path}"
     if path_l.endswith((JSON_SUFFIX, ".toml", *YAML_SUFFIXES)):
         return f"adjusted configuration data in {path}"
     return f"updated {path}"
@@ -816,6 +816,12 @@ def _anchored_symbol_from_line(line: str) -> tuple[str, str]:
         match = pattern.match(text)
         if match:
             return match.group(1), kind
+
+    call_match = re.search(r"\b(?:await\s+)?([A-Za-z_]\w*)\s*\(", text)
+    if call_match:
+        symbol_name = call_match.group(1)
+        if symbol_name not in {"if", "for", "while", "switch", "catch", "return", "new"}:
+            return symbol_name, "function"
     return "", ""
 
 
@@ -1648,7 +1654,7 @@ def _file_phrase(change: FileChangeSummary) -> str:
         anchored_phrase = _anchored_change_phrase(change)
         if anchored_phrase:
             return anchored_phrase
-        return f"refined logic in {path}"
+        return f"changed {path}"
     if has_import_intent and import_targets:
         return f"updated imports in {path} to use {_join_with_and(import_targets[:3])}"
     if significant_intents:

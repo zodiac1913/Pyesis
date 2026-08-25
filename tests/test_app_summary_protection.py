@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch
 import threading
 
-from pyesis.ai_summary import AIWeeklyReportResult, GITHUB_GPT_MODE, HEURISTIC_MODE, OLLAMA_MODE
+from pyesis.ai_summary import AISummaryResult, AIWeeklyReportResult, GITHUB_GPT_MODE, HEURISTIC_MODE, OLLAMA_MODE
 from pyesis.app import PyesisApp
 from pyesis.config import AppConfig, EntryRecord, RepoConfig
 
@@ -25,14 +25,39 @@ class DummyVar:
 class DummyRoot:
     def __init__(self) -> None:
         self.after_calls: list[tuple[int, object]] = []
+        self.title_text = ""
+        self.bell_count = 0
+        self.deiconify_count = 0
+        self.lift_count = 0
+        self.focus_force_count = 0
+        self.attributes_calls: list[tuple[str, object]] = []
 
     def after(self, delay_ms: int, callback) -> None:
         self.after_calls.append((delay_ms, callback))
+
+    def title(self, value: str) -> None:
+        self.title_text = value
+
+    def bell(self) -> None:
+        self.bell_count += 1
+
+    def deiconify(self) -> None:
+        self.deiconify_count += 1
+
+    def lift(self) -> None:
+        self.lift_count += 1
+
+    def focus_force(self) -> None:
+        self.focus_force_count += 1
+
+    def attributes(self, key: str, value) -> None:
+        self.attributes_calls.append((key, value))
 
 
 class DummyEditor:
     def __init__(self) -> None:
         self.ops: list[tuple[str, str, tuple[str, ...] | None]] = []
+        self.scroll_position = 0.0
 
     def delete(self, start: str, end: str) -> None:
         self.ops.append(("delete", "", None))
@@ -45,6 +70,15 @@ class DummyEditor:
         else:
             normalized_tags = tuple(tags)
         self.ops.append(("insert", text, normalized_tags))
+
+    def update_idletasks(self) -> None:
+        return None
+
+    def yview(self) -> tuple[float, float]:
+        return (self.scroll_position, 1.0)
+
+    def yview_moveto(self, fraction: float) -> None:
+        self.scroll_position = fraction
 
     def contents(self) -> str:
         return "".join(text for op, text, _tags in self.ops if op == "insert")
@@ -95,6 +129,13 @@ class AppSummaryProtectionTests(unittest.TestCase):
         app._active_ai_entry_keys = set()
         app._ai_working_pulse_on = False
         app._enhancer_in_flight = False
+        app._ai_backend_unavailable = False
+        app._ai_recovery_probe_in_flight = False
+        app._ai_last_warning = ""
+        app._ai_status_severity = "ok"
+        app._editor_scroll_initialized = False
+        app._ollama_alert_visible = False
+        app._ollama_alert_cycle_id = 0
         app.ollama_activity_var = DummyVar()
         app._refresh_editor = lambda: None
         return app
@@ -298,8 +339,20 @@ class AppSummaryProtectionTests(unittest.TestCase):
                 created_at=now.isoformat(),
                 day_name=now.strftime("%A"),
                 week_start_iso="",
-                summary="I adjusted return flow in pyesis/ai_summary.py.",
+                summary="I changed async flow in pyesis/ai_summary.py.",
                 diff_hash="heuristic-now",
+                diff_excerpt="diff --git a/pyesis/ai_summary.py b/pyesis/ai_summary.py\n+++ b/pyesis/ai_summary.py\n",
+                summary_source="heuristic",
+                author="Backup",
+            ),
+            EntryRecord(
+                repo_label="Pyesis",
+                repo_path="/tmp/pyesis",
+                created_at=now.isoformat(),
+                day_name=now.strftime("%A"),
+                week_start_iso="",
+                summary="I added strict JSON output guidance in pyesis/ai_summary.py.",
+                diff_hash="heuristic-strong-now",
                 diff_excerpt="diff --git a/pyesis/ai_summary.py b/pyesis/ai_summary.py\n+++ b/pyesis/ai_summary.py\n",
                 summary_source="heuristic",
                 author="Backup",
@@ -331,6 +384,23 @@ class AppSummaryProtectionTests(unittest.TestCase):
         ]
 
         self.assertEqual(app._current_week_heuristic_entry_count(), 1)
+
+    def test_strong_heuristic_entry_is_not_rendered_as_orange(self) -> None:
+        app = self._make_app()
+        entry = EntryRecord(
+            repo_label="Pyesis",
+            repo_path="/tmp/pyesis",
+            created_at="2026-08-03T09:00:00",
+            day_name="Monday",
+            week_start_iso="2026-07-31T00:00:00",
+            summary="I added strict JSON output guidance in pyesis/ai_summary.py.",
+            diff_hash="heuristic-strong",
+            diff_excerpt="diff --git a/pyesis/ai_summary.py b/pyesis/ai_summary.py\n+++ b/pyesis/ai_summary.py\n",
+            summary_source="heuristic",
+            author="Backup",
+        )
+
+        self.assertEqual(app._entry_render_tags(entry), ())
 
     def test_same_day_same_file_distinct_diffs_do_not_merge(self) -> None:
         app = self._make_app()
@@ -690,6 +760,69 @@ class AppSummaryProtectionTests(unittest.TestCase):
 
         self.assertTrue(app._is_trusted_ai_entry(entry))
         self.assertEqual(app._entry_render_tags(entry), ())
+
+    def test_ollama_alert_pulse_starts_on_ai_degraded_and_stops_on_recovery(self) -> None:
+        app = self._make_app()
+        app.root = DummyRoot()
+        app._apply_theme = lambda: None
+        app._app_version = lambda: "test"
+        app._current_ai_mode = lambda: OLLAMA_MODE
+        app.ai_status_var = DummyVar()
+
+        degraded = AISummaryResult(
+            text="heuristic fallback",
+            source=HEURISTIC_MODE,
+            requested_source=OLLAMA_MODE,
+            warning="Ollama summary failed: offline",
+            fallback_source=HEURISTIC_MODE,
+        )
+
+        app._handle_ai_health(degraded, "Cats")
+
+        self.assertTrue(app._ai_backend_unavailable)
+        self.assertTrue(app._ollama_alert_visible)
+        self.assertEqual(app.root.title_text, "[OLLAMA DOWN] Pyesis vtest")
+        self.assertEqual(app.root.bell_count, 1)
+        self.assertEqual(app.root.deiconify_count, 0)
+        self.assertEqual(app.root.lift_count, 0)
+        self.assertEqual(app.root.focus_force_count, 0)
+        self.assertEqual(app.root.attributes_calls, [])
+        self.assertEqual(app.root.after_calls[-1][0], 5000)
+
+        app.root.after_calls[-1][1]()
+
+        self.assertFalse(app._ollama_alert_visible)
+        self.assertEqual(app.root.title_text, "Pyesis vtest")
+        self.assertEqual(app.root.after_calls[-1][0], 15000)
+
+        recovered = AISummaryResult(text="AI summary", source=OLLAMA_MODE)
+        app._handle_ai_health(recovered, "Cats")
+
+        self.assertFalse(app._ai_backend_unavailable)
+        self.assertFalse(app._ollama_alert_visible)
+        self.assertEqual(app.root.title_text, "Pyesis vtest")
+
+    def test_non_ollama_degraded_state_does_not_start_ollama_alert_pulse(self) -> None:
+        app = self._make_app()
+        app.root = DummyRoot()
+        app._apply_theme = lambda: None
+        app._app_version = lambda: "test"
+        app._current_ai_mode = lambda: GITHUB_GPT_MODE
+        app.ai_status_var = DummyVar()
+
+        degraded = AISummaryResult(
+            text="heuristic fallback",
+            source=HEURISTIC_MODE,
+            requested_source=GITHUB_GPT_MODE,
+            warning="GitHub GPT unavailable",
+            fallback_source=HEURISTIC_MODE,
+        )
+
+        app._handle_ai_health(degraded, "Pyesis")
+
+        self.assertTrue(app._ai_backend_unavailable)
+        self.assertFalse(app._ollama_alert_visible)
+        self.assertEqual(app.root.after_calls, [])
 
     def test_missing_summary_source_defaults_to_heuristic_not_current_ai_mode(self) -> None:
         app = self._make_app()

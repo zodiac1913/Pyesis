@@ -74,7 +74,7 @@ On Windows PowerShell, use `$env:PYESIS_AI_MODE = "openai-compatible"` style ass
 
 ## Notes
 
-- The app stores configuration in `pyesis_state.json` in the project root.
+- The app stores runtime state in `~/PyesisState/` on every OS.
 - Each entry stores a larger diff excerpt to improve summary quality for future rewrites.
 - Exported documents are written to the configured DOCX output folder.
 - New installs default DOCX output to a `Pyesis` folder in your home Documents directory when available, and legacy `exports` settings are migrated away from the repo-local folder automatically.
@@ -102,6 +102,23 @@ Generated artifacts are written to `dist/`:
 - Windows: `Pyesis-vYYYY.M.D.x-windows-x64.zip` (contains the `.exe`)
 - macOS: `Pyesis-vYYYY.M.D.x-macos-{x64|arm64}.zip` containing `Pyesis.app`
 - Linux: `Pyesis-vYYYY.M.D.x-linux-{x64|arm64}.zip`
+
+To launch the macOS build locally after creating it:
+
+```bash
+unzip -o dist/Pyesis-vYYYY.M.D.x-macos-arm64.zip -d dist
+open dist/Pyesis.app
+```
+
+If macOS blocks the unsigned app, use one of these local override paths:
+
+1. In Finder, control-click `Pyesis.app`, choose `Open`, then confirm.
+2. Or remove the download quarantine flag from Terminal:
+
+```bash
+xattr -dr com.apple.quarantine dist/Pyesis.app
+open dist/Pyesis.app
+```
 
 The macOS app bundle produced by CI is unsigned. It runs locally, but distribution outside your own machine will require the usual Apple signing and notarization work.
 

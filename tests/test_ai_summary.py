@@ -126,6 +126,21 @@ class AISummaryTests(unittest.TestCase):
         self.assertNotIn("introduced configapps", result.text.lower())
         self.assertIn("ConfigApps", result.text)
 
+    def test_heuristic_summary_avoids_refined_logic_fallback_for_controller_config_diff(self) -> None:
+        diff_text = (
+            "diff --git a/Controllers/Configurer/Configs/AppConfig.cs b/Controllers/Configurer/Configs/AppConfig.cs\n"
+            "+++ b/Controllers/Configurer/Configs/AppConfig.cs\n"
+            "@@ -219,1 +219,1 @@\n"
+            "-            title=\"Delete App\", type=\"Delete\",\n"
+            "+            title=\"Remove App\", type=\"Update\",\n"
+        )
+
+        result = build_summary("Cats", diff_text, repo_path="/tmp/cats", mode="heuristic")
+
+        self.assertNotIn("refined logic", result.text.lower())
+        self.assertIn("Controllers/Configurer/Configs/AppConfig.cs", result.text)
+        self.assertIn("Evidence:", result.text)
+
     def test_heuristic_summary_avoids_short_ambiguous_symbol_anchor(self) -> None:
         diff_text = (
             "diff --git a/wwwroot/js/global/sml/Form/smlAutoComplete.js b/wwwroot/js/global/sml/Form/smlAutoComplete.js\n"
@@ -152,7 +167,7 @@ class AISummaryTests(unittest.TestCase):
 
         result = build_summary("Cats", diff_text, repo_path="/tmp/cats", mode="heuristic")
 
-        self.assertIn("Updated work in Cats.", result.text)
+        self.assertIn("Updated work in Cats", result.text)
         self.assertNotIn("validation-required", result.text)
         self.assertNotIn("site.css", result.text)
         self.assertNotIn("Evidence:", result.text)

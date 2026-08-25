@@ -6,6 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import shutil
 from typing import Any
 
 from pyesis.github_auth import (
@@ -15,8 +16,11 @@ from pyesis.github_auth import (
     normalize_github_auth_mode,
 )
 
-
-STATE_PATH = Path("pyesis_state.json")
+PYESIS_HOME_DIRNAME = "Pyesis"
+STATE_HOME_DIRNAME = "PyesisState"
+LEGACY_STATE_PATH = Path("pyesis_state.json")
+LEGACY_BUFFER_DIR = Path("diff_buffers")
+LEGACY_LOG_DIR = Path("logs")
 NEAR_DUP_DIFF_SIMILARITY_THRESHOLD = 0.80
 OLLAMA_DEFAULT_URL = "http://localhost:11434/api/chat"
 OLLAMA_DEFAULT_TIMEOUT_SECONDS = 180
@@ -33,10 +37,171 @@ LEGACY_GITHUB_GPT_MODEL_ALIASES = {
 }
 
 
-def default_export_directory() -> str:
+def default_pyesis_directory() -> Path:
     documents_dir = Path.home() / "Documents"
     base_dir = documents_dir if documents_dir.exists() else Path.home()
-    return str(base_dir / "Pyesis")
+    return base_dir / PYESIS_HOME_DIRNAME
+
+
+def default_export_directory() -> str:
+    return str(default_pyesis_directory())
+
+
+def default_state_directory() -> Path:
+    return Path.home() / STATE_HOME_DIRNAME
+
+
+STATE_DIRECTORY = default_state_directory()
+STATE_PATH = STATE_DIRECTORY / "pyesis_state.json"
+BUFFER_DIR = STATE_DIRECTORY / "diff_buffers"
+AI_ATTEMPT_LOG_PATH = STATE_DIRECTORY / "logs" / "ai_attempts.jsonl"
+
+
+def ensure_state_storage(state_directory: Path = STATE_DIRECTORY) -> None:
+    state_directory.mkdir(parents=True, exist_ok=True)
+    (state_directory / "diff_buffers").mkdir(parents=True, exist_ok=True)
+    (state_directory / "logs").mkdir(parents=True, exist_ok=True)
+
+
+def _copy_file_if_newer(source: Path, target: Path) -> bool:
+    if not source.exists():
+        return False
+    if target.exists():
+        try:
+            if source.stat().st_mtime <= target.stat().st_mtime:
+                return False
+        except OSError:
+            return False
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target)
+    return True
+
+
+def _copy_tree_files_if_newer(source_dir: Path, target_dir: Path) -> bool:
+    if not source_dir.exists() or not source_dir.is_dir():
+        return False
+
+    copied = False
+    for source_path in source_dir.rglob("*"):
+        relative = source_path.relative_to(source_dir)
+        target_path = target_dir / relative
+        if source_path.is_dir():
+            target_path.mkdir(parents=True, exist_ok=True)
+            continue
+        if target_path.exists():
+            try:
+                if source_path.stat().st_mtime <= target_path.stat().st_mtime:
+                    continue
+            except OSError:
+                continue
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_path, target_path)
+        copied = True
+    return copied
+
+
+def _is_within_directory(path: Path, directory: Path) -> bool:
+    try:
+        resolved_path = path.resolve()
+        resolved_directory = directory.resolve()
+    except OSError:
+        return False
+    return resolved_path == resolved_directory or resolved_directory in resolved_path.parents
+
+
+def _latest_mtime_in_tree(path: Path) -> float:
+    try:
+        latest_mtime = path.stat().st_mtime
+    except OSError:
+        latest_mtime = 0.0
+
+    for child in path.rglob("*"):
+        if not child.is_file():
+            continue
+        try:
+            latest_mtime = max(latest_mtime, child.stat().st_mtime)
+        except OSError:
+            continue
+    return latest_mtime
+
+
+def _iter_legacy_state_candidates(root: Path) -> list[tuple[Path, float]]:
+    candidates: list[tuple[Path, float]] = []
+    for state_path in root.rglob(LEGACY_STATE_PATH.name):
+        if not state_path.is_file():
+            continue
+        try:
+            candidates.append((state_path.parent, state_path.stat().st_mtime))
+        except OSError:
+            continue
+    return candidates
+
+
+def _iter_legacy_buffer_candidates(root: Path) -> list[tuple[Path, float]]:
+    candidates: list[tuple[Path, float]] = []
+    for buffer_dir in root.rglob(LEGACY_BUFFER_DIR.name):
+        if not buffer_dir.is_dir():
+            continue
+        candidates.append((buffer_dir.parent, _latest_mtime_in_tree(buffer_dir)))
+    return candidates
+
+
+def _iter_legacy_log_candidates(root: Path) -> list[tuple[Path, float]]:
+    candidates: list[tuple[Path, float]] = []
+    for log_path in root.rglob(AI_ATTEMPT_LOG_PATH.name):
+        if not log_path.is_file() or log_path.parent.name != LEGACY_LOG_DIR.name:
+            continue
+        try:
+            candidates.append((log_path.parent.parent, log_path.stat().st_mtime))
+        except OSError:
+            continue
+    return candidates
+
+
+def find_latest_legacy_runtime_root(search_root: Path | None = None, state_directory: Path = STATE_DIRECTORY) -> Path | None:
+    root = (search_root or Path.home()).expanduser()
+    if not root.exists():
+        return None
+
+    latest_root: Path | None = None
+    latest_mtime = -1.0
+
+    all_candidates = _iter_legacy_state_candidates(root)
+    all_candidates.extend(_iter_legacy_buffer_candidates(root))
+    all_candidates.extend(_iter_legacy_log_candidates(root))
+
+    for candidate_root, candidate_mtime in all_candidates:
+        if _is_within_directory(candidate_root, state_directory):
+            continue
+        if candidate_mtime <= latest_mtime:
+            continue
+        latest_root = candidate_root
+        latest_mtime = candidate_mtime
+
+    return latest_root
+
+
+def migrate_legacy_runtime_data(
+    legacy_root: Path | None = None,
+    state_directory: Path = STATE_DIRECTORY,
+    search_root: Path | None = None,
+) -> bool:
+    ensure_state_storage(state_directory)
+    source_root = (legacy_root or find_latest_legacy_runtime_root(search_root=search_root, state_directory=state_directory))
+    if source_root is None:
+        return False
+    source_root = source_root.expanduser()
+    try:
+        if source_root.resolve() == state_directory.resolve():
+            return False
+    except OSError:
+        return False
+
+    migrated = False
+    migrated |= _copy_file_if_newer(source_root / LEGACY_STATE_PATH.name, state_directory / STATE_PATH.name)
+    migrated |= _copy_tree_files_if_newer(source_root / LEGACY_BUFFER_DIR.name, state_directory / BUFFER_DIR.name)
+    migrated |= _copy_tree_files_if_newer(source_root / LEGACY_LOG_DIR.name, state_directory / AI_ATTEMPT_LOG_PATH.parent.name)
+    return migrated
 
 
 @dataclass
@@ -107,9 +272,12 @@ def dedupe_entries(entries: list[EntryRecord]) -> list[EntryRecord]:
     seen_diff: set[tuple[str, str, str]] = set()
     seen_legacy: set[tuple[str, str, str, str, str]] = set()
     seen_semantic: set[tuple[str, str, str, str, tuple[str, ...]]] = set()
+    seen_synchronized: set[tuple[str, str, str]] = set()
 
     for entry in sorted(entries, key=lambda item: item.created_at):
         if _is_diff_duplicate(entry, seen_diff):
+            continue
+        if _is_synchronized_mirror_duplicate(entry, seen_synchronized):
             continue
         if _is_near_diff_duplicate(entry, deduped):
             continue
@@ -147,6 +315,35 @@ def _entry_diff_fingerprint(entry: EntryRecord) -> str:
     if not excerpt:
         return ""
     return f"excerpt:{hashlib.sha256(excerpt.encode('utf-8')).hexdigest()}"
+
+
+def _is_synchronized_mirror_duplicate(
+    entry: EntryRecord,
+    seen_synchronized: set[tuple[str, str, str]],
+) -> bool:
+    """
+    Detect when the same code change is synced to multiple mirror files
+    (e.g., demo/, extension/, src/runtime/) within the same day.
+    Treats them as a single logical change, not separate work items.
+    """
+    if not entry.summary.strip() or not entry.created_at:
+        return False
+
+    # Extract the date (YYYY-MM-DD)
+    date_key = entry.created_at[:10] if len(entry.created_at) >= 10 else ""
+    if not date_key:
+        return False
+
+    # Create a fingerprint based on repo, date, and summary text
+    summary_normalized = entry.summary.lower().strip()
+    sync_key = (entry.repo_path, date_key, summary_normalized)
+
+    if sync_key in seen_synchronized:
+        return True
+
+    seen_synchronized.add(sync_key)
+    return False
+
 
 
 def _entry_files_fingerprint(entry: EntryRecord) -> list[str]:
@@ -407,6 +604,9 @@ def _should_rewrite_saved_entries(
 
 
 def load_config() -> AppConfig:
+    ensure_state_storage()
+    if not STATE_PATH.exists():
+        migrate_legacy_runtime_data()
     if not STATE_PATH.exists():
         return AppConfig()
 
@@ -503,4 +703,5 @@ def save_config(config: AppConfig, state_path: Path = STATE_PATH) -> None:
         "repos": [asdict(repo) for repo in config.repos],
         "entries": [asdict(entry) for entry in config.entries],
     }
+    state_path.parent.mkdir(parents=True, exist_ok=True)
     state_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")

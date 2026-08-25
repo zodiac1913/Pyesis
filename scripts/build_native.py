@@ -40,7 +40,7 @@ def build_with_pyinstaller(current_platform: str) -> Path:
     if current_platform == "windows":
         command.extend(["--onefile", "--windowed", "--icon", "assets/pyesis.ico"])
     elif current_platform == "macos":
-        command.extend(["--windowed", "main.py"])
+        command.extend(["--windowed", "--icon", "assets/pyesis.icns", "main.py"])
         subprocess.run(command, cwd=ROOT, check=True)
         return DIST_DIR / f"{APP_NAME}.app"
     else:

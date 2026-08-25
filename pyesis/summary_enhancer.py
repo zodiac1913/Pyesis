@@ -344,7 +344,16 @@ def _is_current_week_timestamp(timestamp: str, active_week_start: datetime) -> b
 
 
 def _is_current_week_entry(entry: EntryRecord, active_week_start: datetime) -> bool:
-    return entry.week_start_iso.strip() == active_week_start.isoformat()
+    stored_week_start = _parse_iso(entry.week_start_iso)
+    if stored_week_start is not None:
+        return stored_week_start == active_week_start
+
+    created_at = _parse_iso(entry.created_at)
+    if created_at is None:
+        return False
+
+    week_end = active_week_start + timedelta(days=7)
+    return active_week_start <= created_at < week_end
 
 
 def _eligible_state_entry(
@@ -424,10 +433,6 @@ def _eligible_buffer_item(
 def _should_run_now(config: AppConfig, current_time: datetime) -> tuple[bool, datetime | None, str]:
     if not config.summary_enhancer_enabled:
         return False, None, "Enhancer skipped: disabled"
-
-    active_week_start = _active_week_start(config.week_end_day, current_time)
-    if _is_week_frozen(config, current_time, active_week_start):
-        return False, None, "Enhancer skipped: active week frozen after export cutoff"
 
     interval_minutes = max(1, int(config.summary_enhancer_interval_minutes))
     last_run = _parse_iso(config.summary_enhancer_last_run_at)

@@ -38,6 +38,7 @@ from pyesis.ai_summary import (
     build_summary,
 )
 from pyesis.config import (
+    AI_ATTEMPT_LOG_PATH,
     AppConfig,
     EntryRecord,
     GITHUB_GPT_DEFAULT_MODELS,
@@ -81,8 +82,9 @@ DEFAULT_OLLAMA_SUMMARY_MODEL = "qwen3-coder:30b"
 OLLAMA_IDLE_STATUS = "[IDLE] Ollama has no active description job"
 POLL_REWRITE_LIMIT = 8
 BACKLOG_POLL_SECONDS = 15
-AI_ATTEMPT_LOG_PATH = Path("logs") / "ai_attempts.jsonl"
 HUMAN_SUMMARY_AUTHORS = {"human", "manual", "user"}
+OLLAMA_ALERT_ON_MS = 5_000
+OLLAMA_ALERT_OFF_MS = 15_000
 STRUCTURED_SUMMARY_LABELS = ("who:", "what:", "where:", "when:", "why:", "how:", "description:")
 ADDITIONS_TOKEN = " additions"
 REMOVALS_TOKEN = " removals"
@@ -225,8 +227,10 @@ class PyesisApp:
         self._icon_image: tk.PhotoImage | None = None
         self._editor_bg_image: tk.PhotoImage | None = None
         self._editor_bg_canvas: tk.Canvas | None = None
+        self._ollama_alert_visible = False
+        self._ollama_alert_cycle_id = 0
         self._set_windows_app_id()
-        self.root.title(self._window_title())
+        self._refresh_window_title()
         self._set_initial_window_size()
         self._apply_window_icon()
         self.config = load_config()
@@ -675,7 +679,13 @@ class PyesisApp:
         return roots
 
     def _window_title(self) -> str:
-        return f"Pyesis v{self._app_version()}"
+        base_title = f"Pyesis v{self._app_version()}"
+        if getattr(self, "_ollama_alert_visible", False):
+            return f"[OLLAMA DOWN] {base_title}"
+        return base_title
+
+    def _refresh_window_title(self) -> None:
+        self.root.title(self._window_title())
 
     def _app_version(self) -> str:
         version_file_names = ("pyproject.toml",)
@@ -1384,6 +1394,16 @@ class PyesisApp:
             return False
         return self._needs_manual_summary_refresh(entry) or _is_low_quality_summary_text(summary_text)
 
+    def _is_visible_heuristic_entry(self, entry: EntryRecord) -> bool:
+        if entry.summary_warning.strip():
+            return False
+        summary_source = (entry.summary_source or "").strip().lower()
+        if summary_source and summary_source != HEURISTIC_MODE:
+            return False
+        if not summary_source and entry.author.strip().lower() in HUMAN_SUMMARY_AUTHORS:
+            return False
+        return self._summary_needs_rewrite(entry)
+
     def _is_refreshable_current_week_summary(self, entry: EntryRecord) -> bool:
         if not self._is_current_week_entry(entry):
             return False
@@ -1566,6 +1586,7 @@ class PyesisApp:
         self._ai_last_warning = ""
         self._ai_status_severity = self._initial_ai_status_severity()
         self.ai_status_var.set(self._initial_ai_status_text())
+        self._sync_ollama_alert_state()
         self.high_contrast_var.set(settings.high_contrast_enabled)
         self.ui_font_size_var.set(max(10, min(20, settings.ui_font_size)))
         self._apply_fonts()
@@ -2089,7 +2110,7 @@ class PyesisApp:
         webbrowser.open(temp_path.as_uri())
 
     def _ai_attempt_log_path(self) -> Path:
-        return Path.cwd() / AI_ATTEMPT_LOG_PATH
+        return AI_ATTEMPT_LOG_PATH
 
     def _load_ai_attempt_log_items(self, limit: int = AI_ATTEMPT_LOG_VIEW_LIMIT) -> list[dict[str, object]]:
         log_path = self._ai_attempt_log_path()
@@ -2338,6 +2359,8 @@ class PyesisApp:
 
     def _apply_theme(self) -> None:
         palette = self._palette_for(self._resolve_theme(), self.high_contrast_var.get())
+        if getattr(self, "_ollama_alert_visible", False):
+            palette = self._alert_palette(palette)
 
         self.root.configure(bg=palette["bg"])
         self.style.configure(".", background=palette["bg"], foreground=palette["fg"])
@@ -2418,6 +2441,23 @@ class PyesisApp:
         self.editor.tag_configure("empty-week-note", foreground=palette["muted_fg"])
         if self._editor_bg_canvas is not None:
             self._editor_bg_canvas.configure(bg=palette["surface"])
+
+    def _alert_palette(self, base_palette: dict[str, str]) -> dict[str, str]:
+        palette = dict(base_palette)
+        palette.update(
+            {
+                "bg": "#7f1d1d",
+                "surface": "#991b1b",
+                "surface_alt": "#b91c1c",
+                "input_bg": "#7f1d1d",
+                "muted_fg": "#fee2e2",
+                "accent": "#ef4444",
+                "accent_fg": "#ffffff",
+                "border": "#fecaca",
+                "failed_fg": "#ffffff",
+            }
+        )
+        return palette
 
     def _palette_for(self, resolved_theme: str, high_contrast: bool) -> dict[str, str]:
         if high_contrast:
@@ -2702,7 +2742,9 @@ class PyesisApp:
             return ("ai-failed",)
         if self._is_trusted_ai_entry(entry):
             return ()
-        return ("heuristic",)
+        if self._is_visible_heuristic_entry(entry):
+            return ("heuristic",)
+        return ()
 
     def _entry_warning_comment(self, entry: EntryRecord) -> str:
         warning = re.sub(r"\s+", " ", entry.summary_warning.strip())
@@ -2741,9 +2783,7 @@ class PyesisApp:
     def _current_week_heuristic_entry_count(self) -> int:
         count = 0
         for entry in self.config.entries:
-            if (entry.summary_source or "").strip().lower() != HEURISTIC_MODE:
-                continue
-            if self._is_current_week_entry(entry):
+            if self._is_current_week_entry(entry) and self._is_visible_heuristic_entry(entry):
                 count += 1
         return count
 
@@ -2818,12 +2858,11 @@ class PyesisApp:
 
     def _has_current_week_heuristic_backlog(self) -> bool:
         for entry in self.config.entries:
-            if (entry.summary_source or "").strip().lower() != HEURISTIC_MODE:
-                continue
-            if self._is_current_week_entry(entry):
+            if self._is_current_week_entry(entry) and self._is_visible_heuristic_entry(entry):
                 return True
         return any(
             str(item.get("summarySource", "")).strip().lower() == HEURISTIC_MODE
+            and _is_low_quality_summary_text(str(item.get("gitDiffDescription", "")).strip())
             for item in self._iter_current_week_buffer_items()
         )
 
@@ -2981,6 +3020,7 @@ class PyesisApp:
             if not self._ai_backend_unavailable or warning != self._ai_last_warning:
                 self._ai_backend_unavailable = True
                 self._ai_last_warning = warning
+                self._sync_ollama_alert_state()
             return
 
         if self._ai_backend_unavailable and summary.source != HEURISTIC_MODE:
@@ -2989,6 +3029,7 @@ class PyesisApp:
             self._ai_status_severity = "ok"
             provider = self._ai_provider_label(summary.source)
             self.ai_status_var.set(f"[OK] Healthy: {provider} summaries active")
+            self._sync_ollama_alert_state()
             self._apply_theme()
             self.status_var.set(f"AI recovered for {repo_label}; resumed {provider} summaries")
             return
@@ -2997,6 +3038,47 @@ class PyesisApp:
             self._ai_status_severity = "ok"
             self.ai_status_var.set(f"[OK] Healthy: {self._ai_provider_label(summary.source)} summaries active")
             self._apply_theme()
+
+    def _should_flash_ollama_alert(self) -> bool:
+        return self._ai_backend_unavailable and self._current_ai_mode() == OLLAMA_MODE
+
+    def _sync_ollama_alert_state(self) -> None:
+        if not self._should_flash_ollama_alert():
+            self._ollama_alert_cycle_id += 1
+            self._set_ollama_alert_visible(False)
+            return
+
+        if self._ollama_alert_visible:
+            return
+
+        self._ollama_alert_cycle_id += 1
+        cycle_id = self._ollama_alert_cycle_id
+        self._set_ollama_alert_visible(True)
+        self.root.after(OLLAMA_ALERT_ON_MS, lambda cid=cycle_id: self._advance_ollama_alert_pulse(cid))
+
+    def _advance_ollama_alert_pulse(self, cycle_id: int) -> None:
+        if cycle_id != self._ollama_alert_cycle_id or not self._should_flash_ollama_alert():
+            return
+
+        next_visible = not self._ollama_alert_visible
+        self._set_ollama_alert_visible(next_visible)
+        delay_ms = OLLAMA_ALERT_ON_MS if next_visible else OLLAMA_ALERT_OFF_MS
+        self.root.after(delay_ms, lambda cid=cycle_id: self._advance_ollama_alert_pulse(cid))
+
+    def _set_ollama_alert_visible(self, visible: bool) -> None:
+        if self._ollama_alert_visible == visible:
+            return
+        self._ollama_alert_visible = visible
+        self._refresh_window_title()
+        if visible:
+            self._request_window_attention()
+        self._apply_theme()
+
+    def _request_window_attention(self) -> None:
+        try:
+            self.root.bell()
+        except Exception:
+            pass
 
     def _build_entry(
         self,
@@ -3472,6 +3554,7 @@ class PyesisApp:
                 self._ai_last_warning = ""
                 self._ai_status_severity = "ok"
                 self.ai_status_var.set(f"[OK] Healthy: {provider} summaries active")
+                self._sync_ollama_alert_state()
                 self._apply_theme()
 
         self._start_ai_recovery_probe_if_needed()
@@ -3528,6 +3611,7 @@ class PyesisApp:
         self._ai_last_warning = ""
         self._ai_status_severity = "ok"
         self.ai_status_var.set(f"[OK] Healthy: {provider} reachable; retrying summaries")
+        self._sync_ollama_alert_state()
         self._apply_theme()
         if message:
             self.status_var.set(message)
@@ -3695,7 +3779,8 @@ class PyesisApp:
             return
 
         week_start = self._active_week_start()
-        default_name = f"pyesis_week_{week_start.strftime('%Y-%m-%d')}.json"
+        week_end = week_start + timedelta(days=6)
+        default_name = f"pyesis_week_{week_start.strftime('%Y-%m-%d')}to{week_end.strftime('%d')}.json"
         export_dir = self._docx_output_dir()
         export_dir.mkdir(parents=True, exist_ok=True)
 

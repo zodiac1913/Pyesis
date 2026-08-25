@@ -338,19 +338,35 @@ class SummaryEnhancerTests(unittest.TestCase):
         self.assertEqual(report.rewritten_state, 0)
         self.assertEqual(config.entries[0].rewritten_at, "")
 
-    def test_week_freezes_after_export_cutoff(self) -> None:
+    def test_current_week_rewrites_continue_after_export_cutoff(self) -> None:
         config = self._base_config()
         config.summary_enhancer_dry_run = False
         config.week_end_day = "Thursday"
         config.auto_export_time = "14:28"
+        config.entries = [
+            EntryRecord(
+                repo_label="RepoAfterCutoff",
+                repo_path="repos/repo-after-cutoff",
+                created_at="2026-06-15T09:00:00",
+                day_name="Monday",
+                week_start_iso="2026-06-12T00:00:00",
+                summary="refined logic",
+                diff_hash="after-cutoff-hash",
+                diff_excerpt="diff --git a/after.py b/after.py\n+++ b/after.py\n@@ -0,0 +1 @@\n+print('after cutoff')\n",
+                summary_source="heuristic",
+                author="Backup",
+            )
+        ]
 
         report = run_periodic_enhancer(
             config,
-            summary_builder=lambda _repo, _diff, _path: "Strong rewrite",
+            summary_builder=lambda _repo, _diff, _path: "I documented the after-cutoff cleanup path with a concrete print-based rewrite.",
             now=datetime(2026, 6, 18, 14, 29, 0),
         )
 
-        self.assertFalse(report.ran)
+        self.assertTrue(report.ran)
+        self.assertEqual(report.rewritten_state, 1)
+        self.assertIn("after-cutoff cleanup path", config.entries[0].summary)
 
     def test_thursday_week_boundary_keeps_current_week_oranges_eligible(self) -> None:
         config = self._base_config()
@@ -380,6 +396,41 @@ class SummaryEnhancerTests(unittest.TestCase):
                 requested_source="ollama",
             ),
             now=datetime(2026, 8, 4, 6, 5, 27),
+        )
+
+        self.assertTrue(report.ran)
+        self.assertEqual(report.rewritten_state, 1)
+        self.assertEqual(config.entries[0].summary_source, "ollama")
+        self.assertEqual(config.entries[0].author, "AI")
+
+    def test_blank_week_start_current_week_entry_is_still_rewritten(self) -> None:
+        config = self._base_config()
+        config.summary_enhancer_dry_run = False
+        config.week_end_day = "Thursday"
+        config.ai_mode = "ollama"
+        config.entries = [
+            EntryRecord(
+                repo_label="Cats",
+                repo_path="/tmp/cats",
+                created_at="2026-08-04T07:55:27",
+                day_name="Tuesday",
+                week_start_iso="",
+                summary="I added searchLabelAttribute in wwwroot/js/global/SML/Form/smlAutoComplete.js.",
+                diff_hash="blank-week-start-orange",
+                diff_excerpt="diff --git a/wwwroot/js/global/SML/Form/smlAutoComplete.js b/wwwroot/js/global/SML/Form/smlAutoComplete.js\n+++ b/wwwroot/js/global/SML/Form/smlAutoComplete.js\n@@ -1 +1 @@\n+const searchLabelAttribute = `aria-label=\"Search\"`;\n",
+                summary_source="heuristic",
+                author="Backup",
+            )
+        ]
+
+        report = run_periodic_enhancer(
+            config,
+            summary_builder=lambda _repo, _diff, _path: AISummaryResult(
+                text="I changed the standalone autocomplete label path so lone-mode search always emits a direct aria-label.",
+                source="ollama",
+                requested_source="ollama",
+            ),
+            now=datetime(2026, 8, 5, 6, 5, 27),
         )
 
         self.assertTrue(report.ran)

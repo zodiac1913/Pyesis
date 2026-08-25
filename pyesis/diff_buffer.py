@@ -3,11 +3,9 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 import hashlib
 import json
-from pathlib import Path
 from typing import TypedDict
 
-
-BUFFER_DIR = Path("diff_buffers")
+from pyesis.config import BUFFER_DIR
 
 
 class DiffLedgerItem(TypedDict):
