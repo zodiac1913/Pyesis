@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import patch
 import threading
@@ -35,6 +36,9 @@ class DummyRoot:
     def after(self, delay_ms: int, callback) -> None:
         self.after_calls.append((delay_ms, callback))
 
+    def update_idletasks(self) -> None:
+        return None
+
     def title(self, value: str) -> None:
         self.title_text = value
 
@@ -58,6 +62,8 @@ class DummyEditor:
     def __init__(self) -> None:
         self.ops: list[tuple[str, str, tuple[str, ...] | None]] = []
         self.scroll_position = 0.0
+        self.cursor = "xterm"
+        self.tag_name_lookup: dict[str, tuple[str, ...]] = {}
 
     def delete(self, start: str, end: str) -> None:
         self.ops.append(("delete", "", None))
@@ -80,6 +86,22 @@ class DummyEditor:
     def yview_moveto(self, fraction: float) -> None:
         self.scroll_position = fraction
 
+    def configure(self, **kwargs) -> None:
+        if "cursor" in kwargs:
+            self.cursor = kwargs["cursor"]
+
+    def tag_configure(self, _tag: str, **_kwargs) -> None:
+        return None
+
+    def tag_bind(self, _tag: str, _sequence: str, _callback) -> None:
+        return None
+
+    def index(self, _index: str) -> str:
+        return "1.0"
+
+    def tag_names(self, index: str) -> tuple[str, ...]:
+        return self.tag_name_lookup.get(index, ())
+
     def contents(self) -> str:
         return "".join(text for op, text, _tags in self.ops if op == "insert")
 
@@ -88,12 +110,15 @@ class DummyButton:
     def __init__(self) -> None:
         self.text = ""
         self.command = None
+        self.state = "normal"
 
     def configure(self, **kwargs) -> None:
         if "text" in kwargs:
             self.text = kwargs["text"]
         if "command" in kwargs:
             self.command = kwargs["command"]
+        if "state" in kwargs:
+            self.state = kwargs["state"]
 
 
 class ImmediateThread:
@@ -114,6 +139,7 @@ class ImmediateThread:
 class AppSummaryProtectionTests(unittest.TestCase):
     def _make_app(self) -> PyesisApp:
         app = PyesisApp.__new__(PyesisApp)
+        app.root = DummyRoot()
         app.config = AppConfig(entries=[])
         app.week_end_var = DummyVar(app.config.week_end_day)
         app.status_var = DummyVar()
@@ -137,6 +163,17 @@ class AppSummaryProtectionTests(unittest.TestCase):
         app._ollama_alert_visible = False
         app._ollama_alert_cycle_id = 0
         app.ollama_activity_var = DummyVar()
+        app.export_week_json_button = DummyButton()
+        app.import_week_json_button = DummyButton()
+        app.ai_weekly_button = DummyButton()
+        app.settings_button = DummyButton()
+        app.startup_message_var = DummyVar()
+        app.ai_status_var = DummyVar()
+        app.theme_mode_var = DummyVar(app.config.theme_mode.capitalize())
+        app.high_contrast_var = DummyVar(app.config.high_contrast)
+        app.ui_font_size_var = DummyVar(app.config.ui_font_size)
+        app._startup_loading = False
+        app._file_task_in_flight = False
         app._refresh_editor = lambda: None
         return app
 
@@ -157,6 +194,267 @@ class AppSummaryProtectionTests(unittest.TestCase):
         self.assertEqual(app.status_var.get(), "Exported weekly_changes_20260702_120000.docx")
         self.assertEqual(opened, [Path("/tmp/pyesis-docx/weekly_changes_20260702_120000.docx")])
         self.assertTrue(mock_info.called)
+
+    def test_export_week_json_uses_pyesis_date_filename(self) -> None:
+        app = self._make_app()
+        app._docx_output_dir = lambda: Path("/tmp/pyesis-json")
+        app._active_week_start = lambda: datetime(2026, 8, 20, 0, 0, 0)
+        entry = EntryRecord(
+            repo_label="Pyesis",
+            repo_path="/tmp/pyesis",
+            created_at="2026-08-24T10:05:00",
+            day_name="Monday",
+            week_start_iso="2026-08-20T00:00:00",
+            summary="I added strict JSON output guidance in pyesis/ai_summary.py.",
+            diff_hash="weekly-json",
+            diff_excerpt="diff --git a/pyesis/ai_summary.py b/pyesis/ai_summary.py\n+++ b/pyesis/ai_summary.py\n",
+            summary_source="ollama",
+            author="AI",
+        )
+        app.config.entries = [entry]
+        app._is_current_week_entry = lambda current: current is entry
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            target = Path(tmp_dir) / "chosen.json"
+
+            with patch("pyesis.app.datetime") as mock_datetime, patch("pyesis.app.filedialog.asksaveasfilename", return_value=str(target)) as mock_save, patch(
+                "pyesis.app.messagebox.showinfo"
+            ):
+                mock_datetime.now.return_value = datetime(2026, 8, 26, 19, 15, 0)
+                mock_datetime.side_effect = lambda *args, **kwargs: datetime(*args, **kwargs)
+                app._export_week_json()
+
+            self.assertEqual(mock_save.call_args.kwargs["initialfile"], "Pyesis20260826.json")
+            self.assertTrue(target.exists())
+
+    def test_export_week_json_disables_long_process_buttons_while_running(self) -> None:
+        app = self._make_app()
+        app._docx_output_dir = lambda: Path("/tmp/pyesis-json")
+        app._active_week_start = lambda: datetime(2026, 8, 20, 0, 0, 0)
+        entry = EntryRecord(
+            repo_label="Pyesis",
+            repo_path="/tmp/pyesis",
+            created_at="2026-08-24T10:05:00",
+            day_name="Monday",
+            week_start_iso="2026-08-20T00:00:00",
+            summary="I added strict JSON output guidance in pyesis/ai_summary.py.",
+            diff_hash="weekly-json-busy",
+            diff_excerpt="diff --git a/pyesis/ai_summary.py b/pyesis/ai_summary.py\n+++ b/pyesis/ai_summary.py\n",
+            summary_source="ollama",
+            author="AI",
+        )
+        app.config.entries = [entry]
+        app._is_current_week_entry = lambda current: current is entry
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            target = Path(tmp_dir) / "chosen.json"
+
+            def fake_save_dialog(**_kwargs):
+                self.assertEqual(app.export_week_json_button.state, "disabled")
+                self.assertEqual(app.import_week_json_button.state, "disabled")
+                self.assertEqual(app.ai_weekly_button.state, "disabled")
+                self.assertEqual(app.export_week_json_button.text, "Saving Week JSON...")
+                return str(target)
+
+            with patch("pyesis.app.filedialog.asksaveasfilename", side_effect=fake_save_dialog), patch("pyesis.app.messagebox.showinfo"):
+                app._export_week_json()
+
+        self.assertEqual(app.export_week_json_button.state, "normal")
+        self.assertEqual(app.import_week_json_button.state, "normal")
+        self.assertEqual(app.ai_weekly_button.state, "normal")
+        self.assertEqual(app.export_week_json_button.text, "Export Week JSON")
+
+    def test_normalize_entry_calendar_fields_preserves_summary_metadata(self) -> None:
+        app = self._make_app()
+        app._week_start_for_datetime = lambda _moment: datetime(2026, 8, 21, 0, 0, 0)
+        entry = EntryRecord(
+            repo_label="RustyPythia",
+            repo_path="/tmp/rusty",
+            created_at="2026-08-24T05:42:26",
+            day_name="Sunday",
+            week_start_iso="2026-08-14T00:00:00",
+            summary="I updated index.html.",
+            diff_hash="hash-1",
+            diff_excerpt="diff --git a/index.html b/index.html\n+++ b/index.html\n",
+            summary_source="ollama",
+            author="AI",
+            requested_summary_source="ollama",
+            summary_warning="",
+            fallback_summary_source="heuristic",
+            summary_timing_ms=4498,
+            summary_provider_details="qwen2.5-coder:latest",
+            last_ai_attempt_at="2026-08-24T06:02:31",
+        )
+
+        normalized = app._normalize_entry_calendar_fields([entry])
+
+        self.assertEqual(len(normalized), 1)
+        self.assertEqual(normalized[0].day_name, "Monday")
+        self.assertEqual(normalized[0].week_start_iso, "2026-08-21T00:00:00")
+        self.assertEqual(normalized[0].summary_provider_details, "qwen2.5-coder:latest")
+        self.assertEqual(normalized[0].summary_timing_ms, 4498)
+        self.assertEqual(normalized[0].requested_summary_source, "ollama")
+        self.assertEqual(normalized[0].fallback_summary_source, "heuristic")
+        self.assertEqual(normalized[0].last_ai_attempt_at, "2026-08-24T06:02:31")
+
+    def test_migrate_entries_skips_save_when_entries_are_already_normalized(self) -> None:
+        app = self._make_app()
+        app._week_start_for_datetime = lambda _moment: datetime(2026, 8, 21, 0, 0, 0)
+        app.config.entries = [
+            EntryRecord(
+                repo_label="RustyPythia",
+                repo_path="/tmp/rusty",
+                created_at="2026-08-24T05:42:26",
+                day_name="Monday",
+                week_start_iso="2026-08-21T00:00:00",
+                summary="I updated index.html.",
+                diff_hash="hash-1",
+                diff_excerpt="diff --git a/index.html b/index.html\n+++ b/index.html\n",
+                summary_source="ollama",
+                author="AI",
+            )
+        ]
+
+        with patch("pyesis.app.dedupe_entries") as mock_dedupe, patch("pyesis.app.save_config") as mock_save:
+            app._migrate_entries(allow_ai_rewrite=False)
+
+        mock_dedupe.assert_not_called()
+        mock_save.assert_not_called()
+
+    def test_complete_startup_config_load_refreshes_saved_state_before_recovery(self) -> None:
+        app = self._make_app()
+        app._startup_loading = True
+        repo_refreshes: list[str] = []
+        editor_refreshes: list[str] = []
+        startup_messages: list[str] = []
+        scheduled: list[tuple[int, object]] = []
+        app._apply_ai_environment_defaults = lambda: None
+        app._initial_ai_status_severity = lambda: "ok"
+        app._initial_ai_status_text = lambda: "[OK] Healthy"
+        app._apply_fonts = lambda: None
+        app._apply_theme = lambda: None
+        app._refresh_repo_list = lambda: repo_refreshes.append("repos")
+        app._refresh_editor = lambda: editor_refreshes.append("editor")
+        app._set_startup_loading_message = lambda message: startup_messages.append(message)
+        app.root.after = lambda delay, callback: scheduled.append((delay, callback))
+        loaded = AppConfig(
+            week_end_day="Friday",
+            theme_mode="dark",
+            high_contrast=True,
+            ui_font_size=15,
+            repos=[RepoConfig(path="/tmp/repo", label="Repo", poll_seconds=90)],
+        )
+
+        app._complete_startup_config_load(loaded)
+
+        self.assertIs(app.config, loaded)
+        self.assertEqual(app.week_end_var.get(), "Friday")
+        self.assertEqual(app.theme_mode_var.get(), "Dark")
+        self.assertTrue(app.high_contrast_var.get())
+        self.assertEqual(app.ui_font_size_var.get(), 15)
+        self.assertEqual(app.ai_status_var.get(), "[OK] Healthy")
+        self.assertEqual(repo_refreshes, ["repos"])
+        self.assertEqual(editor_refreshes, [])
+        self.assertEqual(startup_messages, ["Saved settings loaded. Finishing startup..."])
+        self.assertEqual(len(scheduled), 1)
+
+    def test_open_settings_blocks_while_startup_is_loading(self) -> None:
+        app = self._make_app()
+        app._startup_loading = True
+
+        with patch("pyesis.app.messagebox.showinfo") as mock_info:
+            app._open_settings()
+
+        mock_info.assert_called_once()
+
+    def test_import_week_json_disables_long_process_buttons_while_running(self) -> None:
+        app = self._make_app()
+        app._active_week_start = lambda: datetime(2026, 8, 20, 0, 0, 0)
+        app._persist = lambda: None
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            source = Path(tmp_dir) / "week.json"
+            payload = {
+                "pyesis_week_export": True,
+                "exported_at": "2026-08-26T19:15:00",
+                "week_start_iso": "2026-08-20T00:00:00",
+                "week_end_day": "Thursday",
+                "entries": [
+                    {
+                        "repo_label": "Pyesis",
+                        "repo_path": "/tmp/pyesis",
+                        "created_at": "2026-08-24T10:05:00",
+                        "day_name": "Monday",
+                        "week_start_iso": "2026-08-20T00:00:00",
+                        "summary": "I added strict JSON output guidance in pyesis/ai_summary.py.",
+                        "diff_hash": "weekly-import",
+                        "diff_excerpt": "diff --git a/pyesis/ai_summary.py b/pyesis/ai_summary.py\n+++ b/pyesis/ai_summary.py\n",
+                        "summary_source": "ollama",
+                        "author": "AI",
+                    }
+                ],
+            }
+            source.write_text(__import__("json").dumps(payload), encoding="utf-8")
+
+            def fake_open_dialog(**_kwargs):
+                self.assertEqual(app.export_week_json_button.state, "disabled")
+                self.assertEqual(app.import_week_json_button.state, "disabled")
+                self.assertEqual(app.ai_weekly_button.state, "disabled")
+                self.assertEqual(app.import_week_json_button.text, "Importing Week JSON...")
+                return str(source)
+
+            with patch("pyesis.app.filedialog.askopenfilename", side_effect=fake_open_dialog), patch("pyesis.app.messagebox.showinfo"):
+                app._import_week_json()
+
+        self.assertEqual(app.import_week_json_button.state, "normal")
+        self.assertEqual(app.import_week_json_button.text, "Import Week JSON")
+
+    def test_ai_weekly_report_disables_long_process_buttons_while_running(self) -> None:
+        app = self._make_app()
+        now = datetime(2026, 6, 29, 12, 0, 0)
+        entry = EntryRecord(
+            repo_label="Pyesis",
+            repo_path="/tmp/pyesis",
+            created_at="2026-06-29T10:05:00",
+            day_name="Monday",
+            week_start_iso="2026-06-26T00:00:00",
+            summary="I added strict JSON output guidance in pyesis/ai_summary.py.",
+            diff_hash="weekly-ai-busy",
+            diff_excerpt="diff --git a/pyesis/ai_summary.py b/pyesis/ai_summary.py\n+++ b/pyesis/ai_summary.py\n@@ -1 +1 @@\n+prompt\n",
+            summary_source="ollama",
+            author="AI",
+        )
+        app.config.entries = [entry]
+        app._apply_ai_environment_defaults = lambda: None
+        app._docx_output_dir = lambda: Path("/tmp/pyesis-docx")
+        app._open_created_document = lambda _target: None
+
+        def fake_build(_evidence_text, *, model_override=None):
+            self.assertEqual(app.export_week_json_button.state, "disabled")
+            self.assertEqual(app.import_week_json_button.state, "disabled")
+            self.assertEqual(app.ai_weekly_button.state, "disabled")
+            self.assertEqual(app.ai_weekly_button.text, "Generating AI Weekly...")
+            self.assertEqual(model_override, "qwen3-coder:30b")
+            return AIWeeklyReportResult(
+                text="Monday\nPyesis\nDetailed weekly report.",
+                timing_ms=1234,
+                provider_details="qwen3-coder:30b",
+            )
+
+        with patch("pyesis.app.render_weekly_evidence_text", return_value="Day: Monday\nRepo: Pyesis\n- Summary: Added prompt"), patch(
+            "pyesis.app.build_weekly_report",
+            side_effect=fake_build,
+        ), patch("pyesis.app.export_ai_weekly_report_docx", return_value=Path("/tmp/pyesis-docx/WhatIDidThisWeek20260826.docx")), patch(
+            "pyesis.app.messagebox.showinfo"
+        ), patch("pyesis.app.threading.Thread", ImmediateThread), patch("pyesis.app.datetime") as mock_datetime:
+            mock_datetime.now.return_value = now
+            mock_datetime.fromisoformat.side_effect = datetime.fromisoformat
+            app._open_ai_weekly_report()
+            self.assertEqual(app.root.after_calls[-1][0], 0)
+            app.root.after_calls[-1][1]()
+
+        self.assertEqual(app.ai_weekly_button.state, "normal")
+        self.assertEqual(app.ai_weekly_button.text, "AI Weekly")
 
     def test_ai_weekly_report_requires_current_week_entries(self) -> None:
         app = self._make_app()
@@ -186,6 +484,7 @@ class AppSummaryProtectionTests(unittest.TestCase):
     def test_ai_weekly_report_builds_from_current_week_evidence_and_opens_document(self) -> None:
         app = self._make_app()
         now = datetime(2026, 6, 29, 12, 0, 0)
+        app.config.ai_ollama_model = "qwen2.5-coder:latest"
         app.config.entries = [
             EntryRecord(
                 repo_label="Pyesis",
@@ -213,18 +512,21 @@ class AppSummaryProtectionTests(unittest.TestCase):
                 timing_ms=1234,
                 provider_details="qwen3-coder:30b",
             ),
-        ) as mock_build, patch("pyesis.app.export_ai_weekly_report_docx", return_value=Path("/tmp/pyesis-docx/weekly_ai_report_20260702.docx")) as mock_export, patch("pyesis.app.messagebox.showinfo") as mock_info, patch("pyesis.app.datetime") as mock_datetime:
+        ) as mock_build, patch("pyesis.app.export_ai_weekly_report_docx", return_value=Path("/tmp/pyesis-docx/WhatIDidThisWeek20260826.docx")) as mock_export, patch("pyesis.app.messagebox.showinfo") as mock_info, patch("pyesis.app.threading.Thread", ImmediateThread), patch("pyesis.app.datetime") as mock_datetime:
             mock_datetime.now.return_value = now
             mock_datetime.fromisoformat.side_effect = datetime.fromisoformat
             app._open_ai_weekly_report()
+            self.assertEqual(app.root.after_calls[-1][0], 0)
+            app.root.after_calls[-1][1]()
 
         self.assertIn("env", export_results)
         self.assertEqual(mock_build.call_args.args[0], "Day: Monday\nRepo: Pyesis\n- Summary: Added prompt")
+        self.assertEqual(mock_build.call_args.kwargs["model_override"], "qwen3-coder:30b")
         self.assertEqual(mock_export.call_args.args[0], "Monday\nPyesis\nDetailed weekly report.")
         self.assertEqual(mock_export.call_args.args[1], Path("/tmp/pyesis-docx"))
         self.assertEqual(mock_export.call_args.args[2], "2026-06-26T00:00:00")
-        self.assertEqual(app.status_var.get(), "AI weekly report exported to weekly_ai_report_20260702.docx")
-        self.assertEqual(opened, [Path("/tmp/pyesis-docx/weekly_ai_report_20260702.docx")])
+        self.assertEqual(app.status_var.get(), "AI weekly report exported to WhatIDidThisWeek20260826.docx")
+        self.assertEqual(opened, [Path("/tmp/pyesis-docx/WhatIDidThisWeek20260826.docx")])
         self.assertTrue(mock_info.called)
 
     def test_repo_action_button_shows_add_when_path_present_without_selection(self) -> None:
@@ -497,9 +799,9 @@ class AppSummaryProtectionTests(unittest.TestCase):
         self.assertTrue(gate("RepoA", "/tmp/repo-a"))
         self.assertFalse(gate("RepoA", "/tmp/repo-a"))
 
-    def test_poll_worker_skips_backlog_enhancer_when_poll_starts_clean(self) -> None:
+    def test_poll_worker_never_runs_backlog_enhancer(self) -> None:
         app = self._make_app()
-        app._has_current_week_ai_backlog = lambda: False
+        app._has_current_week_ai_backlog = lambda: True
         app._capture_repo_snapshot_change = lambda _repo, _snapshot: True
         enhancer_calls: list[object] = []
         app._run_poll_enhancer = lambda _gate: enhancer_calls.append(object()) or (object(), "")
@@ -514,11 +816,31 @@ class AppSummaryProtectionTests(unittest.TestCase):
         self.assertIsNone(app._poll_enhancement_report)
         self.assertEqual(app._poll_enhancement_error, "")
 
+    def test_capture_summary_uses_heuristic_without_calling_ai(self) -> None:
+        app = self._make_app()
+        app._buffer_day = "2026-08-26"
+        app._build_summary_heuristic = lambda *_args: "I captured the change without waiting for AI."
+        app._build_summary_with_current_provider = lambda *_args: self.fail("capture must not call the AI provider")
+        repo = RepoConfig(path="/tmp/repo-a", label="RepoA")
+
+        with patch("pyesis.app.find_item", return_value=None):
+            summary, shown, author, source, metadata = app._resolve_summary_from_ledger(
+                repo,
+                "diff --git a/a.py b/a.py\n+++ b/a.py\n+change\n",
+            )
+
+        self.assertEqual(summary, "I captured the change without waiting for AI.")
+        self.assertFalse(shown)
+        self.assertEqual(author, "Backup")
+        self.assertEqual(source, HEURISTIC_MODE)
+        self.assertEqual(metadata["requested_summary_source"], HEURISTIC_MODE)
+
     def test_periodic_summary_enhancer_runs_in_background_and_completes_on_ui_thread(self) -> None:
         app = self._make_app()
         app.root = DummyRoot()
         app.poll_summary_var = DummyVar()
         app._on_entry_rewrite_progress = lambda *_args: None
+        app._poll_activity_callback = lambda *_args: None
         update_calls: list[str] = []
         app._update_backlog_button = lambda: update_calls.append("button")
 
@@ -556,6 +878,29 @@ class AppSummaryProtectionTests(unittest.TestCase):
         self.assertFalse(app._enhancer_in_flight)
         self.assertIn("rewrote 1 entries", app.status_var.get())
         self.assertTrue(update_calls)
+
+    def test_successful_rewrite_immediately_queues_next_orange_item(self) -> None:
+        app = self._make_app()
+        app.root = DummyRoot()
+        app._current_ai_mode = lambda: OLLAMA_MODE
+        app._has_current_week_ai_backlog = lambda: True
+        app._run_idle_backlog_enhancer = lambda: None
+        report = type("Report", (), {"total_rewritten": 1, "total_failed_marked": 0})()
+
+        app._queue_next_backlog_rewrite(report)
+
+        self.assertEqual(app.root.after_calls, [(0, app._run_idle_backlog_enhancer)])
+
+    def test_no_progress_does_not_tightly_retry_orange_item(self) -> None:
+        app = self._make_app()
+        app.root = DummyRoot()
+        app._current_ai_mode = lambda: OLLAMA_MODE
+        app._has_current_week_ai_backlog = lambda: True
+        report = type("Report", (), {"total_rewritten": 0, "total_failed_marked": 0})()
+
+        app._queue_next_backlog_rewrite(report)
+
+        self.assertEqual(app.root.after_calls, [])
 
     def test_force_upgrade_backlog_disables_dry_run_before_running(self) -> None:
         app = self._make_app()
@@ -631,6 +976,59 @@ class AppSummaryProtectionTests(unittest.TestCase):
         self.assertNotIn("Showing your most recent captured week", rendered)
         self.assertNotIn("I fixed the previous week issue.", rendered)
 
+    def test_delete_entry_by_key_removes_entry_after_confirmation(self) -> None:
+        app = self._make_app()
+        app.editor = DummyEditor()
+        refresh_calls: list[str] = []
+        app._refresh_editor = lambda: refresh_calls.append("refresh")
+        entry = EntryRecord(
+            repo_label="Cats",
+            repo_path="/tmp/cats",
+            created_at="2026-08-31T07:52:11",
+            day_name="Monday",
+            week_start_iso="2026-08-28T00:00:00",
+            summary="I removed Infrastructure/Models/CatsCRUDL/ccQuery.cs.",
+            diff_hash="delete-hash",
+            diff_excerpt="diff --git a/Infrastructure/Models/CatsCRUDL/ccQuery.cs b/Infrastructure/Models/CatsCRUDL/ccQuery.cs\n+++ b/Infrastructure/Models/CatsCRUDL/ccQuery.cs\n",
+            summary_source="ollama",
+            author="AI",
+        )
+        app.config.entries = [entry]
+
+        with patch("pyesis.app.messagebox.askyesno", return_value=True) as mock_confirm, patch("pyesis.app.save_config") as mock_save:
+            deleted = app._delete_entry_by_key(app._entry_status_key(entry))
+
+        self.assertTrue(deleted)
+        self.assertEqual(app.config.entries, [])
+        self.assertEqual(refresh_calls, ["refresh"])
+        self.assertEqual(app.status_var.get(), "Deleted 1 entry for Cats")
+        self.assertTrue(mock_confirm.called)
+        self.assertTrue(mock_save.called)
+
+    def test_delete_entry_by_key_keeps_entry_when_confirmation_declined(self) -> None:
+        app = self._make_app()
+        entry = EntryRecord(
+            repo_label="Cats",
+            repo_path="/tmp/cats",
+            created_at="2026-08-31T07:52:11",
+            day_name="Monday",
+            week_start_iso="2026-08-28T00:00:00",
+            summary="I removed Infrastructure/Models/CatsCRUDL/ccQuery.cs.",
+            diff_hash="delete-hash-2",
+            diff_excerpt="diff --git a/Infrastructure/Models/CatsCRUDL/ccQuery.cs b/Infrastructure/Models/CatsCRUDL/ccQuery.cs\n+++ b/Infrastructure/Models/CatsCRUDL/ccQuery.cs\n",
+            summary_source="ollama",
+            author="AI",
+        )
+        app.config.entries = [entry]
+
+        with patch("pyesis.app.messagebox.askyesno", return_value=False) as mock_confirm, patch("pyesis.app.save_config") as mock_save:
+            deleted = app._delete_entry_by_key(app._entry_status_key(entry))
+
+        self.assertFalse(deleted)
+        self.assertEqual(app.config.entries, [entry])
+        self.assertTrue(mock_confirm.called)
+        self.assertFalse(mock_save.called)
+
     def test_entry_warning_comment_and_progress_tracking(self) -> None:
         app = self._make_app()
         app.root = DummyRoot()
@@ -664,6 +1062,28 @@ class AppSummaryProtectionTests(unittest.TestCase):
 
         self.assertIn(entry_key, app._active_ai_entry_keys)
         self.assertTrue(refresh_calls)
+
+    def test_failed_ai_fallback_renders_as_orange_retry_without_inline_error(self) -> None:
+        app = self._make_app()
+        entry = EntryRecord(
+            repo_label="Cats",
+            repo_path="/tmp/cats",
+            created_at="2026-08-31T09:00:55",
+            day_name="Sunday",
+            week_start_iso="2026-08-28T00:00:00",
+            summary="I added configuredReport in Controllers/Officials/CCXOController.cs.",
+            diff_hash="failed-gemma",
+            diff_excerpt="diff --git a/a.cs b/a.cs\n+++ b/a.cs\n+configuredReport\n",
+            summary_source="heuristic",
+            author="Backup",
+            requested_summary_source="ollama",
+            summary_warning="Ollama summary failed: malformed JSON",
+            fallback_summary_source="heuristic",
+        )
+
+        self.assertTrue(app._is_visible_heuristic_entry(entry))
+        self.assertEqual(app._entry_render_tags(entry), ("heuristic",))
+        self.assertEqual(app._entry_warning_comment(entry), "")
 
     def test_refresh_current_week_weak_summaries_rewrites_low_quality_ai_entry(self) -> None:
         app = self._make_app()

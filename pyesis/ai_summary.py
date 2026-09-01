@@ -140,7 +140,9 @@ AI_REPO_CONTEXT_LINES = 80
 AI_REPO_CONTEXT_CHAR_LIMIT = 7000
 REPO_CONTEXT_SUFFIXES = (".py", ".cs", ".js", ".ts", ".tsx", ".jsx", ".md", ".toml", ".json", ".yml", ".yaml")
 DEFAULT_OLLAMA_SUMMARY_MODEL = "qwen3-coder:30b"
-DEFAULT_OLLAMA_TIMEOUT_SECONDS = 180
+DEFAULT_OLLAMA_WEEKLY_REPORT_MODEL = DEFAULT_OLLAMA_SUMMARY_MODEL
+DEFAULT_OLLAMA_TIMEOUT_SECONDS = 0
+DEFAULT_OLLAMA_NUM_THREADS = 2
 JSON_CONTENT_TYPE = "application/json"
 HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 GOOD_WRITING_EXAMPLES = (
@@ -153,6 +155,23 @@ BAD_WRITING_EXAMPLES = (
     "In pyesis/app.py, I refined application flow to improve the user-facing app flow.",
     "I changed async flow.",
 )
+
+
+def _ollama_timeout_seconds() -> int | None:
+    raw_value = os.getenv("PYESIS_OLLAMA_TIMEOUT_SECONDS", str(DEFAULT_OLLAMA_TIMEOUT_SECONDS)).strip()
+    try:
+        timeout = int(raw_value or DEFAULT_OLLAMA_TIMEOUT_SECONDS)
+    except ValueError:
+        timeout = DEFAULT_OLLAMA_TIMEOUT_SECONDS
+    return timeout if timeout > 0 else None
+
+
+def _ollama_num_threads() -> int:
+    raw_value = os.getenv("PYESIS_OLLAMA_NUM_THREADS", str(DEFAULT_OLLAMA_NUM_THREADS)).strip()
+    try:
+        return max(1, int(raw_value or DEFAULT_OLLAMA_NUM_THREADS))
+    except ValueError:
+        return DEFAULT_OLLAMA_NUM_THREADS
 ACRONYM_TOKENS = {
     "ai",
     "api",
@@ -270,8 +289,8 @@ def _normalize_ai_mode(value: str) -> str:
     return HEURISTIC_MODE
 
 
-def build_weekly_report(evidence_text: str) -> AIWeeklyReportResult:
-    return _ollama_weekly_report(evidence_text)
+def build_weekly_report(evidence_text: str, model_override: str | None = None) -> AIWeeklyReportResult:
+    return _ollama_weekly_report(evidence_text, model_override=model_override)
 
 
 def _weekly_report_system_prompt() -> str:
@@ -304,17 +323,14 @@ def _build_weekly_report_user_prompt(evidence_text: str) -> str:
     )
 
 
-def _ollama_weekly_report(evidence_text: str) -> AIWeeklyReportResult:
-    if not evidence_text.strip():
-        raise RuntimeError("Missing weekly evidence")
-
-    url = os.getenv("PYESIS_OLLAMA_URL", "http://localhost:11434/api/chat").strip()
-    model = os.getenv("PYESIS_OLLAMA_MODEL", DEFAULT_OLLAMA_SUMMARY_MODEL).strip()
-    keep_alive = os.getenv("PYESIS_OLLAMA_KEEP_ALIVE", "5m").strip()
-    timeout = max(30, int(os.getenv("PYESIS_OLLAMA_TIMEOUT_SECONDS", str(DEFAULT_OLLAMA_TIMEOUT_SECONDS)) or DEFAULT_OLLAMA_TIMEOUT_SECONDS))
-    if not url or not model:
-        raise RuntimeError("Missing Ollama configuration")
-
+def _ollama_request_weekly_report(
+    evidence_text: str,
+    *,
+    url: str,
+    model: str,
+    keep_alive: str,
+    timeout: int | None,
+) -> AIWeeklyReportResult:
     payload = {
         "model": model,
         "messages": [
@@ -322,7 +338,7 @@ def _ollama_weekly_report(evidence_text: str) -> AIWeeklyReportResult:
             {"role": "user", "content": _build_weekly_report_user_prompt(evidence_text)},
         ],
         "stream": False,
-        "options": {"temperature": 0.2},
+        "options": {"temperature": 0.2, "num_thread": _ollama_num_threads()},
     }
     if keep_alive:
         payload["keep_alive"] = keep_alive
@@ -347,6 +363,37 @@ def _ollama_weekly_report(evidence_text: str) -> AIWeeklyReportResult:
         timing_ms=int(round((perf_counter() - started_at) * 1000)),
         provider_details=model,
     )
+
+
+def _ollama_weekly_report(evidence_text: str, model_override: str | None = None) -> AIWeeklyReportResult:
+    if not evidence_text.strip():
+        raise RuntimeError("Missing weekly evidence")
+
+    url = os.getenv("PYESIS_OLLAMA_URL", "http://localhost:11434/api/chat").strip()
+    model = (model_override or os.getenv("PYESIS_OLLAMA_MODEL", DEFAULT_OLLAMA_SUMMARY_MODEL)).strip()
+    keep_alive = os.getenv("PYESIS_OLLAMA_KEEP_ALIVE", "5m").strip()
+    timeout = _ollama_timeout_seconds()
+    if not url or not model:
+        raise RuntimeError("Missing Ollama configuration")
+
+    models = _ollama_model_candidates(model)
+    if not models:
+        raise RuntimeError("Missing Ollama model configuration")
+
+    errors: list[str] = []
+    for candidate in models:
+        try:
+            return _ollama_request_weekly_report(
+                evidence_text,
+                url=url,
+                model=candidate,
+                keep_alive=keep_alive,
+                timeout=timeout,
+            )
+        except Exception as exc:
+            errors.append(f"{candidate}: {exc}")
+
+    raise RuntimeError("; ".join(errors) if errors else "Ollama weekly report failed")
 
 
 def _ai_provider_label(mode: str) -> str:
@@ -1851,7 +1898,7 @@ def _chat_completions_structured_summary(
     url: str,
     model: str,
     api_key: str,
-    timeout: int,
+    timeout: int | None,
     missing_error: str,
 ) -> ProviderStructuredSummary:
     if not url or not model:
@@ -1942,7 +1989,7 @@ def _ollama_request_structured_summary(
     url: str,
     model: str,
     keep_alive: str,
-    timeout: int,
+    timeout: int | None,
 ) -> ProviderStructuredSummary:
     changes = _summary_relevant_changes(_coalesce_changes(summarize_file_changes(diff_text)))
 
@@ -1957,7 +2004,7 @@ def _ollama_request_structured_summary(
         ],
         "stream": False,
         "format": "json",
-        "options": {"temperature": 0},
+        "options": {"temperature": 0, "num_thread": _ollama_num_threads()},
     }
     if keep_alive:
         payload["keep_alive"] = keep_alive
@@ -1994,7 +2041,7 @@ def _ollama_structured_summary(repo_label: str, diff_text: str, repo_path: str |
     url = os.getenv("PYESIS_OLLAMA_URL", "http://localhost:11434/api/chat").strip()
     model = os.getenv("PYESIS_OLLAMA_MODEL", DEFAULT_OLLAMA_SUMMARY_MODEL).strip()
     keep_alive = os.getenv("PYESIS_OLLAMA_KEEP_ALIVE", "5m").strip()
-    timeout = max(30, int(os.getenv("PYESIS_OLLAMA_TIMEOUT_SECONDS", str(DEFAULT_OLLAMA_TIMEOUT_SECONDS)) or DEFAULT_OLLAMA_TIMEOUT_SECONDS))
+    timeout = _ollama_timeout_seconds()
     if not url or not model:
         raise RuntimeError("Missing Ollama configuration")
 

@@ -30,6 +30,7 @@ class SummaryEnhancerTests(unittest.TestCase):
 
     def _base_config(self) -> AppConfig:
         return AppConfig(
+            week_end_day="Sunday",
             ai_mode="heuristic",
             ai_fallback_enabled=True,
             summary_enhancer_enabled=True,
@@ -311,7 +312,7 @@ class SummaryEnhancerTests(unittest.TestCase):
             repo_path="repos/repo-forced",
             created_at="2026-06-16T09:00:00",
             day_name="Monday",
-            week_start_iso="2026-06-15T00:00:00",
+            week_start_iso="2026-06-12T00:00:00",
             summary="made updates",
             diff_hash="forceinterval",
             diff_excerpt="diff --git a/force.py b/force.py\n+++ b/force.py\n@@ -0,0 +1 @@\n+print('forced')\n",
@@ -1010,7 +1011,7 @@ class SummaryEnhancerTests(unittest.TestCase):
             repo_path="repos/repo-retry-ai",
             created_at="2026-06-16T09:10:00",
             day_name="Monday",
-            week_start_iso="2026-06-15T00:00:00",
+            week_start_iso="2026-06-12T00:00:00",
             summary="made updates",
             diff_hash="retry-ai-1",
             diff_excerpt="diff --git a/a.py b/a.py\n+++ b/a.py\n@@ -0,0 +1 @@\n+print('retry-ai')\n",
@@ -1055,7 +1056,7 @@ class SummaryEnhancerTests(unittest.TestCase):
         self.assertEqual(config.entries[0].rewritten_at, "")
         self.assertEqual(config.entries[0].requested_summary_source, "ollama")
         self.assertEqual(config.entries[0].fallback_summary_source, "heuristic")
-        self.assertIn("offline", config.entries[0].summary_warning)
+        self.assertEqual(config.entries[0].summary_warning, "")
         self.assertEqual(config.entries[0].last_ai_attempt_at, "2026-06-16T11:45:00")
 
         with patch("pyesis.summary_enhancer.build_summary") as second_attempt:
@@ -1066,7 +1067,7 @@ class SummaryEnhancerTests(unittest.TestCase):
             )
             second_report = run_periodic_enhancer(
                 config,
-                now=datetime(2026, 6, 16, 11, 47, 0),
+                now=datetime(2026, 6, 16, 11, 48, 0),
             )
 
         self.assertTrue(second_report.ran)
@@ -1116,6 +1117,41 @@ class SummaryEnhancerTests(unittest.TestCase):
         self.assertTrue(retry_attempt.called)
         self.assertEqual(config.entries[0].summary_source, "ollama")
         self.assertEqual(config.entries[0].author, "AI")
+
+    def test_old_failed_ai_upgrade_retries_after_cooldown(self) -> None:
+        entry = EntryRecord(
+            repo_label="RepoOldRed",
+            repo_path="repos/repo-old-red",
+            created_at="2026-06-16T09:00:00",
+            day_name="Monday",
+            week_start_iso="2026-06-12T00:00:00",
+            summary="made updates",
+            diff_hash="old-red-1",
+            diff_excerpt="diff --git a/a.py b/a.py\n+++ b/a.py\n@@ -0,0 +1 @@\n+print('retry-old-red')\n",
+            summary_source="heuristic",
+            author="Backup",
+            requested_summary_source="ollama",
+            summary_warning="Ollama summary failed: malformed JSON",
+            fallback_summary_source="heuristic",
+            last_ai_attempt_at="2026-06-16T09:05:00",
+        )
+        config = self._base_config()
+        config.summary_enhancer_dry_run = False
+        config.ai_mode = "ollama"
+        config.ai_ollama_model = "gemma4:latest"
+        config.entries = [entry]
+
+        with patch("pyesis.summary_enhancer.build_summary") as retry_attempt:
+            retry_attempt.return_value = AISummaryResult(
+                text="I retried the older malformed response and produced a valid Gemma description.",
+                source="ollama",
+                requested_source="ollama",
+            )
+            report = run_periodic_enhancer(config, now=datetime(2026, 6, 16, 11, 30, 0))
+
+        self.assertEqual(report.rewritten_state, 1)
+        self.assertTrue(retry_attempt.called)
+        self.assertEqual(config.entries[0].summary_warning, "")
 
     def test_force_run_retries_failed_ai_upgrade_after_metadata_stamp(self) -> None:
         entry = EntryRecord(

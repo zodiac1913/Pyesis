@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from html import escape
@@ -29,6 +29,7 @@ from pyesis.ai_summary import (
     AI_PROVIDER_LABELS,
     AISummaryResult,
     AIWeeklyReportResult,
+    DEFAULT_OLLAMA_WEEKLY_REPORT_MODEL,
     GITHUB_GPT_MODE,
     HEURISTIC_MODE,
     OLLAMA_MODE,
@@ -48,6 +49,7 @@ from pyesis.config import (
     dedupe_entries,
     default_export_directory,
     load_config,
+    load_startup_config_snapshot,
     save_config,
 )
 from pyesis.diff_buffer import BUFFER_DIR, find_item, list_buffer_day_keys, load_buffer_items, mark_as_shown, purge_old_daily_buffers, remember_diff
@@ -94,6 +96,10 @@ LISTBOX_SELECT_EVENT = "<<ListboxSelect>>"
 AGING_ACTION_BUTTON_STYLE = "AgingAction.TButton"
 IMPORT_WEEK_FAILED_TITLE = "Import failed"
 AI_WEEKLY_REPORT_TITLE = "AI Weekly Report"
+EXPORT_WEEK_JSON_BUTTON_TEXT = "Export Week JSON"
+IMPORT_WEEK_JSON_BUTTON_TEXT = "Import Week JSON"
+AI_WEEKLY_BUTTON_TEXT = "AI Weekly"
+ENTRY_DELETE_TAG = "entry-delete"
 
 
 def _ollama_tags_url(base_url: str) -> str:
@@ -137,6 +143,7 @@ class SettingsValues:
     ai_ollama_model: str
     ai_ollama_keep_alive: str
     ai_ollama_timeout_seconds: int
+    ai_ollama_num_threads: int
     ai_openai_url: str
     ai_openai_model: str
     github_auth_mode: str
@@ -161,6 +168,7 @@ class SettingsDialogState:
     ollama_model_var: tk.StringVar
     ollama_keep_alive_var: tk.StringVar
     ollama_timeout_var: tk.IntVar
+    ollama_num_threads_var: tk.DoubleVar
     openai_url_var: tk.StringVar
     openai_model_var: tk.StringVar
     github_auth_mode_var: tk.StringVar
@@ -233,13 +241,14 @@ class PyesisApp:
         self._refresh_window_title()
         self._set_initial_window_size()
         self._apply_window_icon()
-        self.config = load_config()
+        self.config = load_startup_config_snapshot()
         self._apply_ai_environment_defaults()
-        self.status_var = tk.StringVar(value="Idle")
+        self.status_var = tk.StringVar(value="Loading saved data...")
         self._ai_status_severity = self._initial_ai_status_severity()
         self.ai_status_var = tk.StringVar(value=self._initial_ai_status_text())
         self.ollama_activity_var = tk.StringVar(value=OLLAMA_IDLE_STATUS)
         self.poll_summary_var = tk.StringVar(value="Last poll summary will appear here")
+        self.startup_message_var = tk.StringVar(value="Opening window...")
         self.week_end_var = tk.StringVar(value=self.config.week_end_day)
         self.theme_mode_var = tk.StringVar(value=self.config.theme_mode.capitalize())
         self.high_contrast_var = tk.BooleanVar(value=self.config.high_contrast)
@@ -256,8 +265,22 @@ class PyesisApp:
         self.backlog_button_var = tk.StringVar(value="Upgrade Oranges")
         self.summary_refresh_button: ttk.Button | None = None
         self.summary_refresh_button_var = tk.StringVar(value="Refresh Weak")
+        self.export_week_json_button: ttk.Button | None = None
+        self.import_week_json_button: ttk.Button | None = None
+        self.ai_weekly_button: ttk.Button | None = None
+        self.settings_button: ttk.Button | None = None
+        self.startup_progress: ttk.Progressbar | None = None
+        self.startup_status_label: ttk.Label | None = None
         self.settings_backlog_button: ttk.Button | None = None
         self.settings_summary_refresh_button: ttk.Button | None = None
+        self._startup_loading = True
+        self._startup_thread: threading.Thread | None = None
+        self._startup_finalize_thread: threading.Thread | None = None
+        self._startup_recovery_items: list[dict[str, object]] = []
+        self._startup_recovery_index = 0
+        self._startup_recovery_recovered = 0
+        self._startup_recovery_known_duplicates: set[tuple[str, str, str, str, str]] = set()
+        self._file_task_in_flight = False
         self._poll_in_flight = False
         self._poll_thread: threading.Thread | None = None
         self._poll_results: list[SnapshotCaptureResult] = []
@@ -266,14 +289,13 @@ class PyesisApp:
         self._poll_enhancement_report = None
         self._poll_enhancement_error = ""
         self._active_ai_entry_keys: set[str] = set()
-        self._ai_working_pulse_on = False
-        self._ai_working_pulse_scheduled = False
         self._enhancer_in_flight = False
         self._ai_backend_unavailable = False
         self._ai_recovery_probe_in_flight = False
         self._ai_last_warning = ""
         self._last_rendered_week_start_iso = ""
         self._editor_scroll_initialized = False
+        self._editor_delete_tag_map: dict[str, str] = {}
         self._buffer_day = datetime.now().strftime("%Y-%m-%d")
         purge_old_daily_buffers(7, self._buffer_day)
         self.style = ttk.Style(self.root)
@@ -284,13 +306,10 @@ class PyesisApp:
         self._bind_shortcuts()
         self._apply_fonts()
         self._apply_theme()
-        self._migrate_entries(allow_ai_rewrite=False)
-        self._recover_shown_buffer_entries()
+        self._show_startup_placeholder()
         self._refresh_repo_list()
-        self._refresh_editor()
-        self._maybe_auto_export_daily()
-        self._schedule_poll()
-        self._schedule_backlog_poll()
+        self._set_startup_loading_message("Loading saved data...")
+        self.root.after(0, self._begin_startup_load)
 
     def _set_windows_app_id(self) -> None:
         if os.name != "nt":
@@ -367,7 +386,8 @@ class PyesisApp:
             "PYESIS_OLLAMA_URL": self.config.ai_ollama_url,
             "PYESIS_OLLAMA_MODEL": ollama_model,
             "PYESIS_OLLAMA_KEEP_ALIVE": self.config.ai_ollama_keep_alive,
-            "PYESIS_OLLAMA_TIMEOUT_SECONDS": str(max(30, int(self.config.ai_ollama_timeout_seconds))),
+            "PYESIS_OLLAMA_TIMEOUT_SECONDS": str(max(0, int(self.config.ai_ollama_timeout_seconds))),
+            "PYESIS_OLLAMA_NUM_THREADS": str(max(1, int(self.config.ai_ollama_num_threads))),
             "PYESIS_AI_URL": self.config.ai_openai_url,
             "PYESIS_AI_MODEL": self.config.ai_openai_model,
             "PYESIS_GITHUB_GPT_URL": self.config.ai_github_gpt_url,
@@ -815,14 +835,20 @@ class PyesisApp:
 
         ttk.Button(sidebar, text="Export DOCX", underline=0, command=self._export_docx).grid(row=14, column=0, sticky="ew", pady=(6, 0))
         ttk.Button(sidebar, text="Edit Entry", underline=0, command=self._open_entry_editor).grid(row=15, column=0, sticky="ew", pady=(6, 0))
-        ttk.Button(sidebar, text="Export Week JSON", underline=7, command=self._export_week_json).grid(row=16, column=0, sticky="ew", pady=(6, 0))
-        ttk.Button(sidebar, text="Import Week JSON", underline=7, command=self._import_week_json).grid(row=17, column=0, sticky="ew", pady=(6, 0))
+        self.export_week_json_button = ttk.Button(sidebar, text=EXPORT_WEEK_JSON_BUTTON_TEXT, underline=7, command=self._export_week_json)
+        self.export_week_json_button.grid(row=16, column=0, sticky="ew", pady=(6, 0))
+        self.import_week_json_button = ttk.Button(sidebar, text=IMPORT_WEEK_JSON_BUTTON_TEXT, underline=7, command=self._import_week_json)
+        self.import_week_json_button.grid(row=17, column=0, sticky="ew", pady=(6, 0))
         ttk.Label(sidebar, text="AI status").grid(row=18, column=0, sticky="w", pady=(12, 2))
         ttk.Label(sidebar, textvariable=self.ai_status_var, style="AIStatus.TLabel", wraplength=260).grid(row=19, column=0, sticky="ew")
         ttk.Label(sidebar, textvariable=self.ollama_activity_var, style="OllamaActivity.TLabel", wraplength=260).grid(row=20, column=0, sticky="ew", pady=(8, 0))
         ttk.Label(sidebar, text="Last poll").grid(row=21, column=0, sticky="w", pady=(12, 2))
         ttk.Label(sidebar, textvariable=self.poll_summary_var, style="PollSummary.TLabel", wraplength=260).grid(row=22, column=0, sticky="ew")
         ttk.Label(sidebar, textvariable=self.status_var, wraplength=260).grid(row=23, column=0, sticky="ew", pady=(12, 0))
+        self.startup_status_label = ttk.Label(sidebar, textvariable=self.startup_message_var, wraplength=260, style="PollSummary.TLabel")
+        self.startup_status_label.grid(row=24, column=0, sticky="ew", pady=(8, 0))
+        self.startup_progress = ttk.Progressbar(sidebar, mode="indeterminate")
+        self.startup_progress.grid(row=25, column=0, sticky="ew", pady=(6, 0))
 
         editor_header = ttk.Frame(editor_area)
         editor_header.grid(row=0, column=0, sticky="ew")
@@ -841,23 +867,23 @@ class PyesisApp:
         docs_button = ttk.Button(editor_header, text="Docs", underline=0, width=8, command=self._open_docx_folder)
         docs_button.grid(row=0, column=2, sticky="e", padx=(0, 6))
 
-        ai_weekly_button = ttk.Button(editor_header, text="AI Weekly", underline=3, width=10, command=self._open_ai_weekly_report)
-        ai_weekly_button.grid(row=0, column=3, sticky="e", padx=(0, 6))
+        self.ai_weekly_button = ttk.Button(editor_header, text=AI_WEEKLY_BUTTON_TEXT, underline=3, width=10, command=self._open_ai_weekly_report)
+        self.ai_weekly_button.grid(row=0, column=3, sticky="e", padx=(0, 6))
 
         info_button = ttk.Button(editor_header, text="ⓘ Info", underline=2, width=8, command=self._open_readme_view)
         info_button.grid(row=0, column=4, sticky="e", padx=(0, 6))
 
-        settings_button = ttk.Button(editor_header, text="⚙ Settings", underline=2, width=11, command=self._open_settings)
-        settings_button.grid(row=0, column=5, sticky="e")
+        self.settings_button = ttk.Button(editor_header, text="⚙ Settings", underline=2, width=11, command=self._open_settings)
+        self.settings_button.grid(row=0, column=5, sticky="e")
 
         ai_log_button = ttk.Button(editor_header, text="AI Log", underline=3, width=9, command=self._open_ai_attempt_log)
         ai_log_button.grid(row=0, column=6, sticky="e", padx=(6, 0))
 
         ToolTip(github_button, "Open GitHub Repository (Ctrl+Shift+G)")
         ToolTip(docs_button, lambda: f"Pyesis docx file folder ({self._docx_output_dir()})")
-        ToolTip(ai_weekly_button, "AI Weekly Report from Ollama")
+        ToolTip(self.ai_weekly_button, "AI Weekly Report from Ollama")
         ToolTip(info_button, "Open README (F1)")
-        ToolTip(settings_button, "Settings (Ctrl+,)")
+        ToolTip(self.settings_button, "Settings (Ctrl+,)")
         ToolTip(ai_log_button, "Open AI attempt log (Alt+L)")
 
         preview_shell = ttk.Frame(editor_area)
@@ -885,8 +911,185 @@ class PyesisApp:
         editor_scrollbar = ttk.Scrollbar(preview_shell, orient="vertical", command=self.editor.yview)
         editor_scrollbar.grid(row=0, column=1, sticky="ns")
         self.editor.configure(yscrollcommand=editor_scrollbar.set)
+        self.editor.tag_bind(ENTRY_DELETE_TAG, "<Button-1>", self._on_entry_delete_click)
+        self.editor.tag_bind(ENTRY_DELETE_TAG, "<Enter>", self._on_entry_delete_hover_enter)
+        self.editor.tag_bind(ENTRY_DELETE_TAG, "<Leave>", self._on_entry_delete_hover_leave)
         self._update_repo_action_button()
         self._setup_editor_background()
+
+    def _show_startup_placeholder(self) -> None:
+        self.editor.delete("1.0", tk.END)
+        self.editor.insert("1.0", "Loading Pyesis...\n\nThe window is ready. Saved data is still loading.\n")
+        if self.settings_button is not None:
+            self.settings_button.configure(state="disabled")
+
+    def _set_startup_loading_message(self, message: str) -> None:
+        self.startup_message_var.set(message)
+        self.status_var.set(message)
+        if self.startup_status_label is not None:
+            self.startup_status_label.grid()
+        if self.startup_progress is not None:
+            self.startup_progress.grid()
+            self.startup_progress.start(12)
+        root = getattr(self, "root", None)
+        if root is not None and hasattr(root, "update_idletasks"):
+            root.update_idletasks()
+
+    def _clear_startup_loading_message(self) -> None:
+        self._startup_loading = False
+        self.startup_message_var.set("")
+        if self.settings_button is not None:
+            self.settings_button.configure(state="normal")
+        if self.startup_status_label is not None:
+            self.startup_status_label.grid_remove()
+        if self.startup_progress is not None:
+            self.startup_progress.stop()
+            self.startup_progress.grid_remove()
+        if self.status_var.get().startswith(("Loading ", "Recovering ", "Refreshing ", "Checking ", "Scheduling ")):
+            self.status_var.set("Idle")
+
+    def _post_to_ui(self, callback: Callable[[], None]) -> None:
+        try:
+            self.root.after(0, callback)
+        except (RuntimeError, tk.TclError):
+            pass
+
+    def _begin_startup_load(self) -> None:
+        if self._startup_thread is not None and self._startup_thread.is_alive():
+            return
+        self._startup_thread = threading.Thread(target=self._load_startup_config_worker, daemon=True)
+        self._startup_thread.start()
+
+    def _load_startup_config_worker(self) -> None:
+        try:
+            config = load_config()
+        except Exception as exc:
+            self._post_to_ui(lambda: self._complete_startup_load_error(str(exc)))
+            return
+        self._post_to_ui(lambda loaded_config=config: self._complete_startup_config_load(loaded_config))
+
+    def _complete_startup_load_error(self, error_text: str) -> None:
+        self._set_startup_loading_message(f"Loading saved data failed: {error_text}")
+
+    def _complete_startup_config_load(self, loaded_config: AppConfig) -> None:
+        self.config = loaded_config
+        self.week_end_var.set(self.config.week_end_day)
+        self.theme_mode_var.set(self.config.theme_mode.capitalize())
+        self.high_contrast_var.set(self.config.high_contrast)
+        self.ui_font_size_var.set(self.config.ui_font_size)
+        self._apply_ai_environment_defaults()
+        self._ai_status_severity = self._initial_ai_status_severity()
+        self.ai_status_var.set(self._initial_ai_status_text())
+        self._apply_fonts()
+        self._apply_theme()
+        self._refresh_repo_list()
+        self._set_startup_loading_message("Saved settings loaded. Finishing startup...")
+        self.root.after(0, self._begin_startup_finalize)
+
+    def _begin_startup_finalize(self) -> None:
+        if self._startup_finalize_thread is not None and self._startup_finalize_thread.is_alive():
+            return
+        self._startup_finalize_thread = threading.Thread(target=self._startup_finalize_worker, daemon=True)
+        self._startup_finalize_thread.start()
+
+    def _startup_finalize_worker(self) -> None:
+        self._post_to_ui(lambda: self._set_startup_loading_message("Checking saved entries..."))
+        week_end_day = self.config.week_end_day
+        original_entries = list(self.config.entries)
+        normalized = self._normalize_entry_calendar_fields_for_week_end(original_entries, week_end_day)
+        filtered = self._remove_noise_entries(normalized)
+        changed = False
+        final_entries = original_entries
+        if filtered != original_entries:
+            deduped = dedupe_entries(filtered)
+            if deduped != original_entries:
+                final_entries = deduped
+                changed = True
+
+        recovery_items: list[dict[str, object]] = []
+        for day_key in list_buffer_day_keys():
+            for item in load_buffer_items(day_key):
+                if not item["shown"]:
+                    continue
+                summary_text = item["gitDiffDescription"].strip()
+                if not summary_text:
+                    continue
+                recovery_items.append(item)
+
+        self._post_to_ui(lambda entries=final_entries, changed=changed, items=recovery_items: self._complete_startup_finalize(entries, changed, items))
+
+    def _complete_startup_finalize(self, entries: list[EntryRecord], changed: bool, recovery_items: list[dict[str, object]]) -> None:
+        if changed:
+            self.config.entries = entries
+            self._save_config_snapshot_async()
+        self._startup_recovery_items = recovery_items
+        self._startup_recovery_index = 0
+        self._startup_recovery_recovered = 0
+        self._startup_recovery_known_duplicates = {
+            self._entry_duplicate_key(entry) for entry in self.config.entries if entry.repo_path.strip()
+        }
+        self._set_startup_loading_message("Recovering shown diffs...")
+        self.root.after(0, self._continue_startup_recovery)
+
+    def _continue_startup_recovery(self, batch_size: int = 50) -> None:
+        processed = 0
+        while self._startup_recovery_index < len(self._startup_recovery_items) and processed < batch_size:
+            item = self._startup_recovery_items[self._startup_recovery_index]
+            self._startup_recovery_index += 1
+            processed += 1
+            created_at_raw = str(item["datetime"]).strip()
+            try:
+                created_at = datetime.fromisoformat(created_at_raw)
+            except ValueError:
+                continue
+
+            repo = RepoConfig(path=str(item["repoPath"]), label=str(item["repo"]))
+            entry = self._build_entry(
+                repo,
+                created_at,
+                str(item["gitDiffDescription"]).strip(),
+                str(item["gitDiffText"]),
+                str(item["diffHash"]).strip(),
+                str(item["author"]),
+                self._summary_mode_or_default(str(item["summarySource"]), str(item["author"])),
+                str(item["requestedSummarySource"]),
+                str(item["summaryWarning"]),
+                str(item["fallbackSummarySource"]),
+                item["summaryTimingMs"],
+                str(item["summaryProviderDetails"]),
+                str(item["lastAiAttemptAt"]),
+            )
+
+            duplicate_key = self._entry_duplicate_key(entry)
+            if duplicate_key in self._startup_recovery_known_duplicates:
+                continue
+
+            self._merge_or_append_captured_entry(entry)
+            self._startup_recovery_known_duplicates.add(self._entry_duplicate_key(entry))
+            self._startup_recovery_recovered += 1
+
+        if self._startup_recovery_index < len(self._startup_recovery_items):
+            self.root.after(0, self._continue_startup_recovery)
+            return
+
+        if self._startup_recovery_recovered:
+            self._save_config_snapshot_async()
+
+        self._set_startup_loading_message("Checking auto-export...")
+        self._maybe_auto_export_daily()
+        self._set_startup_loading_message("Scheduling background scans...")
+        self._finish_startup_load()
+
+    def _save_config_snapshot_async(self) -> None:
+        config_copy = replace(self.config, repos=list(self.config.repos), entries=list(self.config.entries))
+        threading.Thread(target=save_config, args=(config_copy,), daemon=True).start()
+
+    def _finish_startup_load(self) -> None:
+        self._schedule_poll()
+        self._schedule_backlog_poll()
+        self._refresh_repo_list()
+        self._refresh_editor()
+        self._clear_startup_loading_message()
 
     def _setup_editor_background(self) -> None:
         watermark_names = ("assets/Pyesis-watermark.png", "assets/pyesis-watermark.png")
@@ -1083,6 +1286,8 @@ class PyesisApp:
         original_entries = list(self.config.entries)
         normalized = self._normalize_entry_calendar_fields(original_entries)
         filtered = self._remove_noise_entries(normalized)
+        if not allow_ai_rewrite and filtered == original_entries:
+            return
         deduped = dedupe_entries(filtered)
         rewritten = self._rewrite_legacy_summaries(deduped) if allow_ai_rewrite else deduped
 
@@ -1091,7 +1296,7 @@ class PyesisApp:
             save_config(self.config)
 
     def _recover_shown_buffer_entries(self) -> int:
-        known_hashes = {entry.diff_hash for entry in self.config.entries if entry.diff_hash.strip()}
+        known_duplicates = {self._entry_duplicate_key(entry) for entry in self.config.entries if entry.repo_path.strip()}
         recovered = 0
 
         for day_key in list_buffer_day_keys():
@@ -1099,8 +1304,6 @@ class PyesisApp:
                 if not item["shown"]:
                     continue
                 diff_hash = item["diffHash"].strip()
-                if diff_hash and diff_hash in known_hashes:
-                    continue
                 summary_text = item["gitDiffDescription"].strip()
                 if not summary_text:
                     continue
@@ -1127,14 +1330,12 @@ class PyesisApp:
                     item["lastAiAttemptAt"],
                 )
 
-                if any(self._is_duplicate_entry(existing, entry) for existing in self.config.entries):
-                    if diff_hash:
-                        known_hashes.add(diff_hash)
+                duplicate_key = self._entry_duplicate_key(entry)
+                if duplicate_key in known_duplicates:
                     continue
 
                 self._merge_or_append_captured_entry(entry)
-                if diff_hash:
-                    known_hashes.add(diff_hash)
+                known_duplicates.add(self._entry_duplicate_key(entry))
                 recovered += 1
 
         if recovered:
@@ -1145,15 +1346,22 @@ class PyesisApp:
         return ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
     def _week_end_day_index(self) -> int:
-        week_days = self._week_day_names()
         configured = self.week_end_var.get().strip() or self.config.week_end_day
+        return self._week_end_day_index_for_name(configured)
+
+    def _week_end_day_index_for_name(self, configured: str) -> int:
+        week_days = self._week_day_names()
         try:
             return week_days.index(configured)
         except ValueError:
             return week_days.index("Thursday")
 
     def _week_start_for_datetime(self, moment: datetime) -> datetime:
-        end_index = self._week_end_day_index()
+        configured = self.week_end_var.get().strip() or self.config.week_end_day
+        return self._week_start_for_datetime_with_week_end(moment, configured)
+
+    def _week_start_for_datetime_with_week_end(self, moment: datetime, week_end_day: str) -> datetime:
+        end_index = self._week_end_day_index_for_name(week_end_day)
         week_end = (moment + timedelta(days=(end_index - moment.weekday()) % 7)).replace(
             hour=0,
             minute=0,
@@ -1202,27 +1410,51 @@ class PyesisApp:
         return self._week_start_for_datetime(entry_dt).isoformat()
 
     def _normalize_entry_calendar_fields(self, entries: list[EntryRecord]) -> list[EntryRecord]:
+        configured = self.week_end_var.get().strip() or self.config.week_end_day
+        return self._normalize_entry_calendar_fields_for_week_end(entries, configured)
+
+    def _normalize_entry_calendar_fields_for_week_end(self, entries: list[EntryRecord], week_end_day: str) -> list[EntryRecord]:
         normalized: list[EntryRecord] = []
         for entry in entries:
             entry_dt = self._entry_datetime(entry)
             if entry_dt is None:
                 normalized.append(entry)
                 continue
+            normalized_day_name = entry_dt.strftime("%A")
+            normalized_week_start_iso = self._week_start_for_datetime_with_week_end(entry_dt, week_end_day).isoformat()
+            if entry.day_name == normalized_day_name and entry.week_start_iso == normalized_week_start_iso:
+                normalized.append(entry)
+                continue
             normalized.append(
-                EntryRecord(
-                    repo_label=entry.repo_label,
-                    repo_path=entry.repo_path,
-                    created_at=entry.created_at,
-                    day_name=entry_dt.strftime("%A"),
-                    week_start_iso=self._week_start_for_datetime(entry_dt).isoformat(),
-                    summary=entry.summary,
-                    summary_source=entry.summary_source,
-                    diff_hash=entry.diff_hash,
-                    diff_excerpt=entry.diff_excerpt,
-                    author=entry.author,
+                replace(
+                    entry,
+                    day_name=normalized_day_name,
+                    week_start_iso=normalized_week_start_iso,
                 )
             )
         return normalized
+
+    def _entry_duplicate_key(self, entry: EntryRecord) -> tuple[str, str, str, str, str]:
+        configured = self.week_end_var.get().strip() or self.config.week_end_day
+        return self._entry_duplicate_key_for_week_end(entry, configured)
+
+    def _entry_duplicate_key_for_week_end(self, entry: EntryRecord, week_end_day: str) -> tuple[str, str, str, str, str]:
+        diff_hash = entry.diff_hash.strip()
+        if diff_hash:
+            return (entry.repo_path, f"hash:{diff_hash}", "", "", "")
+        return (
+            entry.repo_path,
+            f"week:{self._entry_week_start_iso_for_week_end(entry, week_end_day)}",
+            self._entry_day_name(entry),
+            entry.summary.strip(),
+            entry.diff_excerpt.strip(),
+        )
+
+    def _entry_week_start_iso_for_week_end(self, entry: EntryRecord, week_end_day: str) -> str:
+        entry_dt = self._entry_datetime(entry)
+        if entry_dt is None:
+            return entry.week_start_iso
+        return self._week_start_for_datetime_with_week_end(entry_dt, week_end_day).isoformat()
 
     def _remove_noise_entries(self, entries: list[EntryRecord]) -> list[EntryRecord]:
         cleaned: list[EntryRecord] = []
@@ -1395,6 +1627,8 @@ class PyesisApp:
         return self._needs_manual_summary_refresh(entry) or _is_low_quality_summary_text(summary_text)
 
     def _is_visible_heuristic_entry(self, entry: EntryRecord) -> bool:
+        if self._is_pending_ai_retry_entry(entry):
+            return True
         if entry.summary_warning.strip():
             return False
         summary_source = (entry.summary_source or "").strip().lower()
@@ -1403,6 +1637,11 @@ class PyesisApp:
         if not summary_source and entry.author.strip().lower() in HUMAN_SUMMARY_AUTHORS:
             return False
         return self._summary_needs_rewrite(entry)
+
+    def _is_pending_ai_retry_entry(self, entry: EntryRecord) -> bool:
+        requested_source = (entry.requested_summary_source or "").strip().lower()
+        fallback_source = (entry.fallback_summary_source or "").strip().lower()
+        return requested_source not in {"", HEURISTIC_MODE} and fallback_source == HEURISTIC_MODE
 
     def _is_refreshable_current_week_summary(self, entry: EntryRecord) -> bool:
         if not self._is_current_week_entry(entry):
@@ -1551,7 +1790,8 @@ class PyesisApp:
             ai_ollama_url=state.ollama_url_var.get().strip(),
             ai_ollama_model=state.ollama_model_var.get().strip(),
             ai_ollama_keep_alive=state.ollama_keep_alive_var.get().strip() or "30m",
-            ai_ollama_timeout_seconds=max(30, int(state.ollama_timeout_var.get() or OLLAMA_DEFAULT_TIMEOUT_SECONDS)),
+            ai_ollama_timeout_seconds=max(0, int(state.ollama_timeout_var.get() or OLLAMA_DEFAULT_TIMEOUT_SECONDS)),
+            ai_ollama_num_threads=max(1, int(round(state.ollama_num_threads_var.get()))),
             ai_openai_url=state.openai_url_var.get().strip(),
             ai_openai_model=state.openai_model_var.get().strip(),
             github_auth_mode=github_auth_mode,
@@ -1573,6 +1813,7 @@ class PyesisApp:
         self.config.ai_ollama_model = settings.ai_ollama_model
         self.config.ai_ollama_keep_alive = settings.ai_ollama_keep_alive
         self.config.ai_ollama_timeout_seconds = settings.ai_ollama_timeout_seconds
+        self.config.ai_ollama_num_threads = settings.ai_ollama_num_threads
         self.config.ai_openai_url = settings.ai_openai_url
         self.config.ai_openai_model = settings.ai_openai_model
         self.config.github_auth_mode = settings.github_auth_mode
@@ -1795,6 +2036,9 @@ class PyesisApp:
         threading.Thread(target=worker, daemon=True).start()
 
     def _open_settings(self) -> None:
+        if self._startup_loading:
+            messagebox.showinfo("Still loading", "Saved settings are still loading. Please wait a moment and try Settings again.")
+            return
         ollama_present = self._detect_ollama_presence()
         preferred_ai_mode = self._preferred_ai_mode_for_settings()
 
@@ -1867,7 +2111,12 @@ class PyesisApp:
         ollama_model_var = tk.StringVar(value=self.config.ai_ollama_model or DEFAULT_OLLAMA_SUMMARY_MODEL)
         ollama_model_status_var = tk.StringVar(value="Refresh to load installed Ollama models.")
         ollama_keep_alive_var = tk.StringVar(value=self.config.ai_ollama_keep_alive)
-        ollama_timeout_var = tk.IntVar(value=max(30, int(self.config.ai_ollama_timeout_seconds)))
+        ollama_timeout_var = tk.IntVar(value=max(0, int(self.config.ai_ollama_timeout_seconds)))
+        ollama_max_threads = max(2, os.cpu_count() or 2)
+        ollama_num_threads_var = tk.DoubleVar(
+            value=min(ollama_max_threads, max(1, int(self.config.ai_ollama_num_threads)))
+        )
+        ollama_impact_var = tk.StringVar()
         openai_url_var = tk.StringVar(value=self.config.ai_openai_url)
         openai_model_var = tk.StringVar(value=self.config.ai_openai_model)
         github_auth_status = self._github_auth_status()
@@ -1893,6 +2142,7 @@ class PyesisApp:
             ollama_model_var=ollama_model_var,
             ollama_keep_alive_var=ollama_keep_alive_var,
             ollama_timeout_var=ollama_timeout_var,
+            ollama_num_threads_var=ollama_num_threads_var,
             openai_url_var=openai_url_var,
             openai_model_var=openai_model_var,
             github_auth_mode_var=github_auth_mode_var,
@@ -1988,34 +2238,53 @@ class PyesisApp:
         ttk.Label(frame, textvariable=ollama_model_status_var, wraplength=560, justify="left").grid(row=24, column=0, sticky="w", pady=(0, 6))
         ttk.Label(frame, text="Ollama keep alive").grid(row=25, column=0, sticky="w")
         ttk.Entry(frame, textvariable=ollama_keep_alive_var, width=18).grid(row=26, column=0, sticky="w", pady=(4, 12))
-        ttk.Label(frame, text="Ollama timeout (seconds)").grid(row=27, column=0, sticky="w")
-        ttk.Spinbox(frame, from_=30, to=1800, textvariable=ollama_timeout_var, width=8).grid(row=28, column=0, sticky="w", pady=(4, 12))
+        ttk.Label(frame, text="Ollama timeout (seconds; 0 waits indefinitely)").grid(row=27, column=0, sticky="w")
+        ttk.Spinbox(frame, from_=0, to=1800, textvariable=ollama_timeout_var, width=8).grid(row=28, column=0, sticky="w", pady=(4, 12))
 
-        ttk.Label(frame, text="OpenAI-compatible URL").grid(row=29, column=0, sticky="w")
-        ttk.Entry(frame, textvariable=openai_url_var, width=42).grid(row=30, column=0, sticky="ew", pady=(4, 6))
-        ttk.Label(frame, text="OpenAI-compatible model").grid(row=31, column=0, sticky="w")
-        ttk.Entry(frame, textvariable=openai_model_var, width=42).grid(row=32, column=0, sticky="ew", pady=(4, 12))
+        def update_ollama_impact(value: str | float) -> None:
+            threads = max(1, min(ollama_max_threads, int(round(float(value)))))
+            ollama_impact_var.set(f"Ollama impact vs throughput: {threads} thread{'s' if threads != 1 else ''}")
 
-        ttk.Label(frame, text="GitHub account type").grid(row=33, column=0, sticky="w")
+        update_ollama_impact(ollama_num_threads_var.get())
+        ttk.Label(frame, textvariable=ollama_impact_var).grid(row=29, column=0, sticky="w")
+        ttk.Scale(
+            frame,
+            from_=1,
+            to=ollama_max_threads,
+            variable=ollama_num_threads_var,
+            command=update_ollama_impact,
+        ).grid(row=30, column=0, sticky="ew", pady=(4, 2))
+        impact_ends = ttk.Frame(frame)
+        impact_ends.grid(row=31, column=0, sticky="ew", pady=(0, 12))
+        impact_ends.columnconfigure(1, weight=1)
+        ttk.Label(impact_ends, text="Low impact").grid(row=0, column=0, sticky="w")
+        ttk.Label(impact_ends, text="Higher throughput").grid(row=0, column=2, sticky="e")
+
+        ttk.Label(frame, text="OpenAI-compatible URL").grid(row=32, column=0, sticky="w")
+        ttk.Entry(frame, textvariable=openai_url_var, width=42).grid(row=33, column=0, sticky="ew", pady=(4, 6))
+        ttk.Label(frame, text="OpenAI-compatible model").grid(row=34, column=0, sticky="w")
+        ttk.Entry(frame, textvariable=openai_model_var, width=42).grid(row=35, column=0, sticky="ew", pady=(4, 12))
+
+        ttk.Label(frame, text="GitHub account type").grid(row=36, column=0, sticky="w")
         ttk.Combobox(
             frame,
             textvariable=github_auth_mode_var,
             values=[GITHUB_DOTCOM_AUTH_MODE, GITHUB_ENTERPRISE_AUTH_MODE],
             state="readonly",
-        ).grid(row=34, column=0, sticky="ew", pady=(4, 6))
-        ttk.Label(frame, text="GitHub Enterprise host (used only for Enterprise sign-in)").grid(row=35, column=0, sticky="w")
-        ttk.Entry(frame, textvariable=github_auth_endpoint_var, width=42).grid(row=36, column=0, sticky="ew", pady=(4, 6))
-        ttk.Label(frame, textvariable=github_auth_status_var, wraplength=560, justify="left").grid(row=37, column=0, sticky="w")
-        ttk.Label(frame, text="GitHub OAuth client ID").grid(row=38, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(frame, textvariable=github_oauth_client_id_var, width=42).grid(row=39, column=0, sticky="ew", pady=(4, 6))
+        ).grid(row=37, column=0, sticky="ew", pady=(4, 6))
+        ttk.Label(frame, text="GitHub Enterprise host (used only for Enterprise sign-in)").grid(row=38, column=0, sticky="w")
+        ttk.Entry(frame, textvariable=github_auth_endpoint_var, width=42).grid(row=39, column=0, sticky="ew", pady=(4, 6))
+        ttk.Label(frame, textvariable=github_auth_status_var, wraplength=560, justify="left").grid(row=40, column=0, sticky="w")
+        ttk.Label(frame, text="GitHub OAuth client ID").grid(row=41, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(frame, textvariable=github_oauth_client_id_var, width=42).grid(row=42, column=0, sticky="ew", pady=(4, 6))
         ttk.Label(
             frame,
             textvariable=github_login_help_var,
             wraplength=560,
             justify="left",
-        ).grid(row=40, column=0, sticky="w")
+        ).grid(row=43, column=0, sticky="w")
         auth_actions = ttk.Frame(frame)
-        auth_actions.grid(row=41, column=0, sticky="w", pady=(8, 8))
+        auth_actions.grid(row=44, column=0, sticky="w", pady=(8, 8))
         sign_in_button = ttk.Button(
             auth_actions,
             text="Sign in with GitHub",
@@ -2046,19 +2315,19 @@ class PyesisApp:
         github_oauth_client_id_var.trace_add("write", refresh_github_login_controls)
         refresh_github_login_controls()
 
-        ttk.Label(frame, text="Or store or replace a token manually").grid(row=42, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(frame, textvariable=github_auth_token_var, width=42, show="*").grid(row=43, column=0, sticky="ew", pady=(4, 6))
-        ttk.Checkbutton(frame, text="Clear stored GitHub token on save", variable=github_auth_clear_var).grid(row=44, column=0, sticky="w", pady=(0, 12))
+        ttk.Label(frame, text="Or store or replace a token manually").grid(row=45, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(frame, textvariable=github_auth_token_var, width=42, show="*").grid(row=46, column=0, sticky="ew", pady=(4, 6))
+        ttk.Checkbutton(frame, text="Clear stored GitHub token on save", variable=github_auth_clear_var).grid(row=47, column=0, sticky="w", pady=(0, 12))
 
-        ttk.Label(frame, text="GitHub GPT URL").grid(row=45, column=0, sticky="w")
-        ttk.Entry(frame, textvariable=github_gpt_url_var, width=42).grid(row=46, column=0, sticky="ew", pady=(4, 6))
-        ttk.Label(frame, text="GitHub GPT model").grid(row=47, column=0, sticky="w")
+        ttk.Label(frame, text="GitHub GPT URL").grid(row=48, column=0, sticky="w")
+        ttk.Entry(frame, textvariable=github_gpt_url_var, width=42).grid(row=49, column=0, sticky="ew", pady=(4, 6))
+        ttk.Label(frame, text="GitHub GPT model").grid(row=50, column=0, sticky="w")
         ttk.Combobox(
             frame,
             textvariable=github_gpt_model_var,
             values=list(GITHUB_GPT_DEFAULT_MODELS),
             state="readonly",
-        ).grid(row=48, column=0, sticky="ew", pady=(4, 12))
+        ).grid(row=51, column=0, sticky="ew", pady=(4, 12))
 
         self._refresh_ollama_model_choices(
             ollama_url_var,
@@ -2439,6 +2708,7 @@ class PyesisApp:
         self.editor.tag_configure("ai-working-dim", foreground=palette["working_fg_dim"])
         self.editor.tag_configure("ai-comment", foreground=palette["failed_fg"])
         self.editor.tag_configure("empty-week-note", foreground=palette["muted_fg"])
+        self.editor.tag_configure(ENTRY_DELETE_TAG, foreground=palette["failed_fg"], underline=True)
         if self._editor_bg_canvas is not None:
             self._editor_bg_canvas.configure(bg=palette["surface"])
 
@@ -2698,12 +2968,14 @@ class PyesisApp:
             keep_bottom_magnet = self._is_editor_view_near_bottom(previous_scroll_end)
 
         self._last_rendered_week_start_iso = self._active_week_start().isoformat()
+        self._editor_delete_tag_map = {}
         self.editor.delete("1.0", tk.END)
         current_week_count = self._current_week_entry_count()
         for chunk in render_text_chunks(
             self.config,
             entry_tag_resolver=self._entry_render_tags,
             warning_comment_resolver=self._entry_warning_comment,
+            delete_tag_resolver=self._entry_delete_tags,
         ):
             self.editor.insert(tk.END, chunk.text, chunk.tags)
         if current_week_count == 0:
@@ -2734,10 +3006,72 @@ class PyesisApp:
     def _entry_status_key(self, entry: EntryRecord) -> str:
         return f"{entry.repo_label}\0{entry.created_at}\0{entry.diff_hash}"
 
+    def _entry_delete_tag(self, entry: EntryRecord) -> str:
+        entry_key = self._entry_status_key(entry)
+        digest = hashlib.sha1(entry_key.encode("utf-8")).hexdigest()[:12]
+        return f"entry-delete-{digest}"
+
+    def _entry_delete_tags(self, entry: EntryRecord) -> tuple[str, ...]:
+        unique_tag = self._entry_delete_tag(entry)
+        self._editor_delete_tag_map[unique_tag] = self._entry_status_key(entry)
+        return (ENTRY_DELETE_TAG, unique_tag)
+
+    def _entry_index_by_status_key(self, entry_key: str) -> int | None:
+        for index, entry in enumerate(self.config.entries):
+            if self._entry_status_key(entry) == entry_key:
+                return index
+        return None
+
+    def _delete_entry_by_key(self, entry_key: str, confirm: bool = True) -> bool:
+        entry_index = self._entry_index_by_status_key(entry_key)
+        if entry_index is None:
+            self.status_var.set("Entry no longer exists")
+            return False
+
+        entry = self.config.entries[entry_index]
+        if confirm:
+            summary = re.sub(r"\s+", " ", entry.summary.strip())
+            excerpt = summary[:140] + ("..." if len(summary) > 140 else "")
+            prompt = f"Delete this entry?\n\n{entry.day_name} | {entry.created_at} | {entry.repo_label}\n\n{excerpt}"
+            if not messagebox.askyesno("Delete entry", prompt):
+                return False
+
+        self.config.entries.pop(entry_index)
+        save_config(self.config)
+        self._refresh_editor()
+        self.status_var.set(f"Deleted 1 entry for {entry.repo_label}")
+        return True
+
+    def _delete_tag_from_event(self, event: tk.Event) -> str:
+        index = self.editor.index(f"@{event.x},{event.y}")
+        for tag in self.editor.tag_names(index):
+            if tag in self._editor_delete_tag_map:
+                return tag
+        return ""
+
+    def _on_entry_delete_click(self, event: tk.Event) -> str:
+        delete_tag = self._delete_tag_from_event(event)
+        if not delete_tag:
+            return "break"
+        entry_key = self._editor_delete_tag_map.get(delete_tag, "")
+        if entry_key:
+            self._delete_entry_by_key(entry_key)
+        return "break"
+
+    def _on_entry_delete_hover_enter(self, _event: tk.Event) -> str:
+        self.editor.configure(cursor="hand2")
+        return "break"
+
+    def _on_entry_delete_hover_leave(self, _event: tk.Event) -> str:
+        self.editor.configure(cursor="xterm")
+        return "break"
+
     def _entry_render_tags(self, entry: EntryRecord) -> tuple[str, ...]:
         entry_key = self._entry_status_key(entry)
         if entry_key in self._active_ai_entry_keys:
-            return ("ai-working-bright",) if self._ai_working_pulse_on else ("ai-working-dim",)
+            return ("ai-working-bright",)
+        if self._is_pending_ai_retry_entry(entry):
+            return ("heuristic",)
         if entry.summary_warning.strip():
             return ("ai-failed",)
         if self._is_trusted_ai_entry(entry):
@@ -2747,35 +3081,19 @@ class PyesisApp:
         return ()
 
     def _entry_warning_comment(self, entry: EntryRecord) -> str:
+        if self._is_pending_ai_retry_entry(entry):
+            return ""
         warning = re.sub(r"\s+", " ", entry.summary_warning.strip())
         if not warning:
             return ""
         return f"[[{warning}]]"
 
-    def _schedule_ai_working_pulse(self) -> None:
-        if self._ai_working_pulse_scheduled or not self._active_ai_entry_keys:
-            return
-        self._ai_working_pulse_scheduled = True
-        self.root.after(350, self._tick_ai_working_pulse)
-
-    def _tick_ai_working_pulse(self) -> None:
-        if not self._active_ai_entry_keys:
-            self._ai_working_pulse_scheduled = False
-            self._ai_working_pulse_on = False
-            return
-        self._ai_working_pulse_on = not self._ai_working_pulse_on
-        self._refresh_editor()
-        self.root.after(350, self._tick_ai_working_pulse)
-
     def _on_entry_rewrite_progress(self, entry_key: str, status: str) -> None:
         def apply() -> None:
             if status == "start":
                 self._active_ai_entry_keys.add(entry_key)
-                self._schedule_ai_working_pulse()
             else:
                 self._active_ai_entry_keys.discard(entry_key)
-                if not self._active_ai_entry_keys:
-                    self._ai_working_pulse_on = False
             self._refresh_editor()
 
         self.root.after(0, apply)
@@ -2870,9 +3188,16 @@ class PyesisApp:
         for entry in self.config.entries:
             if not self._is_current_week_entry(entry):
                 continue
-            if entry.summary_warning.strip():
+            if entry.summary_warning.strip() or self._is_pending_ai_retry_entry(entry):
                 return True
-        return any(str(item.get("summaryWarning", "")).strip() for item in self._iter_current_week_buffer_items())
+        return any(
+            str(item.get("summaryWarning", "")).strip()
+            or (
+                str(item.get("requestedSummarySource", "")).strip().lower() not in {"", HEURISTIC_MODE}
+                and str(item.get("fallbackSummarySource", "")).strip().lower() == HEURISTIC_MODE
+            )
+            for item in self._iter_current_week_buffer_items()
+        )
 
     def _iter_buffer_items(self):
         for buffer_file in sorted(BUFFER_DIR.glob("*.json")):
@@ -2909,6 +3234,18 @@ class PyesisApp:
 
         self._run_periodic_summary_enhancer(force_run=True, update_status=False)
 
+    def _make_single_rewrite_gate(self):
+        attempted = False
+
+        def rewrite_gate(_repo_label: str, _repo_path: str | None) -> bool:
+            nonlocal attempted
+            if attempted:
+                return False
+            attempted = True
+            return True
+
+        return rewrite_gate
+
     def _scheduled_poll(self) -> None:
         self.run_poll_once()
         self._maybe_auto_export_daily()
@@ -2938,19 +3275,25 @@ class PyesisApp:
             "last_ai_attempt_at": str(existing.get("lastAiAttemptAt", "")).strip() if existing is not None else "",
         }
 
-        if summary_text.strip() and summary_source == GITHUB_GPT_MODE:
+        if summary_text.strip():
             return summary_text, False, author, summary_source, metadata
 
-        summary_text, author, summary_source, metadata = self._upgrade_or_create_summary(
-            repo,
-            diff_text,
-            summary_text,
-            author,
-            summary_source,
-            metadata,
+        # Captures must finish promptly across every repository. AI upgrades run
+        # separately through the one-item background enhancer.
+        return (
+            self._build_summary_heuristic(repo.label, diff_text, repo.path),
+            False,
+            "Backup",
+            HEURISTIC_MODE,
+            {
+                "requested_summary_source": HEURISTIC_MODE,
+                "summary_warning": "",
+                "fallback_summary_source": "",
+                "summary_timing_ms": 0,
+                "summary_provider_details": "",
+                "last_ai_attempt_at": "",
+            },
         )
-
-        return summary_text, False, author, summary_source, metadata
 
     def _upgrade_or_create_summary(
         self,
@@ -3461,7 +3804,6 @@ class PyesisApp:
     def _poll_worker(self, repos: list[RepoConfig]) -> None:
         captured = 0
         errors: list[str] = []
-        backlog_present_at_poll_start = self._has_current_week_ai_backlog()
 
         for repo in repos:
             try:
@@ -3480,17 +3822,10 @@ class PyesisApp:
                 errors.append(f"{repo.label}: capture failed: {exc}")
                 continue
 
-        if backlog_present_at_poll_start:
-            handled_repos: dict[str, int] = {}
-            rewrite_gate = self._make_budgeted_poll_rewrite_gate(handled_repos, captured)
-            enhancement_report, enhancement_error = self._run_poll_enhancer(rewrite_gate)
-        else:
-            enhancement_report, enhancement_error = None, ""
-
         self._poll_captured_count = captured
         self._poll_errors = errors
-        self._poll_enhancement_report = enhancement_report
-        self._poll_enhancement_error = enhancement_error
+        self._poll_enhancement_report = None
+        self._poll_enhancement_error = ""
 
     def _check_poll_worker(self) -> None:
         if self._poll_thread is not None and self._poll_thread.is_alive():
@@ -3529,6 +3864,8 @@ class PyesisApp:
         now_time = datetime.now().strftime('%H:%M:%S')
         if self._poll_has_persistable_updates(captured, enhancement_report):
             self._persist()
+            if captured:
+                self._refresh_editor()
             base = self._poll_completion_message(captured, enhancement_report, now_time)
             self.poll_summary_var.set(base)
             if errors:
@@ -3557,9 +3894,10 @@ class PyesisApp:
                 self._sync_ollama_alert_state()
                 self._apply_theme()
 
-        self._start_ai_recovery_probe_if_needed()
-
         self._reset_poll_state()
+        self._start_ai_recovery_probe_if_needed()
+        if self._has_current_week_ai_backlog() and self._current_ai_mode() != HEURISTIC_MODE:
+            self._run_periodic_summary_enhancer(force_run=True, update_status=False)
 
     def _poll_has_persistable_updates(self, captured: int, enhancement_report) -> bool:
         return bool(
@@ -3667,6 +4005,7 @@ class PyesisApp:
             if report.total_rewritten or report.total_failed_marked:
                 self._refresh_editor()
             self._update_backlog_button()
+            self._queue_next_backlog_rewrite(report)
             return
 
         if (report.total_rewritten or report.total_failed_marked) and update_status:
@@ -3685,6 +4024,14 @@ class PyesisApp:
             self._refresh_editor()
 
         self._update_backlog_button()
+        self._queue_next_backlog_rewrite(report)
+
+    def _queue_next_backlog_rewrite(self, report) -> None:
+        if report.total_rewritten <= 0 or report.total_failed_marked:
+            return
+        if self._current_ai_mode() == HEURISTIC_MODE or not self._has_current_week_ai_backlog():
+            return
+        self.root.after(0, self._run_idle_backlog_enhancer)
 
     def _run_periodic_summary_enhancer(self, *, force_run: bool = False, update_status: bool = True):
         if self._enhancer_in_flight:
@@ -3698,6 +4045,8 @@ class PyesisApp:
                 report = run_periodic_enhancer(
                     self.config,
                     force_run=force_run,
+                    rewrite_gate=self._make_single_rewrite_gate(),
+                    activity_callback=self._poll_activity_callback,
                     progress_callback=self._on_entry_rewrite_progress,
                 )
                 error = ""
@@ -3740,137 +4089,211 @@ class PyesisApp:
     def _current_week_entries(self) -> list[EntryRecord]:
         return [entry for entry in self.config.entries if self._is_current_week_entry(entry)]
 
+    def _set_long_process_buttons_busy(self, busy: bool, active_button: str = "") -> None:
+        button_specs = (
+            ("export_week_json_button", EXPORT_WEEK_JSON_BUTTON_TEXT, "Saving Week JSON..."),
+            ("import_week_json_button", IMPORT_WEEK_JSON_BUTTON_TEXT, "Importing Week JSON..."),
+            ("ai_weekly_button", AI_WEEKLY_BUTTON_TEXT, "Generating AI Weekly..."),
+        )
+        state = "disabled" if busy else "normal"
+        for attr_name, idle_text, busy_text in button_specs:
+            button = getattr(self, attr_name, None)
+            if button is None:
+                continue
+            text = busy_text if busy and attr_name == active_button else idle_text
+            button.configure(state=state, text=text)
+
+        root = getattr(self, "root", None)
+        if root is not None and hasattr(root, "update_idletasks"):
+            root.update_idletasks()
+
+    def _begin_long_process(self, active_button: str) -> bool:
+        if getattr(self, "_file_task_in_flight", False):
+            self.status_var.set("Another export/import task is already running")
+            return False
+        self._file_task_in_flight = True
+        self._set_long_process_buttons_busy(True, active_button)
+        return True
+
+    def _end_long_process(self) -> None:
+        self._file_task_in_flight = False
+        self._set_long_process_buttons_busy(False)
+
+    def _build_ai_weekly_report_worker(self, evidence_text: str, week_start_iso: str, output_dir: Path) -> None:
+        try:
+            result = build_weekly_report(evidence_text, model_override=DEFAULT_OLLAMA_WEEKLY_REPORT_MODEL)
+            target = export_ai_weekly_report_docx(
+                result.text,
+                output_dir,
+                week_start_iso,
+                provider_details=result.provider_details,
+            )
+            error = ""
+        except Exception as exc:
+            result = None
+            target = None
+            error = str(exc)
+
+        self.root.after(0, lambda: self._complete_ai_weekly_report(result, target, error))
+
+    def _complete_ai_weekly_report(
+        self,
+        result: AIWeeklyReportResult | None,
+        target: Path | None,
+        error: str,
+    ) -> None:
+        self.ollama_activity_var.set(OLLAMA_IDLE_STATUS)
+        if error:
+            self.status_var.set("AI weekly report failed")
+            messagebox.showerror(AI_WEEKLY_REPORT_TITLE, error)
+            self._end_long_process()
+            return
+        if result is None or target is None:
+            self.status_var.set("AI weekly report failed")
+            messagebox.showerror(AI_WEEKLY_REPORT_TITLE, "AI weekly report did not produce a document.")
+            self._end_long_process()
+            return
+
+        self.status_var.set(f"AI weekly report exported to {target.name}")
+        messagebox.showinfo(AI_WEEKLY_REPORT_TITLE, f"Saved {target}")
+        self._open_created_document(target)
+        self._end_long_process()
+
     def _open_ai_weekly_report(self) -> None:
+        if not self._begin_long_process("ai_weekly_button"):
+            return
+
         self.config.week_end_day = self.week_end_var.get()
         week_entries = self._current_week_entries()
         if not week_entries:
             messagebox.showinfo(AI_WEEKLY_REPORT_TITLE, "No entries found for the current week.")
+            self._end_long_process()
             return
 
         self._apply_ai_environment_defaults()
         evidence_text = render_weekly_evidence_text(self.config)
+        week_start_iso = self._active_week_start().isoformat()
+        output_dir = self._docx_output_dir()
         self.status_var.set("Generating AI weekly report from current-week evidence...")
         self.ollama_activity_var.set("[WORKING] Generating weekly report with Ollama")
-        try:
-            result = build_weekly_report(evidence_text)
-        except Exception as exc:
-            self.ollama_activity_var.set(OLLAMA_IDLE_STATUS)
-            self.status_var.set("AI weekly report failed")
-            messagebox.showerror(AI_WEEKLY_REPORT_TITLE, str(exc))
-            return
-
-        self.ollama_activity_var.set(OLLAMA_IDLE_STATUS)
-        week_start_iso = self._active_week_start().isoformat()
-        target = export_ai_weekly_report_docx(
-            result.text,
-            self._docx_output_dir(),
-            week_start_iso,
-            provider_details=result.provider_details,
-        )
-        self.status_var.set(f"AI weekly report exported to {target.name}")
-        messagebox.showinfo(AI_WEEKLY_REPORT_TITLE, f"Saved {target}")
-        self._open_created_document(target)
+        threading.Thread(
+            target=self._build_ai_weekly_report_worker,
+            args=(evidence_text, week_start_iso, output_dir),
+            daemon=True,
+        ).start()
 
     def _export_week_json(self) -> None:
         """Export the current week's entries to a portable JSON file for cross-machine merging."""
-        week_entries = [e for e in self.config.entries if self._is_current_week_entry(e)]
-        if not week_entries:
-            messagebox.showinfo("Export Week JSON", "No entries found for the current week.")
+        if not self._begin_long_process("export_week_json_button"):
             return
 
-        week_start = self._active_week_start()
-        week_end = week_start + timedelta(days=6)
-        default_name = f"pyesis_week_{week_start.strftime('%Y-%m-%d')}to{week_end.strftime('%d')}.json"
-        export_dir = self._docx_output_dir()
-        export_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            week_entries = [e for e in self.config.entries if self._is_current_week_entry(e)]
+            if not week_entries:
+                messagebox.showinfo("Export Week JSON", "No entries found for the current week.")
+                return
 
-        target = filedialog.asksaveasfilename(
-            title="Export current week entries as JSON",
-            initialdir=str(export_dir),
-            initialfile=default_name,
-            defaultextension=".json",
-            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
-        )
-        if not target:
-            return
+            exported_at = datetime.now()
+            week_start = self._active_week_start()
+            default_name = f"Pyesis{exported_at.strftime('%Y%m%d')}.json"
+            export_dir = self._docx_output_dir()
+            export_dir.mkdir(parents=True, exist_ok=True)
 
-        payload = {
-            "pyesis_week_export": True,
-            "exported_at": datetime.now().isoformat(),
-            "week_start_iso": week_start.isoformat(),
-            "week_end_day": self.week_end_var.get(),
-            "entries": [asdict(e) for e in week_entries],
-        }
+            target = filedialog.asksaveasfilename(
+                title="Export current week entries as JSON",
+                initialdir=str(export_dir),
+                initialfile=default_name,
+                defaultextension=".json",
+                filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            )
+            if not target:
+                return
 
-        Path(target).write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        self.status_var.set(f"Exported {len(week_entries)} entries to {Path(target).name}")
-        messagebox.showinfo(
-            "Export complete",
-            f"Saved {len(week_entries)} entr{'y' if len(week_entries) == 1 else 'ies'} to:\n{target}",
-        )
+            payload = {
+                "pyesis_week_export": True,
+                "exported_at": exported_at.isoformat(),
+                "week_start_iso": week_start.isoformat(),
+                "week_end_day": self.week_end_var.get(),
+                "entries": [asdict(e) for e in week_entries],
+            }
+
+            Path(target).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            self.status_var.set(f"Exported {len(week_entries)} entries to {Path(target).name}")
+            messagebox.showinfo(
+                "Export complete",
+                f"Saved {len(week_entries)} entr{'y' if len(week_entries) == 1 else 'ies'} to:\n{target}",
+            )
+        finally:
+            self._end_long_process()
 
     def _import_week_json(self) -> None:
         """Import week entries from a previously exported JSON file, merging into current state."""
-        export_dir = self._docx_output_dir()
-        source = filedialog.askopenfilename(
-            title="Import week entries from JSON",
-            initialdir=str(export_dir),
-            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
-        )
-        if not source:
+        if not self._begin_long_process("import_week_json_button"):
             return
 
         try:
-            data = json.loads(Path(source).read_text(encoding="utf-8"))
-        except Exception as exc:
-            messagebox.showerror(IMPORT_WEEK_FAILED_TITLE, f"Could not read file:\n{exc}")
-            return
-
-        if not isinstance(data, dict) or not data.get("pyesis_week_export"):
-            messagebox.showerror(
-                IMPORT_WEEK_FAILED_TITLE,
-                "This file does not appear to be a Pyesis week export.\n"
-                "Use 'Export Week JSON' on your work machine to create one.",
+            export_dir = self._docx_output_dir()
+            source = filedialog.askopenfilename(
+                title="Import week entries from JSON",
+                initialdir=str(export_dir),
+                filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
             )
-            return
-
-        raw_entries = data.get("entries", [])
-        if not isinstance(raw_entries, list) or not raw_entries:
-            messagebox.showinfo("Import Week JSON", "No entries found in the selected file.")
-            return
-
-        # Warn if the file's week doesn't match the current week
-        file_week_start = str(data.get("week_start_iso", "")).strip()
-        current_week_start = self._active_week_start().isoformat()
-        if file_week_start and file_week_start != current_week_start:
-            proceed = messagebox.askyesno(
-                "Week mismatch",
-                f"The file contains entries from week starting {file_week_start[:10]},\n"
-                f"but the current week starts {current_week_start[:10]}.\n\n"
-                "Import anyway?",
-            )
-            if not proceed:
+            if not source:
                 return
 
-        try:
-            imported = [_decode_entry(item) for item in raw_entries if isinstance(item, dict)]
-        except Exception as exc:
-            messagebox.showerror(IMPORT_WEEK_FAILED_TITLE, f"Could not parse entries:\n{exc}")
-            return
+            try:
+                data = json.loads(Path(source).read_text(encoding="utf-8"))
+            except Exception as exc:
+                messagebox.showerror(IMPORT_WEEK_FAILED_TITLE, f"Could not read file:\n{exc}")
+                return
 
-        before = len(self.config.entries)
-        self.config.entries = dedupe_entries(self.config.entries + imported)
-        after = len(self.config.entries)
-        added = after - before
+            if not isinstance(data, dict) or not data.get("pyesis_week_export"):
+                messagebox.showerror(
+                    IMPORT_WEEK_FAILED_TITLE,
+                    "This file does not appear to be a Pyesis week export.\n"
+                    "Use 'Export Week JSON' on your work machine to create one.",
+                )
+                return
 
-        self._persist()
-        self._refresh_editor()
-        self.status_var.set(f"Imported {added} new entr{'y' if added == 1 else 'ies'} from {Path(source).name}")
-        messagebox.showinfo(
-            "Import complete",
-            f"Added {added} new entr{'y' if added == 1 else 'ies'} "
-            f"({len(imported)} in file, {len(imported) - added} already present / deduplicated).",
-        )
+            raw_entries = data.get("entries", [])
+            if not isinstance(raw_entries, list) or not raw_entries:
+                messagebox.showinfo("Import Week JSON", "No entries found in the selected file.")
+                return
+
+            # Warn if the file's week doesn't match the current week
+            file_week_start = str(data.get("week_start_iso", "")).strip()
+            current_week_start = self._active_week_start().isoformat()
+            if file_week_start and file_week_start != current_week_start:
+                proceed = messagebox.askyesno(
+                    "Week mismatch",
+                    f"The file contains entries from week starting {file_week_start[:10]},\n"
+                    f"but the current week starts {current_week_start[:10]}.\n\n"
+                    "Import anyway?",
+                )
+                if not proceed:
+                    return
+
+            try:
+                imported = [_decode_entry(item) for item in raw_entries if isinstance(item, dict)]
+            except Exception as exc:
+                messagebox.showerror(IMPORT_WEEK_FAILED_TITLE, f"Could not parse entries:\n{exc}")
+                return
+
+            before = len(self.config.entries)
+            self.config.entries = dedupe_entries(self.config.entries + imported)
+            after = len(self.config.entries)
+            added = after - before
+
+            self._persist()
+            self._refresh_editor()
+            self.status_var.set(f"Imported {added} new entr{'y' if added == 1 else 'ies'} from {Path(source).name}")
+            messagebox.showinfo(
+                "Import complete",
+                f"Added {added} new entr{'y' if added == 1 else 'ies'} "
+                f"({len(imported)} in file, {len(imported) - added} already present / deduplicated).",
+            )
+        finally:
+            self._end_long_process()
 
     def _open_docx_folder(self) -> None:
         target_dir = self._docx_output_dir()

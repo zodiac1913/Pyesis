@@ -23,7 +23,9 @@ LEGACY_BUFFER_DIR = Path("diff_buffers")
 LEGACY_LOG_DIR = Path("logs")
 NEAR_DUP_DIFF_SIMILARITY_THRESHOLD = 0.80
 OLLAMA_DEFAULT_URL = "http://localhost:11434/api/chat"
-OLLAMA_DEFAULT_TIMEOUT_SECONDS = 180
+OLLAMA_DEFAULT_TIMEOUT_SECONDS = 0
+OLLAMA_DEFAULT_NUM_THREADS = 2
+MIRROR_ROOT_PREFIXES = ("demo/", "extension/", "src/runtime/")
 SUPPORTED_AI_MODES = {"heuristic", "ollama", "openai-compatible", "github-gpt"}
 LEGACY_GITHUB_COPILOT_MODE = "github-copilot"
 GITHUB_GPT_DEFAULT_MODEL = "openai/gpt-5"
@@ -249,6 +251,7 @@ class AppConfig:
     ai_ollama_model: str = ""
     ai_ollama_keep_alive: str = "30m"
     ai_ollama_timeout_seconds: int = OLLAMA_DEFAULT_TIMEOUT_SECONDS
+    ai_ollama_num_threads: int = OLLAMA_DEFAULT_NUM_THREADS
     ai_openai_url: str = ""
     ai_openai_model: str = ""
     ai_github_gpt_url: str = GITHUB_MODELS_CHAT_COMPLETIONS_URL
@@ -319,7 +322,7 @@ def _entry_diff_fingerprint(entry: EntryRecord) -> str:
 
 def _is_synchronized_mirror_duplicate(
     entry: EntryRecord,
-    seen_synchronized: set[tuple[str, str, str]],
+    seen_synchronized: set[tuple[str, str, str, tuple[str, ...]]],
 ) -> bool:
     """
     Detect when the same code change is synced to multiple mirror files
@@ -334,15 +337,28 @@ def _is_synchronized_mirror_duplicate(
     if not date_key:
         return False
 
-    # Create a fingerprint based on repo, date, and summary text
+    entry_files = _entry_files_fingerprint(entry)
+    normalized_files = tuple(_normalized_mirror_path(path) for path in entry_files)
+    if not normalized_files or normalized_files == tuple(entry_files):
+        return False
+
+    # Create a fingerprint based on repo, date, summary text, and normalized mirror-relative paths.
     summary_normalized = entry.summary.lower().strip()
-    sync_key = (entry.repo_path, date_key, summary_normalized)
+    sync_key = (entry.repo_path, date_key, summary_normalized, normalized_files)
 
     if sync_key in seen_synchronized:
         return True
 
     seen_synchronized.add(sync_key)
     return False
+
+
+def _normalized_mirror_path(path: str) -> str:
+    normalized = path.lower().strip()
+    for prefix in MIRROR_ROOT_PREFIXES:
+        if normalized.startswith(prefix):
+            return normalized.removeprefix(prefix)
+    return normalized
 
 
 
@@ -603,43 +619,45 @@ def _should_rewrite_saved_entries(
     )
 
 
-def load_config() -> AppConfig:
-    ensure_state_storage()
-    if not STATE_PATH.exists():
-        migrate_legacy_runtime_data()
-    if not STATE_PATH.exists():
-        return AppConfig()
+def _load_state_data(state_path: Path = STATE_PATH) -> dict[str, Any] | None:
+    if state_path == STATE_PATH:
+        ensure_state_storage()
+        if not STATE_PATH.exists():
+            migrate_legacy_runtime_data()
+    if not state_path.exists():
+        return None
+    raw_data = json.loads(state_path.read_text(encoding="utf-8"))
+    return raw_data if isinstance(raw_data, dict) else None
 
-    data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+
+def _config_export_directory(data: dict[str, Any]) -> str:
     default_export_dir = default_export_directory()
     raw_export_directory = str(data.get("export_directory", "") or "").strip()
     if not raw_export_directory:
-        export_directory = default_export_dir
-    else:
-        configured_path = Path(raw_export_directory).expanduser()
-        legacy_export_dir = Path("exports")
-        if configured_path == legacy_export_dir or configured_path.resolve() == legacy_export_dir.resolve():
-            export_directory = default_export_dir
-        else:
-            export_directory = raw_export_directory
+        return default_export_dir
+
+    configured_path = Path(raw_export_directory).expanduser()
+    legacy_export_dir = Path("exports")
+    if configured_path == legacy_export_dir or configured_path.resolve() == legacy_export_dir.resolve():
+        return default_export_dir
+    return raw_export_directory
+
+
+def _config_theme_mode(data: dict[str, Any]) -> str:
     theme_mode = str(data.get("theme_mode", "system")).lower()
     if theme_mode not in {"system", "light", "dark"}:
-        theme_mode = "system"
-    raw_entry_items = data.get("entries", [])
-    raw_entries = [_decode_entry(item) for item in raw_entry_items]
-    entries = dedupe_entries(raw_entries)
-    if _should_rewrite_saved_entries(raw_entries, entries, raw_entry_items):
-        data["entries"] = [asdict(entry) for entry in entries]
-        STATE_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        return "system"
+    return theme_mode
 
+
+def _base_config_from_data(data: dict[str, Any], entries: list[EntryRecord]) -> AppConfig:
     ai_mode = _normalize_ai_mode(data.get("ai_mode", "heuristic"))
-
     return AppConfig(
         week_end_day=data.get("week_end_day", "Thursday"),
-        theme_mode=theme_mode,
+        theme_mode=_config_theme_mode(data),
         high_contrast=bool(data.get("high_contrast", False)),
         ui_font_size=max(10, min(20, int(data.get("ui_font_size", 11)))),
-        export_directory=export_directory,
+        export_directory=_config_export_directory(data),
         auto_export_time=str(data.get("auto_export_time", "")),
         last_auto_export_date=str(data.get("last_auto_export_date", "")),
         ai_mode=ai_mode,
@@ -648,7 +666,8 @@ def load_config() -> AppConfig:
         ai_ollama_url=str(data.get("ai_ollama_url", OLLAMA_DEFAULT_URL)).strip() or OLLAMA_DEFAULT_URL,
         ai_ollama_model=str(data.get("ai_ollama_model", "")).strip(),
         ai_ollama_keep_alive=str(data.get("ai_ollama_keep_alive", "30m")).strip() or "30m",
-        ai_ollama_timeout_seconds=max(30, int(data.get("ai_ollama_timeout_seconds", OLLAMA_DEFAULT_TIMEOUT_SECONDS) or OLLAMA_DEFAULT_TIMEOUT_SECONDS)),
+        ai_ollama_timeout_seconds=max(0, int(data.get("ai_ollama_timeout_seconds", OLLAMA_DEFAULT_TIMEOUT_SECONDS) or OLLAMA_DEFAULT_TIMEOUT_SECONDS)),
+        ai_ollama_num_threads=max(1, int(data.get("ai_ollama_num_threads", OLLAMA_DEFAULT_NUM_THREADS) or OLLAMA_DEFAULT_NUM_THREADS)),
         ai_openai_url=str(data.get("ai_openai_url", "")).strip(),
         ai_openai_model=str(data.get("ai_openai_model", "")).strip(),
         ai_github_gpt_url=str(data.get("ai_github_gpt_url", data.get("ai_github_copilot_url", GITHUB_MODELS_CHAT_COMPLETIONS_URL))).strip() or GITHUB_MODELS_CHAT_COMPLETIONS_URL,
@@ -670,6 +689,26 @@ def load_config() -> AppConfig:
     )
 
 
+def load_startup_config_snapshot(state_path: Path = STATE_PATH) -> AppConfig:
+    data = _load_state_data(state_path)
+    if data is None:
+        return AppConfig()
+    return _base_config_from_data(data, [])
+
+
+def load_config() -> AppConfig:
+    data = _load_state_data()
+    if data is None:
+        return AppConfig()
+    raw_entry_items = data.get("entries", [])
+    raw_entries = [_decode_entry(item) for item in raw_entry_items]
+    entries = dedupe_entries(raw_entries)
+    if _should_rewrite_saved_entries(raw_entries, entries, raw_entry_items):
+        data["entries"] = [asdict(entry) for entry in entries]
+        STATE_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return _base_config_from_data(data, entries)
+
+
 def save_config(config: AppConfig, state_path: Path = STATE_PATH) -> None:
     config.entries = dedupe_entries(config.entries)
     payload = {
@@ -686,7 +725,8 @@ def save_config(config: AppConfig, state_path: Path = STATE_PATH) -> None:
         "ai_ollama_url": config.ai_ollama_url,
         "ai_ollama_model": config.ai_ollama_model,
         "ai_ollama_keep_alive": config.ai_ollama_keep_alive,
-        "ai_ollama_timeout_seconds": max(30, int(config.ai_ollama_timeout_seconds)),
+        "ai_ollama_timeout_seconds": max(0, int(config.ai_ollama_timeout_seconds)),
+        "ai_ollama_num_threads": max(1, int(config.ai_ollama_num_threads)),
         "ai_openai_url": config.ai_openai_url,
         "ai_openai_model": config.ai_openai_model,
         "ai_github_gpt_url": config.ai_github_gpt_url,

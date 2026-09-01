@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+import tempfile
 import unittest
 
-from pyesis.config import EntryRecord, dedupe_entries
+from pyesis.config import EntryRecord, dedupe_entries, load_startup_config_snapshot
 
 
 class ConfigSummaryProtectionTests(unittest.TestCase):
@@ -137,6 +140,43 @@ class ConfigSummaryProtectionTests(unittest.TestCase):
 
         self.assertEqual(len(deduped), 1)
         self.assertEqual(deduped[0].diff_hash, "hash-two")
+
+    def test_load_startup_config_snapshot_reads_theme_and_repos_without_entries(self) -> None:
+        payload = {
+            "theme_mode": "dark",
+            "high_contrast": True,
+            "ui_font_size": 14,
+            "week_end_day": "Friday",
+            "repos": [
+                {"path": "/tmp/pyesis", "label": "Pyesis", "poll_seconds": 90},
+            ],
+            "entries": [
+                {
+                    "repo_label": "Pyesis",
+                    "repo_path": "/tmp/pyesis",
+                    "created_at": "2026-08-26T10:05:00",
+                    "day_name": "Tuesday",
+                    "week_start_iso": "2026-08-21T00:00:00",
+                    "summary": "I changed startup loading.",
+                    "diff_hash": "hash-1",
+                    "diff_excerpt": "diff --git a/pyesis/app.py b/pyesis/app.py\n+++ b/pyesis/app.py\n",
+                }
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            state_path = Path(tmp_dir) / "pyesis_state.json"
+            state_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            snapshot = load_startup_config_snapshot(state_path)
+
+        self.assertEqual(snapshot.theme_mode, "dark")
+        self.assertTrue(snapshot.high_contrast)
+        self.assertEqual(snapshot.ui_font_size, 14)
+        self.assertEqual(snapshot.week_end_day, "Friday")
+        self.assertEqual(len(snapshot.repos), 1)
+        self.assertEqual(snapshot.repos[0].label, "Pyesis")
+        self.assertEqual(snapshot.entries, [])
 
 
 if __name__ == "__main__":

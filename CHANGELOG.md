@@ -1,5 +1,23 @@
 # Changelog
 
+## 2026.9.1.0 - 2026-09-01
+
+### Added
+- Weekly JSON export and import for moving the current week between machines.
+- AI Weekly DOCX export built from current-week evidence.
+- Click-to-delete preview markers with confirmation for cleaning up individual entries.
+
+### Changed
+- Startup now loads from a lightweight snapshot first, then finishes saved-entry normalization and shown-diff recovery in the background.
+- Runtime state and diff buffers now live under `~/PyesisState` with legacy repo-local data migration.
+- Weekly rendering, evidence generation, and summary cleanup respect the configured week-end day.
+- Ollama requests now support configurable timeout and thread settings, and AI Weekly forces its dedicated report model.
+
+### Fixed
+- Current-week recovery restores shown buffer items so heavy prior-day work does not disappear on reopen.
+- Orange backlog and weak-summary handling now track only current-week entries that still need attention.
+- Preview rendering now avoids partial startup views that could temporarily show an incomplete week.
+
 ## 2026.7.30.1 - 2026-07-30
 
 ### Fixed

@@ -15,14 +15,17 @@ from pyesis.document_formatter import export_ai_weekly_report_docx, render_plain
 class DocumentFormatterTests(unittest.TestCase):
     def test_export_ai_weekly_report_docx_writes_word_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
-            target = export_ai_weekly_report_docx(
-                "## Monday\n### Pyesis\n- Summary: I added parser recovery details.\n- Summary: I clarified the import path changes.",
-                Path(tmp_dir),
-                "2026-06-26T00:00:00",
-                provider_details="qwen3-coder:30b",
-            )
+            with patch("pyesis.document_formatter.datetime") as mock_datetime:
+                mock_datetime.now.return_value = datetime(2026, 8, 26, 19, 15, 0)
+                mock_datetime.fromisoformat.side_effect = datetime.fromisoformat
+                target = export_ai_weekly_report_docx(
+                    "## Monday\n### Pyesis\n- Summary: I added parser recovery details.\n- Summary: I clarified the import path changes.",
+                    Path(tmp_dir),
+                    "2026-06-26T00:00:00",
+                    provider_details="qwen3-coder:30b",
+                )
 
-            self.assertEqual(target.name, "weekly_ai_report_20260702.docx")
+            self.assertEqual(target.name, "WhatIDidThisWeek20260826.docx")
             self.assertTrue(target.exists())
             document = Document(target)
             paragraphs = [
@@ -178,6 +181,29 @@ class DocumentFormatterTests(unittest.TestCase):
         self.assertEqual(day_chunk.tags, ("day-heading",))
         self.assertEqual(repo_chunk.tags, ("repo-heading",))
         self.assertEqual(item_chunk.tags, ())
+
+    def test_render_text_chunks_appends_delete_marker_when_requested(self) -> None:
+        entry = EntryRecord(
+            repo_label="Pyesis",
+            repo_path="/tmp/pyesis",
+            created_at="2026-06-29T06:37:47",
+            day_name="Monday",
+            week_start_iso="2026-06-26T00:00:00",
+            summary="I tightened preview rendering in pyesis/app.py.",
+            diff_hash="hash-delete-tag",
+            diff_excerpt="diff --git a/pyesis/app.py b/pyesis/app.py\n+++ b/pyesis/app.py\n",
+            summary_source="ollama",
+            author="AI",
+        )
+        config = AppConfig(week_end_day="Thursday", entries=[entry])
+
+        with patch("pyesis.document_formatter.datetime") as mock_datetime:
+            mock_datetime.now.return_value = datetime(2026, 6, 29, 12, 0, 0)
+            mock_datetime.fromisoformat.side_effect = datetime.fromisoformat
+            chunks = render_text_chunks(config, delete_tag_resolver=lambda _entry: ("entry-delete", "entry-delete-1"))
+
+        delete_chunk = next(chunk for chunk in chunks if chunk.text == "  x\n")
+        self.assertEqual(delete_chunk.tags, ("entry-delete", "entry-delete-1"))
 
     def test_render_text_chunks_adds_evidence_from_diff_when_summary_has_none(self) -> None:
         entry = EntryRecord(

@@ -425,6 +425,68 @@ class AISummaryTests(unittest.TestCase):
         self.assertEqual(result.provider_details, "qwen3-coder:30b")
         self.assertFalse(request_payload["stream"])
         self.assertNotIn("format", request_payload)
+        self.assertEqual(request_payload["options"]["num_thread"], 2)
+
+    def test_build_weekly_report_falls_through_multiple_models(self) -> None:
+        attempts: list[tuple[str, int | None]] = []
+
+        def fake_request(evidence_text, *, url, model, keep_alive, timeout):
+            del evidence_text, url, keep_alive
+            attempts.append((model, timeout))
+            if model == "broken-model":
+                raise RuntimeError("model offline")
+            return AIWeeklyReportResult(
+                text="Monday\nPyesis\nI added parser recovery details and clarified the import path changes.",
+                timing_ms=321,
+                provider_details=model,
+            )
+
+        with patch("pyesis.ai_summary._ollama_request_weekly_report", side_effect=fake_request):
+            with patch.dict(
+                "os.environ",
+                {
+                    "PYESIS_OLLAMA_URL": "http://localhost:11434/api/chat",
+                    "PYESIS_OLLAMA_MODEL": "broken-model, qwen3-coder:30b",
+                    "PYESIS_OLLAMA_KEEP_ALIVE": "5m",
+                    "PYESIS_OLLAMA_TIMEOUT_SECONDS": "225",
+                },
+                clear=False,
+            ):
+                result = build_weekly_report("Day: Monday\nRepo: Pyesis\n- Summary: Added parser")
+
+        self.assertEqual(attempts, [("broken-model", 225), ("qwen3-coder:30b", 225)])
+        self.assertEqual(result.provider_details, "qwen3-coder:30b")
+
+    def test_build_weekly_report_model_override_uses_only_requested_model(self) -> None:
+        attempts: list[tuple[str, int | None]] = []
+
+        def fake_request(evidence_text, *, url, model, keep_alive, timeout):
+            del evidence_text, url, keep_alive
+            attempts.append((model, timeout))
+            return AIWeeklyReportResult(
+                text="Monday\nPyesis\nI added parser recovery details and clarified the import path changes.",
+                timing_ms=321,
+                provider_details=model,
+            )
+
+        with patch("pyesis.ai_summary._ollama_request_weekly_report", side_effect=fake_request):
+            with patch.dict(
+                "os.environ",
+                {
+                    "PYESIS_OLLAMA_URL": "http://localhost:11434/api/chat",
+                    "PYESIS_OLLAMA_MODEL": "broken-model, qwen2.5-coder:latest",
+                    "PYESIS_OLLAMA_KEEP_ALIVE": "5m",
+                    "PYESIS_OLLAMA_TIMEOUT_SECONDS": "225",
+                },
+                clear=False,
+            ):
+                result = build_weekly_report(
+                    "Day: Monday\nRepo: Pyesis\n- Summary: Added parser",
+                    model_override="qwen3-coder:30b",
+                )
+
+        self.assertEqual(attempts, [("qwen3-coder:30b", 225)])
+        self.assertEqual(result.provider_details, "qwen3-coder:30b")
 
     def test_ollama_structured_summary_falls_through_multiple_models(self) -> None:
         diff_text = (
@@ -573,6 +635,56 @@ class AISummaryTests(unittest.TestCase):
         self.assertEqual(result.source, "ollama")
         self.assertEqual(mock_urlopen.call_args.kwargs["timeout"], 240)
 
+    def test_build_summary_allows_ollama_to_wait_indefinitely(self) -> None:
+        diff_text = (
+            "diff --git a/pyesis/diff_buffer.py b/pyesis/diff_buffer.py\n"
+            "+++ b/pyesis/diff_buffer.py\n"
+            "@@ -1,5 +1,6 @@\n"
+            " class DiffLedgerItem(TypedDict):\n"
+            "+    summarySource: str\n"
+            "     rewrittenBy: str\n"
+        )
+        response_payload = {
+            "message": {
+                "content": json.dumps(
+                    {
+                        "who": "I",
+                        "what": "I added summarySource in pyesis/diff_buffer.py",
+                        "where": "pyesis/diff_buffer.py",
+                        "when": "Not available from the diff.",
+                        "why": "track summary source metadata",
+                        "how": "adding the summarySource field",
+                    }
+                )
+            }
+        }
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return json.dumps(response_payload).encode("utf-8")
+
+        with patch("pyesis.ai_summary.request.urlopen", return_value=FakeResponse()) as mock_urlopen:
+            with patch.dict(
+                "os.environ",
+                {
+                    "PYESIS_OLLAMA_URL": "http://localhost:11434/api/chat",
+                    "PYESIS_OLLAMA_MODEL": "qwen3-coder:30b",
+                    "PYESIS_OLLAMA_KEEP_ALIVE": "5m",
+                    "PYESIS_OLLAMA_TIMEOUT_SECONDS": "0",
+                },
+                clear=False,
+            ):
+                result = build_summary("Pyesis", diff_text, repo_path="/tmp/repo", mode="ollama")
+
+        self.assertEqual(result.source, "ollama")
+        self.assertIsNone(mock_urlopen.call_args.kwargs["timeout"])
+
     def test_build_summary_requests_json_mode_from_ollama(self) -> None:
         diff_text = (
             "diff --git a/pyesis/diff_buffer.py b/pyesis/diff_buffer.py\n"
@@ -624,6 +736,7 @@ class AISummaryTests(unittest.TestCase):
         self.assertEqual(result.source, "ollama")
         self.assertEqual(request_payload["format"], "json")
         self.assertEqual(request_payload["options"]["temperature"], 0)
+        self.assertEqual(request_payload["options"]["num_thread"], 2)
 
     def test_build_summary_reports_ollama_content_preview_on_parse_failure(self) -> None:
         diff_text = (

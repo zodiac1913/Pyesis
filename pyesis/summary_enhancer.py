@@ -49,7 +49,6 @@ WEAK_TEMPLATE_PATTERNS = (
 )
 HUMAN_AUTHORS = {"human", "user", "manual"}
 HUMAN_SOURCES = {"human", "manual"}
-FAILED_AI_RETRY_WINDOW = timedelta(minutes=10)
 FAILED_AI_RETRY_COOLDOWN = timedelta(minutes=3)
 
 
@@ -254,12 +253,10 @@ def _should_persist_failed_ai_upgrade(rewrite: SummaryRewrite | None, force_ai_u
 
 
 def _should_retry_failed_ai_upgrade(created_at: str, last_ai_attempt_at: str, current_time: datetime) -> bool:
-    created = _parse_iso(created_at)
+    del created_at
     last_attempt = _parse_iso(last_ai_attempt_at)
-    if created is None or last_attempt is None:
-        return False
-    if current_time > (created + FAILED_AI_RETRY_WINDOW):
-        return False
+    if last_attempt is None:
+        return True
     return current_time >= (last_attempt + FAILED_AI_RETRY_COOLDOWN)
 
 
@@ -346,7 +343,8 @@ def _is_current_week_timestamp(timestamp: str, active_week_start: datetime) -> b
 def _is_current_week_entry(entry: EntryRecord, active_week_start: datetime) -> bool:
     stored_week_start = _parse_iso(entry.week_start_iso)
     if stored_week_start is not None:
-        return stored_week_start == active_week_start
+        if stored_week_start == active_week_start:
+            return True
 
     created_at = _parse_iso(entry.created_at)
     if created_at is None:
@@ -697,9 +695,9 @@ def _rewrite_state_entries(
             entry.author,
         )
         if not _accept_rewrite(rewrite, force_ai_upgrade):
+            persist_failed_ai_upgrade = _should_persist_failed_ai_upgrade(rewrite, force_ai_upgrade)
             _log_rewrite_skip(report, "State", entry.repo_label, rewrite, force_ai_upgrade, builder_call.duration_seconds)
             if not dry_run:
-                failure_warning = _rewrite_failure_warning(rewrite, force_ai_upgrade)
                 config.entries[index] = EntryRecord(
                     repo_label=entry.repo_label,
                     repo_path=entry.repo_path,
@@ -714,7 +712,7 @@ def _rewrite_state_entries(
                     rewritten_by=entry.rewritten_by,
                     rewritten_at=entry.rewritten_at,
                     requested_summary_source=(rewrite.requested_source if rewrite is not None else entry.requested_summary_source),
-                    summary_warning=failure_warning,
+                    summary_warning="" if persist_failed_ai_upgrade else _rewrite_failure_warning(rewrite, force_ai_upgrade),
                     fallback_summary_source=(rewrite.fallback_source if rewrite is not None else entry.fallback_summary_source),
                     summary_timing_ms=max(0, int(rewrite.timing_ms)) if rewrite is not None else entry.summary_timing_ms,
                     summary_provider_details=(rewrite.provider_details if rewrite is not None else entry.summary_provider_details),
@@ -811,6 +809,7 @@ def _rewrite_buffer_items(
             str(item.get("author", "Backup")),
         )
         if not _accept_rewrite(rewrite, force_ai_upgrade):
+            persist_failed_ai_upgrade = _should_persist_failed_ai_upgrade(rewrite, force_ai_upgrade)
             _log_rewrite_skip(
                 report,
                 "Buffer",
@@ -820,9 +819,8 @@ def _rewrite_buffer_items(
                 builder_call.duration_seconds,
             )
             if not dry_run:
-                failure_warning = _rewrite_failure_warning(rewrite, force_ai_upgrade)
                 item["requestedSummarySource"] = rewrite.requested_source if rewrite is not None else str(item.get("requestedSummarySource", ""))
-                item["summaryWarning"] = failure_warning
+                item["summaryWarning"] = "" if persist_failed_ai_upgrade else _rewrite_failure_warning(rewrite, force_ai_upgrade)
                 item["fallbackSummarySource"] = rewrite.fallback_source if rewrite is not None else str(item.get("fallbackSummarySource", ""))
                 item["summaryTimingMs"] = max(0, int(rewrite.timing_ms)) if rewrite is not None else max(0, int(item.get("summaryTimingMs", 0) or 0))
                 item["summaryProviderDetails"] = rewrite.provider_details if rewrite is not None else str(item.get("summaryProviderDetails", ""))
@@ -900,6 +898,39 @@ def _rewrite_buffer_files(
     return updated
 
 
+def _sync_buffer_items_from_state(config: AppConfig, buffer_dir: Path, active_week_start: datetime) -> bool:
+    entries_by_hash = {
+        entry.diff_hash: entry
+        for entry in config.entries
+        if entry.diff_hash and _is_current_week_entry(entry, active_week_start)
+    }
+    updated = False
+
+    for buffer_file in sorted(buffer_dir.glob("*.json")):
+        items = _read_buffer_items(buffer_file)
+        file_changed = False
+        for item in items:
+            entry = entries_by_hash.get(str(item.get("diffHash", "")))
+            if entry is None:
+                continue
+            item["gitDiffDescription"] = entry.summary
+            item["author"] = entry.author
+            item["summarySource"] = entry.summary_source
+            item["rewrittenBy"] = entry.rewritten_by
+            item["rewrittenAt"] = entry.rewritten_at
+            item["requestedSummarySource"] = entry.requested_summary_source
+            item["summaryWarning"] = entry.summary_warning
+            item["fallbackSummarySource"] = entry.fallback_summary_source
+            item["summaryTimingMs"] = entry.summary_timing_ms
+            item["summaryProviderDetails"] = entry.summary_provider_details
+            item["lastAiAttemptAt"] = entry.last_ai_attempt_at
+            file_changed = True
+        if file_changed:
+            _write_buffer_items(buffer_file, items)
+            updated = True
+    return updated
+
+
 def run_periodic_enhancer(
     config: AppConfig,
     *,
@@ -967,6 +998,7 @@ def run_periodic_enhancer(
         current_time=current_time,
         report=report,
     )
+    buffer_updated |= _sync_buffer_items_from_state(config, resolved_buffer_dir, active_week_start)
 
     if not dry_run:
         config.summary_enhancer_last_run_at = rewritten_at

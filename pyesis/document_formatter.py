@@ -167,6 +167,7 @@ def render_text_chunks(
     config: AppConfig,
     entry_tag_resolver=None,
     warning_comment_resolver=None,
+    delete_tag_resolver=None,
     now: datetime | None = None,
 ) -> list[RenderedTextChunk]:
     active_week_start_iso, active_week_entries = _active_week_entries(config.entries, config.week_end_day, now=now)
@@ -174,7 +175,7 @@ def render_text_chunks(
 
     _append_week_header(chunks, active_week_start_iso)
     if active_week_entries:
-        _append_week_entries(chunks, active_week_entries, entry_tag_resolver, warning_comment_resolver)
+        _append_week_entries(chunks, active_week_entries, entry_tag_resolver, warning_comment_resolver, delete_tag_resolver)
 
     return chunks
 
@@ -193,13 +194,14 @@ def _append_week_entries(
     day_map: dict[str, list[EntryRecord]],
     entry_tag_resolver,
     warning_comment_resolver,
+    delete_tag_resolver,
 ) -> None:
     for day_name in DAY_ORDER:
         entries = day_map.get(day_name)
         if not entries:
             continue
         chunks.append(RenderedTextChunk(f"@{day_name}\n", tags=("day-heading",)))
-        _append_day_repo_entries(chunks, entries, entry_tag_resolver, warning_comment_resolver)
+        _append_day_repo_entries(chunks, entries, entry_tag_resolver, warning_comment_resolver, delete_tag_resolver)
         chunks.append(RenderedTextChunk("\n"))
 
 
@@ -208,12 +210,19 @@ def _append_day_repo_entries(
     entries: list[EntryRecord],
     entry_tag_resolver,
     warning_comment_resolver,
+    delete_tag_resolver,
 ) -> None:
     for repo_label, repo_entries in _group_entries_by_repo(entries).items():
         chunks.append(RenderedTextChunk(f"\t• {repo_label}:\n", tags=("repo-heading",)))
         for entry in repo_entries:
             tags = _resolved_entry_tags(entry, entry_tag_resolver)
-            for line in _summary_lines(_summary_body_text(entry.summary, entry.diff_excerpt)):
+            delete_tags = _resolved_delete_tags(entry, delete_tag_resolver)
+            summary_lines = _summary_lines(_summary_body_text(entry.summary, entry.diff_excerpt))
+            for line_index, line in enumerate(summary_lines):
+                if line_index == 0 and delete_tags:
+                    chunks.append(RenderedTextChunk(f"\t\t• {line}", tags=tags))
+                    chunks.append(RenderedTextChunk("  x\n", tags=delete_tags))
+                    continue
                 chunks.append(RenderedTextChunk(f"\t\t• {line}\n", tags=tags))
             evidence = _entry_evidence_line(entry)
             if evidence:
@@ -231,6 +240,15 @@ def _resolved_entry_tags(entry: EntryRecord, entry_tag_resolver) -> tuple[str, .
         if resolved is not None:
             return tuple(resolved)
     return ("heuristic",) if _is_heuristic_entry(entry) else ()
+
+
+def _resolved_delete_tags(entry: EntryRecord, delete_tag_resolver) -> tuple[str, ...]:
+    if delete_tag_resolver is None:
+        return ()
+    resolved = delete_tag_resolver(entry)
+    if resolved is None:
+        return ()
+    return tuple(resolved)
 
 
 def _resolved_warning_comment(entry: EntryRecord, warning_comment_resolver) -> str:
@@ -282,7 +300,7 @@ def export_ai_weekly_report_docx(
     if file_name:
         target = output_dir / file_name
     else:
-        target = output_dir / f"weekly_ai_report_{week_end.strftime('%Y%m%d')}.docx"
+        target = output_dir / f"WhatIDidThisWeek{datetime.now().strftime('%Y%m%d')}.docx"
     document.save(target)
     return target
 

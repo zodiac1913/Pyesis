@@ -16,6 +16,16 @@ class ConfigStatePathTests(unittest.TestCase):
             with patch("pyesis.config.Path.home", return_value=fake_home):
                 self.assertEqual(config.default_state_directory(), fake_home / "PyesisState")
 
+    def test_ollama_thread_count_round_trips_through_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "pyesis_state.json"
+            saved = config.AppConfig(ai_ollama_num_threads=4)
+
+            config.save_config(saved, state_path=state_path)
+            loaded = config.load_startup_config_snapshot(state_path=state_path)
+
+            self.assertEqual(loaded.ai_ollama_num_threads, 4)
+
     def test_migrate_legacy_runtime_data_uses_newest_legacy_root(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             home_dir = Path(temp_dir)
