@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from calendar import monthrange
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from difflib import SequenceMatcher
 import hashlib
 import json
@@ -37,6 +39,7 @@ LEGACY_GITHUB_GPT_MODEL_ALIASES = {
     "gpt-5": GITHUB_GPT_DEFAULT_MODEL,
     "gpt-5-mini": GITHUB_GPT_MINI_MODEL,
 }
+ENTRY_RETENTION_MONTHS = 12
 
 
 def default_pyesis_directory() -> Path:
@@ -56,12 +59,14 @@ def default_state_directory() -> Path:
 STATE_DIRECTORY = default_state_directory()
 STATE_PATH = STATE_DIRECTORY / "pyesis_state.json"
 BUFFER_DIR = STATE_DIRECTORY / "diff_buffers"
+ARCHIVE_DIR = STATE_DIRECTORY / "week_archives"
 AI_ATTEMPT_LOG_PATH = STATE_DIRECTORY / "logs" / "ai_attempts.jsonl"
 
 
 def ensure_state_storage(state_directory: Path = STATE_DIRECTORY) -> None:
     state_directory.mkdir(parents=True, exist_ok=True)
     (state_directory / "diff_buffers").mkdir(parents=True, exist_ok=True)
+    (state_directory / "week_archives").mkdir(parents=True, exist_ok=True)
     (state_directory / "logs").mkdir(parents=True, exist_ok=True)
 
 
@@ -236,6 +241,12 @@ class EntryRecord:
 
 
 @dataclass
+class DeletedEntryRecord:
+    key: str
+    deleted_at: str
+
+
+@dataclass
 class AppConfig:
     week_end_day: str = "Thursday"
     theme_mode: str = "system"
@@ -267,6 +278,103 @@ class AppConfig:
     summary_enhancer_rewritten_by: str = "PyesisSummaryEnhancer"
     repos: list[RepoConfig] = field(default_factory=list)
     entries: list[EntryRecord] = field(default_factory=list)
+    deleted_entries: list[DeletedEntryRecord] = field(default_factory=list)
+
+
+def deleted_entry_key_for_values(
+    repo_path: str,
+    diff_hash: str,
+    week_start_iso: str = "",
+    day_name: str = "",
+    summary: str = "",
+    diff_excerpt: str = "",
+) -> str:
+    normalized_repo_path = repo_path.strip()
+    normalized_diff_hash = diff_hash.strip()
+    if normalized_diff_hash:
+        return "\0".join((normalized_repo_path, f"hash:{normalized_diff_hash}"))
+    return "\0".join(
+        (
+            normalized_repo_path,
+            f"week:{week_start_iso.strip()}",
+            day_name.strip(),
+            summary.strip(),
+            diff_excerpt.strip(),
+        )
+    )
+
+
+def deleted_entry_key_for_entry(entry: EntryRecord) -> str:
+    return deleted_entry_key_for_values(
+        entry.repo_path,
+        entry.diff_hash,
+        entry.week_start_iso,
+        entry.day_name,
+        entry.summary,
+        entry.diff_excerpt,
+    )
+
+
+def _subtract_months(moment: datetime, months: int) -> datetime:
+    if months <= 0:
+        return moment
+    month_index = moment.month - months
+    year = moment.year
+    while month_index <= 0:
+        month_index += 12
+        year -= 1
+    day = min(moment.day, monthrange(year, month_index)[1])
+    return moment.replace(year=year, month=month_index, day=day)
+
+
+def _retention_cutoff(now: datetime | None = None) -> datetime:
+    return _subtract_months(now or datetime.now(), ENTRY_RETENTION_MONTHS)
+
+
+def _parse_iso_datetime(value: str) -> datetime | None:
+    raw_value = value.strip()
+    if not raw_value:
+        return None
+    try:
+        return datetime.fromisoformat(raw_value)
+    except ValueError:
+        return None
+
+
+def _retain_entry(entry: EntryRecord, now: datetime | None = None) -> bool:
+    created_at = _parse_iso_datetime(entry.created_at)
+    if created_at is None:
+        return True
+    return created_at >= _retention_cutoff(now)
+
+
+def _retain_deleted_entry(entry: DeletedEntryRecord, now: datetime | None = None) -> bool:
+    deleted_at = _parse_iso_datetime(entry.deleted_at)
+    if deleted_at is None:
+        return True
+    return deleted_at >= _retention_cutoff(now)
+
+
+def _normalize_deleted_entries(entries: list[DeletedEntryRecord]) -> list[DeletedEntryRecord]:
+    normalized: dict[str, DeletedEntryRecord] = {}
+    for entry in entries:
+        key = entry.key.strip()
+        if not key:
+            continue
+        deleted_at = entry.deleted_at.strip()
+        existing = normalized.get(key)
+        if existing is None or (deleted_at and deleted_at > existing.deleted_at):
+            normalized[key] = DeletedEntryRecord(key=key, deleted_at=deleted_at)
+    return list(normalized.values())
+
+
+def _prune_deleted_entries(entries: list[DeletedEntryRecord], now: datetime | None = None) -> list[DeletedEntryRecord]:
+    normalized = _normalize_deleted_entries(entries)
+    return [entry for entry in normalized if _retain_deleted_entry(entry, now)]
+
+
+def _prune_entries(entries: list[EntryRecord], now: datetime | None = None) -> list[EntryRecord]:
+    return [entry for entry in entries if _retain_entry(entry, now)]
 
 
 def dedupe_entries(entries: list[EntryRecord]) -> list[EntryRecord]:
@@ -577,6 +685,20 @@ def _decode_entry(item: dict[str, Any]) -> EntryRecord:
     )
 
 
+def _decode_deleted_entry(item: Any) -> DeletedEntryRecord | None:
+    if isinstance(item, str):
+        key = item.strip()
+        if not key:
+            return None
+        return DeletedEntryRecord(key=key, deleted_at="")
+    if not isinstance(item, dict):
+        return None
+    key = str(item.get("key", "")).strip()
+    if not key:
+        return None
+    return DeletedEntryRecord(key=key, deleted_at=str(item.get("deleted_at", "")).strip())
+
+
 def _normalize_ai_mode(value: Any) -> str:
     ai_mode = str(value or "heuristic").strip().lower() or "heuristic"
     if ai_mode == LEGACY_GITHUB_COPILOT_MODE:
@@ -650,7 +772,7 @@ def _config_theme_mode(data: dict[str, Any]) -> str:
     return theme_mode
 
 
-def _base_config_from_data(data: dict[str, Any], entries: list[EntryRecord]) -> AppConfig:
+def _base_config_from_data(data: dict[str, Any], entries: list[EntryRecord], deleted_entries: list[DeletedEntryRecord]) -> AppConfig:
     ai_mode = _normalize_ai_mode(data.get("ai_mode", "heuristic"))
     return AppConfig(
         week_end_day=data.get("week_end_day", "Thursday"),
@@ -686,6 +808,7 @@ def _base_config_from_data(data: dict[str, Any], entries: list[EntryRecord]) -> 
         summary_enhancer_rewritten_by=str(data.get("summary_enhancer_rewritten_by", "PyesisSummaryEnhancer")).strip() or "PyesisSummaryEnhancer",
         repos=[_decode_repo(item) for item in data.get("repos", [])],
         entries=entries,
+        deleted_entries=deleted_entries,
     )
 
 
@@ -693,24 +816,42 @@ def load_startup_config_snapshot(state_path: Path = STATE_PATH) -> AppConfig:
     data = _load_state_data(state_path)
     if data is None:
         return AppConfig()
-    return _base_config_from_data(data, [])
+    raw_deleted_entries = [_decode_deleted_entry(item) for item in data.get("deleted_entries", [])]
+    deleted_entries = _prune_deleted_entries([entry for entry in raw_deleted_entries if entry is not None])
+    return _base_config_from_data(data, [], deleted_entries)
 
 
 def load_config() -> AppConfig:
     data = _load_state_data()
     if data is None:
         return AppConfig()
+    raw_deleted_entries = [_decode_deleted_entry(item) for item in data.get("deleted_entries", [])]
+    deleted_entries = _prune_deleted_entries([entry for entry in raw_deleted_entries if entry is not None])
+    deleted_entry_keys = {entry.key for entry in deleted_entries}
     raw_entry_items = data.get("entries", [])
     raw_entries = [_decode_entry(item) for item in raw_entry_items]
-    entries = dedupe_entries(raw_entries)
-    if _should_rewrite_saved_entries(raw_entries, entries, raw_entry_items):
+    retained_entries = _prune_entries(raw_entries)
+    visible_entries = [entry for entry in retained_entries if deleted_entry_key_for_entry(entry) not in deleted_entry_keys]
+    entries = dedupe_entries(visible_entries)
+    deleted_entries_payload = [asdict(entry) for entry in deleted_entries]
+    if (
+        _should_rewrite_saved_entries(raw_entries, entries, raw_entry_items)
+        or len(retained_entries) != len(raw_entries)
+        or len(visible_entries) != len(retained_entries)
+        or data.get("deleted_entries", []) != deleted_entries_payload
+    ):
         data["entries"] = [asdict(entry) for entry in entries]
+        data["deleted_entries"] = deleted_entries_payload
         STATE_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    return _base_config_from_data(data, entries)
+    return _base_config_from_data(data, entries, deleted_entries)
 
 
 def save_config(config: AppConfig, state_path: Path = STATE_PATH) -> None:
-    config.entries = dedupe_entries(config.entries)
+    config.deleted_entries = _prune_deleted_entries(config.deleted_entries)
+    deleted_entry_keys = {entry.key for entry in config.deleted_entries}
+    config.entries = dedupe_entries(
+        [entry for entry in _prune_entries(config.entries) if deleted_entry_key_for_entry(entry) not in deleted_entry_keys]
+    )
     payload = {
         "week_end_day": config.week_end_day,
         "theme_mode": config.theme_mode,
@@ -742,6 +883,7 @@ def save_config(config: AppConfig, state_path: Path = STATE_PATH) -> None:
         "summary_enhancer_rewritten_by": config.summary_enhancer_rewritten_by,
         "repos": [asdict(repo) for repo in config.repos],
         "entries": [asdict(entry) for entry in config.entries],
+        "deleted_entries": [asdict(entry) for entry in config.deleted_entries],
     }
     state_path.parent.mkdir(parents=True, exist_ok=True)
     state_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")

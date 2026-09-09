@@ -40,19 +40,22 @@ from pyesis.ai_summary import (
 )
 from pyesis.config import (
     AI_ATTEMPT_LOG_PATH,
+    ARCHIVE_DIR,
     AppConfig,
+    DeletedEntryRecord,
     EntryRecord,
     GITHUB_GPT_DEFAULT_MODELS,
     OLLAMA_DEFAULT_TIMEOUT_SECONDS,
     RepoConfig,
     _decode_entry,
     dedupe_entries,
+    deleted_entry_key_for_entry,
     default_export_directory,
     load_config,
     load_startup_config_snapshot,
     save_config,
 )
-from pyesis.diff_buffer import BUFFER_DIR, find_item, list_buffer_day_keys, load_buffer_items, mark_as_shown, purge_old_daily_buffers, remember_diff
+from pyesis.diff_buffer import BUFFER_DIR, find_item, list_buffer_day_keys, load_buffer_items, mark_as_shown, purge_noise_buffer_items, purge_old_daily_buffers, remember_diff
 from pyesis.document_formatter import export_ai_weekly_report_docx, export_docx, render_plain_text, render_text_chunks, render_weekly_evidence_text
 from pyesis.github_auth import (
     GITHUB_DOTCOM_AUTH_MODE,
@@ -70,8 +73,9 @@ from pyesis.github_auth import (
     start_github_device_login,
     store_github_auth_token,
 )
-from pyesis.git_monitor import DiffSnapshot, capture_snapshot, split_diff_by_file, summarize_file_changes, validate_repo
+from pyesis.git_monitor import DiffSnapshot, capture_snapshot, is_noise_work_text, split_diff_by_file, summarize_file_changes, validate_repo
 from pyesis.summary_enhancer import run_periodic_enhancer
+from pyesis.week_archive import archive_completed_weeks
 
 
 DIFF_EXCERPT_LIMIT = 12_000
@@ -1005,6 +1009,13 @@ class PyesisApp:
             if deduped != original_entries:
                 final_entries = deduped
                 changed = True
+        purge_noise_buffer_items()
+        archive_completed_weeks(
+            final_entries,
+            week_end_day=week_end_day,
+            archive_dir=ARCHIVE_DIR,
+            buffer_dir=BUFFER_DIR,
+        )
 
         recovery_items: list[dict[str, object]] = []
         for day_key in list_buffer_day_keys():
@@ -1059,6 +1070,11 @@ class PyesisApp:
                 str(item["summaryProviderDetails"]),
                 str(item["lastAiAttemptAt"]),
             )
+
+            if self._has_deleted_entry_key(self._entry_deleted_key(entry)):
+                continue
+            if self._is_noise_entry(entry):
+                continue
 
             duplicate_key = self._entry_duplicate_key(entry)
             if duplicate_key in self._startup_recovery_known_duplicates:
@@ -1330,6 +1346,11 @@ class PyesisApp:
                     item["lastAiAttemptAt"],
                 )
 
+                if self._has_deleted_entry_key(self._entry_deleted_key(entry)):
+                    continue
+                if self._is_noise_entry(entry):
+                    continue
+
                 duplicate_key = self._entry_duplicate_key(entry)
                 if duplicate_key in known_duplicates:
                     continue
@@ -1456,17 +1477,11 @@ class PyesisApp:
             return entry.week_start_iso
         return self._week_start_for_datetime_with_week_end(entry_dt, week_end_day).isoformat()
 
+    def _is_noise_entry(self, entry: EntryRecord) -> bool:
+        return is_noise_work_text(entry.summary) or is_noise_work_text(entry.diff_excerpt)
+
     def _remove_noise_entries(self, entries: list[EntryRecord]) -> list[EntryRecord]:
-        cleaned: list[EntryRecord] = []
-        for entry in entries:
-            summary_l = entry.summary.lower()
-            excerpt_l = entry.diff_excerpt.lower()
-            if "pyesis_state.json" in summary_l or "pyesis_state.json" in excerpt_l:
-                continue
-            if "logs/ai_attempts.jsonl" in summary_l or "logs/ai_attempts.jsonl" in excerpt_l:
-                continue
-            cleaned.append(entry)
-        return cleaned
+        return [entry for entry in entries if not self._is_noise_entry(entry)]
 
     def _should_merge_entries(self, previous: EntryRecord, current: EntryRecord) -> bool:
         if previous.repo_path != current.repo_path:
@@ -1525,6 +1540,13 @@ class PyesisApp:
             return
         self._buffer_day = today
         purge_old_daily_buffers(7, today)
+        purge_noise_buffer_items()
+        archive_completed_weeks(
+            self.config.entries,
+            week_end_day=self.config.week_end_day,
+            archive_dir=ARCHIVE_DIR,
+            buffer_dir=BUFFER_DIR,
+        )
 
     def _rewrite_legacy_summaries(self, entries: list[EntryRecord]) -> list[EntryRecord]:
         rewritten: list[EntryRecord] = []
@@ -3006,6 +3028,22 @@ class PyesisApp:
     def _entry_status_key(self, entry: EntryRecord) -> str:
         return f"{entry.repo_label}\0{entry.created_at}\0{entry.diff_hash}"
 
+    def _entry_deleted_key(self, entry: EntryRecord) -> str:
+        return deleted_entry_key_for_entry(entry)
+
+    def _has_deleted_entry_key(self, deleted_key: str) -> bool:
+        return any(entry.key == deleted_key for entry in self.config.deleted_entries)
+
+    def _remember_deleted_entry(self, entry: EntryRecord) -> None:
+        deleted_key = self._entry_deleted_key(entry)
+        deleted_at = datetime.now().isoformat(timespec="seconds")
+        for index, deleted_entry in enumerate(self.config.deleted_entries):
+            if deleted_entry.key != deleted_key:
+                continue
+            self.config.deleted_entries[index] = DeletedEntryRecord(key=deleted_key, deleted_at=deleted_at)
+            return
+        self.config.deleted_entries.append(DeletedEntryRecord(key=deleted_key, deleted_at=deleted_at))
+
     def _entry_delete_tag(self, entry: EntryRecord) -> str:
         entry_key = self._entry_status_key(entry)
         digest = hashlib.sha1(entry_key.encode("utf-8")).hexdigest()[:12]
@@ -3036,6 +3074,7 @@ class PyesisApp:
             if not messagebox.askyesno("Delete entry", prompt):
                 return False
 
+        self._remember_deleted_entry(entry)
         self.config.entries.pop(entry_index)
         save_config(self.config)
         self._refresh_editor()
@@ -3703,6 +3742,8 @@ class PyesisApp:
             summary_text, already_shown, author, summary_source, summary_metadata = self._resolve_summary_from_ledger(repo, file_diff_text)
             if already_shown:
                 continue
+            if is_noise_work_text(file_path) or is_noise_work_text(file_diff_text):
+                continue
 
             ledger_item = remember_diff(
                 repo.label,
@@ -3737,6 +3778,9 @@ class PyesisApp:
                 str(ledger_item.get("summaryProviderDetails", "")).strip(),
                 str(ledger_item.get("lastAiAttemptAt", "")).strip(),
             )
+            if self._has_deleted_entry_key(self._entry_deleted_key(new_entry)):
+                mark_as_shown(repo.label, file_diff_text, self._buffer_day)
+                continue
             if self._should_skip_captured_entry(repo, file_path, file_diff_text, new_entry):
                 continue
 

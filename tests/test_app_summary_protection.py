@@ -9,7 +9,7 @@ import threading
 
 from pyesis.ai_summary import AISummaryResult, AIWeeklyReportResult, GITHUB_GPT_MODE, HEURISTIC_MODE, OLLAMA_MODE
 from pyesis.app import PyesisApp
-from pyesis.config import AppConfig, EntryRecord, RepoConfig
+from pyesis.config import AppConfig, DeletedEntryRecord, EntryRecord, RepoConfig, deleted_entry_key_for_entry
 
 
 class DummyVar:
@@ -1000,6 +1000,8 @@ class AppSummaryProtectionTests(unittest.TestCase):
 
         self.assertTrue(deleted)
         self.assertEqual(app.config.entries, [])
+        self.assertEqual(len(app.config.deleted_entries), 1)
+        self.assertEqual(app.config.deleted_entries[0].key, deleted_entry_key_for_entry(entry))
         self.assertEqual(refresh_calls, ["refresh"])
         self.assertEqual(app.status_var.get(), "Deleted 1 entry for Cats")
         self.assertTrue(mock_confirm.called)
@@ -1028,6 +1030,56 @@ class AppSummaryProtectionTests(unittest.TestCase):
         self.assertEqual(app.config.entries, [entry])
         self.assertTrue(mock_confirm.called)
         self.assertFalse(mock_save.called)
+
+    def test_startup_recovery_skips_deleted_entry_keys(self) -> None:
+        app = self._make_app()
+        entry = EntryRecord(
+            repo_label="Cats",
+            repo_path="/tmp/cats",
+            created_at="2026-08-31T07:52:11",
+            day_name="Monday",
+            week_start_iso="2026-08-28T00:00:00",
+            summary="I removed Infrastructure/Models/CatsCRUDL/ccQuery.cs.",
+            diff_hash="delete-hash-3",
+            diff_excerpt="diff --git a/Infrastructure/Models/CatsCRUDL/ccQuery.cs b/Infrastructure/Models/CatsCRUDL/ccQuery.cs\n+++ b/Infrastructure/Models/CatsCRUDL/ccQuery.cs\n",
+            summary_source="ollama",
+            author="AI",
+        )
+        app.config.deleted_entries = [
+            DeletedEntryRecord(key=deleted_entry_key_for_entry(entry), deleted_at="2026-08-31T08:00:00")
+        ]
+        app._startup_recovery_items = [
+            {
+                "datetime": entry.created_at,
+                "repo": entry.repo_label,
+                "repoPath": entry.repo_path,
+                "gitDiffDescription": entry.summary,
+                "gitDiffText": entry.diff_excerpt,
+                "diffHash": entry.diff_hash,
+                "author": entry.author,
+                "summarySource": entry.summary_source,
+                "requestedSummarySource": "",
+                "summaryWarning": "",
+                "fallbackSummarySource": "",
+                "summaryTimingMs": 0,
+                "summaryProviderDetails": "",
+                "lastAiAttemptAt": "",
+            }
+        ]
+        app._startup_recovery_index = 0
+        app._startup_recovery_recovered = 0
+        app._startup_recovery_known_duplicates = set()
+        app._save_config_snapshot_async = lambda: self.fail("deleted entries should not be restored")
+        app._set_startup_loading_message = lambda _message: None
+        app._maybe_auto_export_daily = lambda: None
+        finished: list[str] = []
+        app._finish_startup_load = lambda: finished.append("done")
+
+        app._continue_startup_recovery()
+
+        self.assertEqual(app.config.entries, [])
+        self.assertEqual(app._startup_recovery_recovered, 0)
+        self.assertEqual(finished, ["done"])
 
     def test_entry_warning_comment_and_progress_tracking(self) -> None:
         app = self._make_app()
@@ -1283,6 +1335,61 @@ class AppSummaryProtectionTests(unittest.TestCase):
         self.assertEqual(app.config.entries[0].diff_hash, "recover-hash-1")
         self.assertEqual(app.config.entries[0].summary_source, "ollama")
         self.assertTrue(mock_save.called)
+
+    def test_remove_noise_entries_drops_nested_sqlite_copy(self) -> None:
+        app = self._make_app()
+        keep = EntryRecord(
+            repo_label="CatsDbGetSomeIpsum",
+            repo_path="/tmp/ipsum",
+            created_at="2026-09-08T08:53:03",
+            day_name="Tuesday",
+            week_start_iso="2026-09-07T00:00:00",
+            summary="I added SourceFolderLastWriteUtcTicks in generated/catsUpDate.JSON.",
+            diff_hash="keep-1",
+            diff_excerpt="diff --git a/generated/catsUpDate.json b/generated/catsUpDate.json\n+++ b/generated/catsUpDate.json\n",
+        )
+        drop = EntryRecord(
+            repo_label="CatsDbGetSomeIpsum",
+            repo_path="/tmp/ipsum",
+            created_at="2026-09-08T06:07:00",
+            day_name="Tuesday",
+            week_start_iso="2026-09-07T00:00:00",
+            summary="I created cms-sqlLite-cats-source/Views/Home/Index.cshtml.",
+            diff_hash="drop-1",
+            diff_excerpt="diff --git a/cms-sqlLite-cats-source/Views/Home/Index.cshtml b/cms-sqlLite-cats-source/Views/Home/Index.cshtml\nnew file mode 100644\n+++ b/cms-sqlLite-cats-source/Views/Home/Index.cshtml\n",
+        )
+        kept = app._remove_noise_entries([keep, drop])
+        self.assertEqual(kept, [keep])
+
+    def test_recover_shown_buffer_entries_skips_nested_sqlite_copy(self) -> None:
+        app = self._make_app()
+        shown_item = {
+            "datetime": "2026-09-08T06:07:00",
+            "repo": "CatsDbGetSomeIpsum",
+            "gitDiffText": "diff --git a/cms-sqlLite-cats-source/CATS.csproj b/cms-sqlLite-cats-source/CATS.csproj\nnew file mode 100644\n+++ b/cms-sqlLite-cats-source/CATS.csproj\n",
+            "gitDiffDescription": "I created cms-sqlLite-cats-source/CATS.csproj.",
+            "shown": True,
+            "diffHash": "sqlite-copy-1",
+            "repoPath": "/tmp/ipsum",
+            "author": "Backup",
+            "summarySource": "heuristic",
+            "requestedSummarySource": "heuristic",
+            "summaryWarning": "",
+            "fallbackSummarySource": "",
+            "summaryTimingMs": 0,
+            "summaryProviderDetails": "",
+            "lastAiAttemptAt": "",
+        }
+
+        with patch("pyesis.app.list_buffer_day_keys", return_value=["2026-09-08"]), patch(
+            "pyesis.app.load_buffer_items",
+            return_value=[shown_item],
+        ), patch("pyesis.app.save_config") as mock_save:
+            recovered = app._recover_shown_buffer_entries()
+
+        self.assertEqual(recovered, 0)
+        self.assertEqual(app.config.entries, [])
+        self.assertFalse(mock_save.called)
 
 
 if __name__ == "__main__":

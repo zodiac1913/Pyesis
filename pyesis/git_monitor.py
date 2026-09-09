@@ -23,7 +23,13 @@ DEFAULT_EXCLUDES = [
     "logs/**",
     ".venv/**",
     "__pycache__/**",
+    "cms-sqlLite-cats-source/**",
 ]
+NOISE_TEXT_MARKERS = (
+    "pyesis_state.json",
+    "logs/ai_attempts.jsonl",
+    "cms-sqllite-cats-source/",
+)
 DIFF_CONTEXT_LINES = 20
 DIFF_SAMPLE_LIMIT = 12
 HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
@@ -312,12 +318,25 @@ def _hunk_new_start(line: str) -> int | None:
     return int(match.group(1))
 
 
+def is_noise_work_text(text: str) -> bool:
+    lowered = text.replace("\\", "/").lower()
+    return any(marker in lowered for marker in NOISE_TEXT_MARKERS)
+
+
 def _is_excluded_path(path: str) -> bool:
-    normalized = path.replace("\\", "/")
+    normalized = path.replace("\\", "/").lstrip("./")
     for pattern in DEFAULT_EXCLUDES:
-        if pattern == normalized:
-            return True
-        prefix = pattern.removesuffix("/**")
-        if pattern.endswith("/**") and normalized.startswith(prefix + "/"):
+        if pattern.endswith("/**"):
+            prefix = pattern.removesuffix("/**")
+            if _path_has_directory(normalized, prefix):
+                return True
+            continue
+        if normalized == pattern or normalized.endswith("/" + pattern):
             return True
     return False
+
+
+def _path_has_directory(normalized: str, directory: str) -> bool:
+    if normalized == directory or normalized.startswith(directory + "/"):
+        return True
+    return f"/{directory}/" in f"/{normalized}/"

@@ -6,6 +6,7 @@ import json
 from typing import TypedDict
 
 from pyesis.config import BUFFER_DIR
+from pyesis.git_monitor import is_noise_work_text
 
 
 class DiffLedgerItem(TypedDict):
@@ -72,6 +73,24 @@ def list_buffer_day_keys() -> list[str]:
 def load_buffer_items(day_key: str | None = None) -> list[DiffLedgerItem]:
     active_day = day_key or _today_key()
     return _read_items(_buffer_path(active_day))
+
+
+def _buffer_item_is_noise(item: DiffLedgerItem) -> bool:
+    return is_noise_work_text(item.get("gitDiffText", "")) or is_noise_work_text(item.get("gitDiffDescription", ""))
+
+
+def purge_noise_buffer_items() -> int:
+    if not BUFFER_DIR.exists():
+        return 0
+    removed = 0
+    for path in BUFFER_DIR.glob("*.json"):
+        items = _read_items(path)
+        kept = [item for item in items if not _buffer_item_is_noise(item)]
+        dropped = len(items) - len(kept)
+        if dropped:
+            _write_items(path, kept)
+            removed += dropped
+    return removed
 
 
 def _read_items(path: Path) -> list[DiffLedgerItem]:

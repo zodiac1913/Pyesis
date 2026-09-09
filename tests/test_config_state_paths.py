@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+from datetime import datetime
 from pathlib import Path
 import tempfile
 import unittest
@@ -25,6 +27,65 @@ class ConfigStatePathTests(unittest.TestCase):
             loaded = config.load_startup_config_snapshot(state_path=state_path)
 
             self.assertEqual(loaded.ai_ollama_num_threads, 4)
+
+    def test_save_config_prunes_old_entries_and_persists_deleted_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "pyesis_state.json"
+            visible_entry = config.EntryRecord(
+                repo_label="Pyesis",
+                repo_path="/tmp/pyesis",
+                created_at="2026-09-01T09:00:00",
+                day_name="Tuesday",
+                week_start_iso="2026-08-28T00:00:00",
+                summary="I kept the active summary.",
+                diff_hash="keep-hash",
+                diff_excerpt="diff --git a/keep.py b/keep.py\n+++ b/keep.py\n",
+            )
+            deleted_entry = config.EntryRecord(
+                repo_label="Pyesis",
+                repo_path="/tmp/pyesis",
+                created_at="2026-09-01T10:00:00",
+                day_name="Tuesday",
+                week_start_iso="2026-08-28T00:00:00",
+                summary="I deleted this summary.",
+                diff_hash="deleted-hash",
+                diff_excerpt="diff --git a/delete.py b/delete.py\n+++ b/delete.py\n",
+            )
+            old_entry = config.EntryRecord(
+                repo_label="Pyesis",
+                repo_path="/tmp/pyesis",
+                created_at="2025-08-01T10:00:00",
+                day_name="Friday",
+                week_start_iso="2025-07-28T00:00:00",
+                summary="I am too old to keep.",
+                diff_hash="old-hash",
+                diff_excerpt="diff --git a/old.py b/old.py\n+++ b/old.py\n",
+            )
+            saved = config.AppConfig(
+                entries=[visible_entry, deleted_entry, old_entry],
+                deleted_entries=[
+                    config.DeletedEntryRecord(
+                        key=config.deleted_entry_key_for_entry(deleted_entry),
+                        deleted_at="2026-09-01T10:05:00",
+                    ),
+                    config.DeletedEntryRecord(
+                        key="/tmp/pyesis\0hash:old-deleted-key",
+                        deleted_at="2025-08-01T10:05:00",
+                    ),
+                ],
+            )
+
+            with patch("pyesis.config.datetime") as mock_datetime:
+                mock_datetime.now.return_value = datetime.fromisoformat("2026-09-01T12:00:00")
+                mock_datetime.fromisoformat.side_effect = datetime.fromisoformat
+                config.save_config(saved, state_path=state_path)
+                loaded = config.load_startup_config_snapshot(state_path=state_path)
+
+            payload = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual([item["diff_hash"] for item in payload["entries"]], ["keep-hash"])
+            self.assertEqual(payload["deleted_entries"], [{"key": config.deleted_entry_key_for_entry(deleted_entry), "deleted_at": "2026-09-01T10:05:00"}])
+            self.assertEqual([entry.diff_hash for entry in saved.entries], ["keep-hash"])
+            self.assertEqual(loaded.deleted_entries[0].key, config.deleted_entry_key_for_entry(deleted_entry))
 
     def test_migrate_legacy_runtime_data_uses_newest_legacy_root(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

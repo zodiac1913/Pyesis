@@ -41,6 +41,7 @@ WEAK_PHRASES = (
     "updated package metadata",
 )
 WEAK_TEMPLATE_PATTERNS = (
+    re.compile(r"^\s*(?:added|removed|note|summary|warning)\s*:", re.IGNORECASE),
     re.compile(r"\bnot available from diff\b", re.IGNORECASE),
     re.compile(r"\bby i\b", re.IGNORECASE),
     re.compile(r"\bchanging code around\b", re.IGNORECASE),

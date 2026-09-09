@@ -1394,6 +1394,40 @@ class SummaryEnhancerTests(unittest.TestCase):
         self.assertIn("AI rewrite skipped", config.entries[0].summary_warning)
         self.assertEqual(config.entries[0].rewritten_at, "")
 
+    def test_label_style_rewrite_is_rejected_and_marks_warning(self) -> None:
+        entry = EntryRecord(
+            repo_label="RepoLabelStyle",
+            repo_path="repos/repo-label-style",
+            created_at="2026-06-16T09:10:00",
+            day_name="Monday",
+            week_start_iso="2026-06-15T00:00:00",
+            summary="made updates",
+            diff_hash="label-style-rewrite",
+            diff_excerpt="diff --git a/a.md b/a.md\n+++ b/a.md\n@@ -0,0 +1 @@\n+PythiaJS note\n",
+            summary_source="heuristic",
+            author="Backup",
+        )
+
+        config = self._base_config()
+        config.summary_enhancer_dry_run = False
+        config.summary_enhancer_aggressive_prodding = True
+        config.entries = [entry]
+
+        report = run_periodic_enhancer(
+            config,
+            summary_builder=lambda _repo, _diff, _path: (
+                "Added: PythiaJS was the prototype and predecessor of Rusty Pythia. "
+                "It is not a query language; the query workspace supports SQuerL and SQL."
+            ),
+            now=datetime(2026, 6, 16, 11, 55, 0),
+        )
+
+        self.assertTrue(report.ran)
+        self.assertEqual(report.failed_state_marked, 1)
+        self.assertEqual(config.entries[0].summary, "made updates")
+        self.assertIn("AI rewrite skipped", config.entries[0].summary_warning)
+        self.assertEqual(config.entries[0].rewritten_at, "")
+
     def test_rewrite_gate_prioritizes_older_entries_before_newer_ones(self) -> None:
         newer_entry = EntryRecord(
             repo_label="RepoOrdered",
