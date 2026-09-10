@@ -19,7 +19,22 @@ class WeekArchiveTests(unittest.TestCase):
             archive_dir = root / "week_archives"
             buffer_dir = root / "diff_buffers"
             buffer_dir.mkdir()
-            (buffer_dir / "2026-08-28.json").write_text("[]", encoding="utf-8")
+            (buffer_dir / "2026-08-28.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "datetime": "2026-08-28T09:00:00",
+                            "repo": "Pyesis",
+                            "gitDiffText": "diff --git a/old.py b/old.py\n+++ b/old.py\n",
+                            "gitDiffDescription": "I finished last week's work.",
+                            "shown": True,
+                            "diffHash": "old-week",
+                            "repoPath": "/tmp/pyesis",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
 
             completed = EntryRecord(
                 repo_label="Pyesis",

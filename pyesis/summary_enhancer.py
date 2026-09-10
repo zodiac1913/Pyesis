@@ -18,7 +18,7 @@ from pyesis.ai_summary import (
     build_summary,
 )
 from pyesis.config import AppConfig, EntryRecord, STATE_PATH, save_config
-from pyesis.diff_buffer import BUFFER_DIR
+from pyesis.diff_buffer import list_buffer_day_keys, load_buffer_items, replace_buffer_items
 from pyesis.github_auth import load_github_auth_token, normalize_github_auth_endpoint, normalize_github_auth_mode
 
 
@@ -859,7 +859,7 @@ def _rewrite_buffer_items(
 
 def _rewrite_buffer_files(
     config: AppConfig,
-    buffer_dir: Path,
+    buffer_dir: Path | None,
     *,
     builder: SummaryBuilder,
     rewrite_gate: RewriteGate | None,
@@ -874,8 +874,13 @@ def _rewrite_buffer_files(
     report: EnhanceReport,
 ) -> bool:
     updated = False
-    for buffer_file in sorted(buffer_dir.glob("*.json")):
-        items = _read_buffer_items(buffer_file)
+    day_keys = list_buffer_day_keys(buffer_dir) if buffer_dir is not None else list_buffer_day_keys()
+    for day_key in day_keys:
+        if buffer_dir is not None:
+            buffer_file = buffer_dir / f"{day_key}.json"
+            items = _read_buffer_items(buffer_file)
+        else:
+            items = load_buffer_items(day_key)
         if not items:
             continue
         file_changed = _rewrite_buffer_items(
@@ -894,21 +899,28 @@ def _rewrite_buffer_files(
             report=report,
         )
         if file_changed:
-            _write_buffer_items(buffer_file, items)
+            if buffer_dir is not None:
+                _write_buffer_items(buffer_dir / f"{day_key}.json", items)
+            else:
+                replace_buffer_items(day_key, items)
             updated = True
     return updated
 
 
-def _sync_buffer_items_from_state(config: AppConfig, buffer_dir: Path, active_week_start: datetime) -> bool:
+def _sync_buffer_items_from_state(config: AppConfig, buffer_dir: Path | None, active_week_start: datetime) -> bool:
     entries_by_hash = {
         entry.diff_hash: entry
         for entry in config.entries
         if entry.diff_hash and _is_current_week_entry(entry, active_week_start)
     }
     updated = False
-
-    for buffer_file in sorted(buffer_dir.glob("*.json")):
-        items = _read_buffer_items(buffer_file)
+    day_keys = list_buffer_day_keys(buffer_dir) if buffer_dir is not None else list_buffer_day_keys()
+    for day_key in day_keys:
+        if buffer_dir is not None:
+            buffer_file = buffer_dir / f"{day_key}.json"
+            items = _read_buffer_items(buffer_file)
+        else:
+            items = load_buffer_items(day_key)
         file_changed = False
         for item in items:
             entry = entries_by_hash.get(str(item.get("diffHash", "")))
@@ -927,7 +939,10 @@ def _sync_buffer_items_from_state(config: AppConfig, buffer_dir: Path, active_we
             item["lastAiAttemptAt"] = entry.last_ai_attempt_at
             file_changed = True
         if file_changed:
-            _write_buffer_items(buffer_file, items)
+            if buffer_dir is not None:
+                _write_buffer_items(buffer_dir / f"{day_key}.json", items)
+            else:
+                replace_buffer_items(day_key, items)
             updated = True
     return updated
 
@@ -946,7 +961,7 @@ def run_periodic_enhancer(
     aggressive_prodding_override: bool | None = None,
 ) -> EnhanceReport:
     resolved_state_path = state_path or STATE_PATH
-    resolved_buffer_dir = buffer_dir or BUFFER_DIR
+    resolved_buffer_dir = buffer_dir
     logs: list[str] = []
     dry_run = bool(config.summary_enhancer_dry_run)
     report = EnhanceReport(ran=False, dry_run=dry_run, logs=logs)

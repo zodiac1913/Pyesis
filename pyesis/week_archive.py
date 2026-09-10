@@ -98,30 +98,30 @@ def _write_week_archive(
         "week_end_day": week_end_day,
         "entries": [asdict(entry) for entry in entries],
     }
-    buffer_paths = _buffer_paths_for_week(week_start, buffer_dir)
+    buffer_items_by_day = _buffer_items_for_week(week_start, buffer_dir)
 
     with tempfile.TemporaryDirectory() as temp_dir:
         staging = Path(temp_dir)
         (staging / "week.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        if buffer_paths:
+        if buffer_items_by_day:
             buffer_stage = staging / "diff_buffers"
             buffer_stage.mkdir()
-            for source in buffer_paths:
-                (buffer_stage / source.name).write_bytes(source.read_bytes())
+            for day_name, items in buffer_items_by_day.items():
+                (buffer_stage / f"{day_name}.json").write_text(json.dumps(items, indent=2), encoding="utf-8")
         with py7zr.SevenZipFile(target, "w") as archive:
             archive.write(staging / "week.json", "week.json")
-            for staged in sorted((staging / "diff_buffers").glob("*.json")) if buffer_paths else []:
+            for staged in sorted((staging / "diff_buffers").glob("*.json")) if buffer_items_by_day else []:
                 archive.write(staged, f"diff_buffers/{staged.name}")
     return target
 
 
-def _buffer_paths_for_week(week_start: datetime, buffer_dir: Path | None) -> list[Path]:
-    if buffer_dir is None or not buffer_dir.exists():
-        return []
-    paths: list[Path] = []
+def _buffer_items_for_week(week_start: datetime, buffer_dir: Path | None) -> dict[str, list]:
+    from pyesis.diff_buffer import load_buffer_items
+
+    staged: dict[str, list] = {}
     for offset in range(7):
         day_name = (week_start + timedelta(days=offset)).strftime("%Y-%m-%d")
-        path = buffer_dir / f"{day_name}.json"
-        if path.is_file():
-            paths.append(path)
-    return paths
+        items = load_buffer_items(day_name, buffer_dir=buffer_dir)
+        if items:
+            staged[day_name] = items
+    return staged

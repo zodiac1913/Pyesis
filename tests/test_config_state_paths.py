@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 from datetime import datetime
 from pathlib import Path
@@ -20,7 +19,7 @@ class ConfigStatePathTests(unittest.TestCase):
 
     def test_ollama_thread_count_round_trips_through_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            state_path = Path(temp_dir) / "pyesis_state.json"
+            state_path = Path(temp_dir) / "pyesis.db"
             saved = config.AppConfig(ai_ollama_num_threads=4)
 
             config.save_config(saved, state_path=state_path)
@@ -30,7 +29,7 @@ class ConfigStatePathTests(unittest.TestCase):
 
     def test_save_config_prunes_old_entries_and_persists_deleted_keys(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            state_path = Path(temp_dir) / "pyesis_state.json"
+            state_path = Path(temp_dir) / "pyesis.db"
             visible_entry = config.EntryRecord(
                 repo_label="Pyesis",
                 repo_path="/tmp/pyesis",
@@ -80,12 +79,12 @@ class ConfigStatePathTests(unittest.TestCase):
                 mock_datetime.fromisoformat.side_effect = datetime.fromisoformat
                 config.save_config(saved, state_path=state_path)
                 loaded = config.load_startup_config_snapshot(state_path=state_path)
+                full = config.load_config(state_path=state_path)
 
-            payload = json.loads(state_path.read_text(encoding="utf-8"))
-            self.assertEqual([item["diff_hash"] for item in payload["entries"]], ["keep-hash"])
-            self.assertEqual(payload["deleted_entries"], [{"key": config.deleted_entry_key_for_entry(deleted_entry), "deleted_at": "2026-09-01T10:05:00"}])
+            self.assertEqual([entry.diff_hash for entry in full.entries], ["keep-hash"])
             self.assertEqual([entry.diff_hash for entry in saved.entries], ["keep-hash"])
             self.assertEqual(loaded.deleted_entries[0].key, config.deleted_entry_key_for_entry(deleted_entry))
+            self.assertEqual(full.deleted_entries[0].key, config.deleted_entry_key_for_entry(deleted_entry))
 
     def test_migrate_legacy_runtime_data_uses_newest_legacy_root(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

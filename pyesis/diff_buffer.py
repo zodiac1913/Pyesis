@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 import hashlib
-import json
+from pathlib import Path
 from typing import TypedDict
 
-from pyesis.config import BUFFER_DIR
+from pyesis.config import BUFFER_DIR, STATE_PATH
 from pyesis.git_monitor import is_noise_work_text
+from pyesis import storage
 
 
 class DiffLedgerItem(TypedDict):
@@ -33,124 +34,150 @@ def _today_key() -> str:
     return datetime.now().strftime("%Y-%m-%d")
 
 
-def _buffer_path(day_key: str) -> Path:
-    return BUFFER_DIR / f"{day_key}.json"
+def _buffer_path(day_key: str, buffer_dir: Path | None = None) -> Path:
+    return (buffer_dir or BUFFER_DIR) / f"{day_key}.json"
 
 
-def purge_old_daily_buffers(days_to_keep: int = 7, day_key: str | None = None) -> None:
+def _uses_files(buffer_dir: Path | None) -> bool:
+    return buffer_dir is not None
+
+
+def purge_old_daily_buffers(days_to_keep: int = 7, day_key: str | None = None, buffer_dir: Path | None = None) -> None:
     keep_from = datetime.fromisoformat(day_key or _today_key()) - timedelta(days=max(0, days_to_keep - 1))
-    if not BUFFER_DIR.exists():
+    keep_from_key = keep_from.strftime("%Y-%m-%d")
+    if _uses_files(buffer_dir):
+        directory = buffer_dir or BUFFER_DIR
+        if not directory.exists():
+            return
+        for path in directory.glob("*.json"):
+            try:
+                file_day = datetime.fromisoformat(path.stem)
+            except ValueError:
+                path.unlink(missing_ok=True)
+                continue
+            if file_day < keep_from:
+                path.unlink(missing_ok=True)
         return
-    for path in BUFFER_DIR.glob("*.json"):
-        stem = path.stem
-        try:
-            file_day = datetime.fromisoformat(stem)
-        except ValueError:
-            path.unlink(missing_ok=True)
-            continue
-        if file_day < keep_from:
-            path.unlink(missing_ok=True)
+    storage.delete_buffer_days_before(STATE_PATH, keep_from_key)
+    if BUFFER_DIR.exists():
+        for path in BUFFER_DIR.glob("*.json"):
+            try:
+                file_day = datetime.fromisoformat(path.stem)
+            except ValueError:
+                path.unlink(missing_ok=True)
+                continue
+            if file_day < keep_from:
+                path.unlink(missing_ok=True)
 
 
-def clear_buffers_for_day(day_key: str | None = None) -> None:
+def clear_buffers_for_day(day_key: str | None = None, buffer_dir: Path | None = None) -> None:
     target_day = day_key or _today_key()
-    _buffer_path(target_day).unlink(missing_ok=True)
+    if _uses_files(buffer_dir):
+        _buffer_path(target_day, buffer_dir).unlink(missing_ok=True)
+        return
+    storage.delete_buffer_day(STATE_PATH, target_day)
 
 
-def list_buffer_day_keys() -> list[str]:
-    if not BUFFER_DIR.exists():
-        return []
-    day_keys: list[str] = []
-    for path in sorted(BUFFER_DIR.glob("*.json")):
-        try:
-            datetime.fromisoformat(path.stem)
-        except ValueError:
-            continue
-        day_keys.append(path.stem)
-    return day_keys
+def list_buffer_day_keys(buffer_dir: Path | None = None) -> list[str]:
+    if _uses_files(buffer_dir):
+        directory = buffer_dir or BUFFER_DIR
+        if not directory.exists():
+            return []
+        day_keys: list[str] = []
+        for path in sorted(directory.glob("*.json")):
+            try:
+                datetime.fromisoformat(path.stem)
+            except ValueError:
+                continue
+            day_keys.append(path.stem)
+        return day_keys
+    return storage.list_buffer_days(STATE_PATH)
 
 
-def load_buffer_items(day_key: str | None = None) -> list[DiffLedgerItem]:
+def load_buffer_items(day_key: str | None = None, buffer_dir: Path | None = None) -> list[DiffLedgerItem]:
     active_day = day_key or _today_key()
-    return _read_items(_buffer_path(active_day))
+    if _uses_files(buffer_dir):
+        return _normalize_items(_read_raw_items(_buffer_path(active_day, buffer_dir)))
+    return _normalize_items(storage.load_buffer_day(STATE_PATH, active_day))
+
+
+def replace_buffer_items(day_key: str, items: list[DiffLedgerItem], buffer_dir: Path | None = None) -> None:
+    if _uses_files(buffer_dir):
+        _write_items(_buffer_path(day_key, buffer_dir), items)
+        return
+    storage.replace_buffer_day(STATE_PATH, day_key, list(items))
 
 
 def _buffer_item_is_noise(item: DiffLedgerItem) -> bool:
     return is_noise_work_text(item.get("gitDiffText", "")) or is_noise_work_text(item.get("gitDiffDescription", ""))
 
 
-def purge_noise_buffer_items() -> int:
-    if not BUFFER_DIR.exists():
-        return 0
-    removed = 0
-    for path in BUFFER_DIR.glob("*.json"):
-        items = _read_items(path)
-        kept = [item for item in items if not _buffer_item_is_noise(item)]
-        dropped = len(items) - len(kept)
-        if dropped:
-            _write_items(path, kept)
-            removed += dropped
-    return removed
+def purge_noise_buffer_items(buffer_dir: Path | None = None) -> int:
+    if _uses_files(buffer_dir):
+        directory = buffer_dir or BUFFER_DIR
+        if not directory.exists():
+            return 0
+        removed = 0
+        for path in directory.glob("*.json"):
+            items = _normalize_items(_read_raw_items(path))
+            kept = [item for item in items if not _buffer_item_is_noise(item)]
+            dropped = len(items) - len(kept)
+            if dropped:
+                _write_items(path, kept)
+                removed += dropped
+        return removed
+    return storage.purge_noise_buffers(STATE_PATH)
 
 
-def _read_items(path: Path) -> list[DiffLedgerItem]:
+def _read_raw_items(path: Path) -> list[dict]:
     if not path.exists():
         return []
     try:
+        import json
+
         data = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return []
     if not isinstance(data, list):
         return []
+    return [item for item in data if isinstance(item, dict)]
 
+
+def _normalize_items(raw_items: list[dict]) -> list[DiffLedgerItem]:
     items: list[DiffLedgerItem] = []
-    for raw in data:
-        if not isinstance(raw, dict):
-            continue
+    for raw in raw_items:
         repo = str(raw.get("repo", "")).strip()
         git_diff_text = str(raw.get("gitDiffText", ""))
         git_diff_description = str(raw.get("gitDiffDescription", ""))
-        item_datetime = str(raw.get("datetime", ""))
-        shown = bool(raw.get("shown", False))
-        diff_hash = str(raw.get("diffHash", ""))
-        repo_path = str(raw.get("repoPath", ""))
-        author = str(raw.get("author", "Backup"))
-        summary_source = str(raw.get("summarySource", "")).strip().lower()
-        rewritten_by = str(raw.get("rewrittenBy", "")).strip()
-        rewritten_at = str(raw.get("rewrittenAt", "")).strip()
-        requested_summary_source = str(raw.get("requestedSummarySource", "")).strip().lower()
-        summary_warning = str(raw.get("summaryWarning", "")).strip()
-        fallback_summary_source = str(raw.get("fallbackSummarySource", "")).strip().lower()
-        summary_timing_ms = max(0, int(raw.get("summaryTimingMs", 0) or 0))
-        summary_provider_details = str(raw.get("summaryProviderDetails", "")).strip()
-        last_ai_attempt_at = str(raw.get("lastAiAttemptAt", "")).strip()
         if not repo or not git_diff_text:
             continue
         items.append(
             {
-                "datetime": item_datetime,
+                "datetime": str(raw.get("datetime", "")),
                 "repo": repo,
                 "gitDiffText": git_diff_text,
                 "gitDiffDescription": git_diff_description,
-                "shown": shown,
-                "diffHash": diff_hash or hashlib.sha256(git_diff_text.encode("utf-8")).hexdigest(),
-                "repoPath": repo_path,
-                "author": author,
-                "summarySource": summary_source,
-                "rewrittenBy": rewritten_by,
-                "rewrittenAt": rewritten_at,
-                "requestedSummarySource": requested_summary_source,
-                "summaryWarning": summary_warning,
-                "fallbackSummarySource": fallback_summary_source,
-                "summaryTimingMs": summary_timing_ms,
-                "summaryProviderDetails": summary_provider_details,
-                "lastAiAttemptAt": last_ai_attempt_at,
+                "shown": bool(raw.get("shown", False)),
+                "diffHash": str(raw.get("diffHash", "")) or hashlib.sha256(git_diff_text.encode("utf-8")).hexdigest(),
+                "repoPath": str(raw.get("repoPath", "")),
+                "author": str(raw.get("author", "Backup")),
+                "summarySource": str(raw.get("summarySource", "")).strip().lower(),
+                "rewrittenBy": str(raw.get("rewrittenBy", "")).strip(),
+                "rewrittenAt": str(raw.get("rewrittenAt", "")).strip(),
+                "requestedSummarySource": str(raw.get("requestedSummarySource", "")).strip().lower(),
+                "summaryWarning": str(raw.get("summaryWarning", "")).strip(),
+                "fallbackSummarySource": str(raw.get("fallbackSummarySource", "")).strip().lower(),
+                "summaryTimingMs": max(0, int(raw.get("summaryTimingMs", 0) or 0)),
+                "summaryProviderDetails": str(raw.get("summaryProviderDetails", "")).strip(),
+                "lastAiAttemptAt": str(raw.get("lastAiAttemptAt", "")).strip(),
             }
         )
     return items
 
 
 def _write_items(path: Path, items: list[DiffLedgerItem]) -> None:
+    import json
+
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = [
         {
@@ -173,16 +200,15 @@ def _write_items(path: Path, items: list[DiffLedgerItem]) -> None:
             "lastAiAttemptAt": item["lastAiAttemptAt"],
         }
         for item in items
+        if not _buffer_item_is_noise(item)
     ]
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def find_item(repo_label: str, diff_text: str, day_key: str | None = None) -> DiffLedgerItem | None:
+def find_item(repo_label: str, diff_text: str, day_key: str | None = None, buffer_dir: Path | None = None) -> DiffLedgerItem | None:
     active_day = day_key or _today_key()
-    path = _buffer_path(active_day)
     diff_hash = hashlib.sha256(diff_text.encode("utf-8")).hexdigest()
-
-    for item in _read_items(path):
+    for item in load_buffer_items(active_day, buffer_dir=buffer_dir):
         if item["repo"] != repo_label:
             continue
         if item["diffHash"] == diff_hash or item["gitDiffText"] == diff_text:
@@ -241,13 +267,12 @@ def remember_diff(
     summary_provider_details: str = "",
     last_ai_attempt_at: str = "",
     day_key: str | None = None,
+    buffer_dir: Path | None = None,
 ) -> DiffLedgerItem:
     active_day = day_key or _today_key()
-    path = _buffer_path(active_day)
     diff_hash = hashlib.sha256(diff_text.encode("utf-8")).hexdigest()
     created_at = datetime.now().isoformat(timespec="seconds")
-
-    items = _read_items(path)
+    items = load_buffer_items(active_day, buffer_dir=buffer_dir)
     for item in items:
         if not _matches_diff_item(item, repo_label, diff_hash, diff_text):
             continue
@@ -265,7 +290,10 @@ def remember_diff(
             created_at=created_at,
             repo_path=repo_path,
         )
-        _write_items(path, items)
+        if _uses_files(buffer_dir):
+            replace_buffer_items(active_day, items, buffer_dir=buffer_dir)
+        else:
+            storage.upsert_buffer_item(STATE_PATH, active_day, item)
         return item
 
     new_item: DiffLedgerItem = {
@@ -287,16 +315,18 @@ def remember_diff(
         "summaryProviderDetails": summary_provider_details,
         "lastAiAttemptAt": last_ai_attempt_at,
     }
-    items.append(new_item)
-    _write_items(path, items)
+    if _uses_files(buffer_dir):
+        items.append(new_item)
+        replace_buffer_items(active_day, items, buffer_dir=buffer_dir)
+    else:
+        storage.upsert_buffer_item(STATE_PATH, active_day, new_item)
     return new_item
 
 
-def mark_as_shown(repo_label: str, diff_text: str, day_key: str | None = None) -> bool:
+def mark_as_shown(repo_label: str, diff_text: str, day_key: str | None = None, buffer_dir: Path | None = None) -> bool:
     active_day = day_key or _today_key()
-    path = _buffer_path(active_day)
-    items = _read_items(path)
     diff_hash = hashlib.sha256(diff_text.encode("utf-8")).hexdigest()
+    items = load_buffer_items(active_day, buffer_dir=buffer_dir)
     changed = False
     for item in items:
         if item["repo"] != repo_label:
@@ -305,7 +335,10 @@ def mark_as_shown(repo_label: str, diff_text: str, day_key: str | None = None) -
             if not item["shown"]:
                 item["shown"] = True
                 changed = True
+            if changed:
+                if _uses_files(buffer_dir):
+                    replace_buffer_items(active_day, items, buffer_dir=buffer_dir)
+                else:
+                    storage.upsert_buffer_item(STATE_PATH, active_day, item)
             break
-    if changed:
-        _write_items(path, items)
     return changed

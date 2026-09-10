@@ -41,6 +41,7 @@ from pyesis.ai_summary import (
 from pyesis.config import (
     AI_ATTEMPT_LOG_PATH,
     ARCHIVE_DIR,
+    STATE_PATH,
     AppConfig,
     DeletedEntryRecord,
     EntryRecord,
@@ -586,8 +587,9 @@ class PyesisApp:
             "attempts": attempts,
         }
         AI_ATTEMPT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with AI_ATTEMPT_LOG_PATH.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
+        from pyesis.storage import append_ai_attempt
+
+        append_ai_attempt(STATE_PATH, payload)
 
     def _ai_provider_label(self, mode: str) -> str:
         return AI_PROVIDER_LABELS.get(mode, mode or "AI")
@@ -1014,7 +1016,7 @@ class PyesisApp:
             final_entries,
             week_end_day=week_end_day,
             archive_dir=ARCHIVE_DIR,
-            buffer_dir=BUFFER_DIR,
+            buffer_dir=None,
         )
 
         recovery_items: list[dict[str, object]] = []
@@ -1545,7 +1547,7 @@ class PyesisApp:
             self.config.entries,
             week_end_day=self.config.week_end_day,
             archive_dir=ARCHIVE_DIR,
-            buffer_dir=BUFFER_DIR,
+            buffer_dir=None,
         )
 
     def _rewrite_legacy_summaries(self, entries: list[EntryRecord]) -> list[EntryRecord]:
@@ -2401,26 +2403,12 @@ class PyesisApp:
         webbrowser.open(temp_path.as_uri())
 
     def _ai_attempt_log_path(self) -> Path:
-        return AI_ATTEMPT_LOG_PATH
+        return STATE_PATH
 
     def _load_ai_attempt_log_items(self, limit: int = AI_ATTEMPT_LOG_VIEW_LIMIT) -> list[dict[str, object]]:
-        log_path = self._ai_attempt_log_path()
-        if not log_path.exists():
-            return []
+        from pyesis.storage import load_ai_attempts
 
-        items: list[dict[str, object]] = []
-        try:
-            for raw_line in log_path.read_text(encoding="utf-8").splitlines():
-                line = raw_line.strip()
-                if not line:
-                    continue
-                payload = json.loads(line)
-                if isinstance(payload, dict):
-                    items.append(payload)
-        except Exception:
-            return []
-
-        return items[-max(1, limit) :]
+        return load_ai_attempts(STATE_PATH, limit)
 
     def _ai_attempt_label(self, item: dict[str, object]) -> str:
         timestamp = str(item.get("timestamp", "")).strip() or "unknown-time"
@@ -2479,7 +2467,6 @@ class PyesisApp:
         return "\n".join(lines)
 
     def _open_ai_attempt_log(self) -> None:
-        log_path = self._ai_attempt_log_path()
         items = list(reversed(self._load_ai_attempt_log_items()))
 
         dialog = tk.Toplevel(self.root)
@@ -2500,7 +2487,7 @@ class PyesisApp:
         enabled_note = "enabled" if self.config.ai_attempt_logging_enabled else "disabled"
         ttk.Label(
             shell,
-            text=f"Showing the most recent {AI_ATTEMPT_LOG_VIEW_LIMIT} AI attempts from {log_path} ({enabled_note}).",
+            text=f"Showing the most recent {AI_ATTEMPT_LOG_VIEW_LIMIT} AI attempts from the Pyesis database ({enabled_note}).",
             wraplength=820,
             justify="left",
         ).grid(row=0, column=0, sticky="w", pady=(0, 8))
@@ -2528,7 +2515,7 @@ class PyesisApp:
         if not items:
             detail.insert(
                 "1.0",
-                f"No AI attempt records found at {log_path}.\n\nTurn on 'Write AI attempt audit log' in Settings and run a poll to capture provider attempts.",
+                f"No AI attempt records found in the Pyesis database.\n\nTurn on 'Write AI attempt audit log' in Settings and run a poll to capture provider attempts.",
             )
             detail.configure(state="disabled")
         else:
@@ -3239,16 +3226,9 @@ class PyesisApp:
         )
 
     def _iter_buffer_items(self):
-        for buffer_file in sorted(BUFFER_DIR.glob("*.json")):
-            try:
-                items = json.loads(buffer_file.read_text(encoding="utf-8"))
-            except Exception:
-                continue
-            if not isinstance(items, list):
-                continue
-            for item in items:
-                if isinstance(item, dict):
-                    yield item
+        for day_key in list_buffer_day_keys():
+            for item in load_buffer_items(day_key):
+                yield item
 
     def _iter_current_week_buffer_items(self):
         for item in self._iter_buffer_items():

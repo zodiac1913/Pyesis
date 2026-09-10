@@ -74,7 +74,7 @@ On Windows PowerShell, use `$env:PYESIS_AI_MODE = "openai-compatible"` style ass
 
 ## Notes
 
-- The app stores runtime state in `~/PyesisState/` on every OS.
+- The app stores runtime data in `~/PyesisState/pyesis.db` on every OS, including monitored repos, entries, diff buffers, and AI attempt logs. Legacy `pyesis_state.json` is imported once and renamed.
 - Each entry stores a larger diff excerpt to improve summary quality for future rewrites.
 - Exported documents are written to the configured DOCX output folder.
 - New installs default DOCX output to a `Pyesis` folder in your home Documents directory when available, and legacy `exports` settings are migrated away from the repo-local folder automatically.

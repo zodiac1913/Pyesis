@@ -18,6 +18,9 @@ RENAME_TO_PREFIX = "rename to "
 DEV_NULL_PATH = "/dev/null"
 DEFAULT_EXCLUDES = [
     "pyesis_state.json",
+    "pyesis.db",
+    "pyesis.db-wal",
+    "pyesis.db-shm",
     "diff_buffers/**",
     "exports/**",
     "logs/**",
@@ -321,6 +324,10 @@ def _hunk_new_start(line: str) -> int | None:
 def is_noise_work_text(text: str) -> bool:
     lowered = text.replace("\\", "/").lower()
     return any(marker in lowered for marker in NOISE_TEXT_MARKERS)
+
+
+def is_noise_entry_record(summary: str, excerpt: str, repo_path: str = "", repo_label: str = "") -> bool:
+    return any(is_noise_work_text(part) for part in (summary, excerpt, repo_path, repo_label))
 
 
 def _is_excluded_path(path: str) -> bool:

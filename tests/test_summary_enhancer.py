@@ -17,7 +17,7 @@ class SummaryEnhancerTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp_dir_ctx = tempfile.TemporaryDirectory()
         self._tmp_dir = Path(self._tmp_dir_ctx.name)
-        self._state_path = self._tmp_dir / "pyesis_state.json"
+        self._state_path = self._tmp_dir / "pyesis.db"
         self._patch_config_state_path = patch("pyesis.config.STATE_PATH", self._state_path)
         self._patch_enhancer_state_path = patch("pyesis.summary_enhancer.STATE_PATH", self._state_path)
         self._patch_config_state_path.start()
@@ -68,7 +68,7 @@ class SummaryEnhancerTests(unittest.TestCase):
     def test_dry_run_does_not_write_fields(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp = Path(tmp_dir)
-            state_path = tmp / "pyesis_state.json"
+            state_path = tmp / "pyesis.db"
             buffer_dir = tmp / "diff_buffers"
             buffer_dir.mkdir(parents=True, exist_ok=True)
             buffer_path = buffer_dir / "2026-06-16.json"
@@ -132,7 +132,7 @@ class SummaryEnhancerTests(unittest.TestCase):
     def test_live_run_rewrites_only_description_fields(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp = Path(tmp_dir)
-            state_path = tmp / "pyesis_state.json"
+            state_path = tmp / "pyesis.db"
             buffer_dir = tmp / "diff_buffers"
             buffer_dir.mkdir(parents=True, exist_ok=True)
             buffer_path = buffer_dir / "2026-06-16.json"

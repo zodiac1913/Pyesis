@@ -5,7 +5,6 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from difflib import SequenceMatcher
 import hashlib
-import json
 from pathlib import Path
 import re
 import shutil
@@ -57,7 +56,9 @@ def default_state_directory() -> Path:
 
 
 STATE_DIRECTORY = default_state_directory()
-STATE_PATH = STATE_DIRECTORY / "pyesis_state.json"
+DB_PATH = STATE_DIRECTORY / "pyesis.db"
+STATE_PATH = DB_PATH
+LEGACY_JSON_PATH = STATE_DIRECTORY / "pyesis_state.json"
 BUFFER_DIR = STATE_DIRECTORY / "diff_buffers"
 ARCHIVE_DIR = STATE_DIRECTORY / "week_archives"
 AI_ATTEMPT_LOG_PATH = STATE_DIRECTORY / "logs" / "ai_attempts.jsonl"
@@ -205,7 +206,7 @@ def migrate_legacy_runtime_data(
         return False
 
     migrated = False
-    migrated |= _copy_file_if_newer(source_root / LEGACY_STATE_PATH.name, state_directory / STATE_PATH.name)
+    migrated |= _copy_file_if_newer(source_root / LEGACY_STATE_PATH.name, state_directory / LEGACY_STATE_PATH.name)
     migrated |= _copy_tree_files_if_newer(source_root / LEGACY_BUFFER_DIR.name, state_directory / BUFFER_DIR.name)
     migrated |= _copy_tree_files_if_newer(source_root / LEGACY_LOG_DIR.name, state_directory / AI_ATTEMPT_LOG_PATH.parent.name)
     return migrated
@@ -741,15 +742,23 @@ def _should_rewrite_saved_entries(
     )
 
 
-def _load_state_data(state_path: Path = STATE_PATH) -> dict[str, Any] | None:
-    if state_path == STATE_PATH:
+def _load_state_data(state_path: Path = STATE_PATH, *, include_entries: bool = True) -> dict[str, Any] | None:
+    from pyesis.storage import normalized_db_path, read_payload
+
+    if normalized_db_path(state_path) == STATE_PATH:
         ensure_state_storage()
-        if not STATE_PATH.exists():
-            migrate_legacy_runtime_data()
-    if not state_path.exists():
-        return None
-    raw_data = json.loads(state_path.read_text(encoding="utf-8"))
-    return raw_data if isinstance(raw_data, dict) else None
+        migrate_legacy_runtime_data()
+    return read_payload(state_path, include_entries=include_entries)
+
+
+def _drop_noise_entries(entries: list[EntryRecord]) -> list[EntryRecord]:
+    from pyesis.git_monitor import is_noise_entry_record
+
+    return [
+        entry
+        for entry in entries
+        if not is_noise_entry_record(entry.summary, entry.diff_excerpt, entry.repo_path, entry.repo_label)
+    ]
 
 
 def _config_export_directory(data: dict[str, Any]) -> str:
@@ -813,7 +822,7 @@ def _base_config_from_data(data: dict[str, Any], entries: list[EntryRecord], del
 
 
 def load_startup_config_snapshot(state_path: Path = STATE_PATH) -> AppConfig:
-    data = _load_state_data(state_path)
+    data = _load_state_data(state_path, include_entries=False)
     if data is None:
         return AppConfig()
     raw_deleted_entries = [_decode_deleted_entry(item) for item in data.get("deleted_entries", [])]
@@ -821,8 +830,10 @@ def load_startup_config_snapshot(state_path: Path = STATE_PATH) -> AppConfig:
     return _base_config_from_data(data, [], deleted_entries)
 
 
-def load_config() -> AppConfig:
-    data = _load_state_data()
+def load_config(state_path: Path = STATE_PATH) -> AppConfig:
+    from pyesis.storage import write_config
+
+    data = _load_state_data(state_path, include_entries=True)
     if data is None:
         return AppConfig()
     raw_deleted_entries = [_decode_deleted_entry(item) for item in data.get("deleted_entries", [])]
@@ -832,58 +843,27 @@ def load_config() -> AppConfig:
     raw_entries = [_decode_entry(item) for item in raw_entry_items]
     retained_entries = _prune_entries(raw_entries)
     visible_entries = [entry for entry in retained_entries if deleted_entry_key_for_entry(entry) not in deleted_entry_keys]
-    entries = dedupe_entries(visible_entries)
-    deleted_entries_payload = [asdict(entry) for entry in deleted_entries]
+    entries = _drop_noise_entries(dedupe_entries(visible_entries))
+    config = _base_config_from_data(data, entries, deleted_entries)
     if (
         _should_rewrite_saved_entries(raw_entries, entries, raw_entry_items)
         or len(retained_entries) != len(raw_entries)
         or len(visible_entries) != len(retained_entries)
-        or data.get("deleted_entries", []) != deleted_entries_payload
+        or len(entries) != len(visible_entries)
+        or data.get("deleted_entries", []) != [asdict(entry) for entry in deleted_entries]
     ):
-        data["entries"] = [asdict(entry) for entry in entries]
-        data["deleted_entries"] = deleted_entries_payload
-        STATE_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    return _base_config_from_data(data, entries, deleted_entries)
+        write_config(config, state_path)
+    return config
 
 
 def save_config(config: AppConfig, state_path: Path = STATE_PATH) -> None:
+    from pyesis.storage import write_config
+
     config.deleted_entries = _prune_deleted_entries(config.deleted_entries)
     deleted_entry_keys = {entry.key for entry in config.deleted_entries}
-    config.entries = dedupe_entries(
-        [entry for entry in _prune_entries(config.entries) if deleted_entry_key_for_entry(entry) not in deleted_entry_keys]
+    config.entries = _drop_noise_entries(
+        dedupe_entries(
+            [entry for entry in _prune_entries(config.entries) if deleted_entry_key_for_entry(entry) not in deleted_entry_keys]
+        )
     )
-    payload = {
-        "week_end_day": config.week_end_day,
-        "theme_mode": config.theme_mode,
-        "high_contrast": config.high_contrast,
-        "ui_font_size": config.ui_font_size,
-        "export_directory": config.export_directory,
-        "auto_export_time": config.auto_export_time,
-        "last_auto_export_date": config.last_auto_export_date,
-        "ai_mode": config.ai_mode,
-        "ai_fallback_enabled": config.ai_fallback_enabled,
-        "ai_attempt_logging_enabled": config.ai_attempt_logging_enabled,
-        "ai_ollama_url": config.ai_ollama_url,
-        "ai_ollama_model": config.ai_ollama_model,
-        "ai_ollama_keep_alive": config.ai_ollama_keep_alive,
-        "ai_ollama_timeout_seconds": max(0, int(config.ai_ollama_timeout_seconds)),
-        "ai_ollama_num_threads": max(1, int(config.ai_ollama_num_threads)),
-        "ai_openai_url": config.ai_openai_url,
-        "ai_openai_model": config.ai_openai_model,
-        "ai_github_gpt_url": config.ai_github_gpt_url,
-        "ai_github_gpt_model": config.ai_github_gpt_model,
-        "github_auth_mode": config.github_auth_mode,
-        "github_auth_endpoint": config.github_auth_endpoint,
-        "github_oauth_client_id": config.github_oauth_client_id,
-        "summary_enhancer_enabled": config.summary_enhancer_enabled,
-        "summary_enhancer_interval_minutes": config.summary_enhancer_interval_minutes,
-        "summary_enhancer_dry_run": config.summary_enhancer_dry_run,
-        "summary_enhancer_aggressive_prodding": config.summary_enhancer_aggressive_prodding,
-        "summary_enhancer_last_run_at": config.summary_enhancer_last_run_at,
-        "summary_enhancer_rewritten_by": config.summary_enhancer_rewritten_by,
-        "repos": [asdict(repo) for repo in config.repos],
-        "entries": [asdict(entry) for entry in config.entries],
-        "deleted_entries": [asdict(entry) for entry in config.deleted_entries],
-    }
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    state_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    write_config(config, state_path)

@@ -2,10 +2,10 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Python: Pyesis (main.py)",
-            "type": "debugpy",
+            "name": "Pyesis",
+            "type": "python",
             "request": "launch",
-            "python": "${command:python.interpreterPath}",
+            "python": "${workspaceFolder}/.venv/bin/python",
             "program": "${workspaceFolder}/main.py",
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
