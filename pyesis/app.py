@@ -970,7 +970,8 @@ class PyesisApp:
         try:
             config = load_config()
         except Exception as exc:
-            self._post_to_ui(lambda: self._complete_startup_load_error(str(exc)))
+            error_text = str(exc)
+            self._post_to_ui(lambda error_text=error_text: self._complete_startup_load_error(error_text))
             return
         self._post_to_ui(lambda loaded_config=config: self._complete_startup_config_load(loaded_config))
 
@@ -1108,6 +1109,7 @@ class PyesisApp:
         self._refresh_repo_list()
         self._refresh_editor()
         self._clear_startup_loading_message()
+        self._queue_startup_poll()
 
     def _setup_editor_background(self) -> None:
         watermark_names = ("assets/Pyesis-watermark.png", "assets/pyesis-watermark.png")
@@ -1888,7 +1890,8 @@ class PyesisApp:
         try:
             device_login = start_github_device_login(mode, endpoint, client_id)
         except Exception as exc:
-            self.root.after(0, lambda: status_var.set(f"GitHub sign-in failed: {exc}"))
+            error_text = str(exc)
+            self.root.after(0, lambda error_text=error_text: status_var.set(f"GitHub sign-in failed: {error_text}"))
             return
 
         def show_pending(login: GitHubDeviceLogin) -> None:
@@ -1911,7 +1914,8 @@ class PyesisApp:
             if not ok:
                 raise RuntimeError(message or "Could not save the GitHub token.")
         except Exception as exc:
-            self.root.after(0, lambda: status_var.set(f"GitHub sign-in failed: {exc}"))
+            error_text = str(exc)
+            self.root.after(0, lambda error_text=error_text: status_var.set(f"GitHub sign-in failed: {error_text}"))
             return
 
         def on_success(user: GitHubUserIdentity) -> None:
@@ -4365,7 +4369,6 @@ def launch() -> None:
     app = PyesisApp(root)
     root.minsize(980, 640)
     app.status_var.set("Ready")
-    app._queue_startup_poll()
     if sys.platform == "darwin":
         root.update_idletasks()
         root.deiconify()

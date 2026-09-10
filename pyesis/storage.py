@@ -179,6 +179,12 @@ def backfill_legacy_entries(db_path: Path) -> int:
     from pyesis.git_monitor import is_noise_entry_record
 
     target = normalized_db_path(db_path)
+    if target.exists():
+        with connect(target) as connection:
+            initialize_schema(connection)
+            existing = int(connection.execute("SELECT COUNT(*) AS count FROM entries").fetchone()["count"])
+        if existing > 0:
+            return 0
     inserted = 0
     for path in _legacy_json_candidates(db_path):
         raw = _load_legacy_payload(path) if path.exists() else None

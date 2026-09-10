@@ -378,7 +378,7 @@ def _prune_entries(entries: list[EntryRecord], now: datetime | None = None) -> l
     return [entry for entry in entries if _retain_entry(entry, now)]
 
 
-def dedupe_entries(entries: list[EntryRecord]) -> list[EntryRecord]:
+def dedupe_entries(entries: list[EntryRecord], *, include_near_diff: bool = True) -> list[EntryRecord]:
     deduped: list[EntryRecord] = []
     deduped_file_fp: list[list[str]] = []
     seen_diff: set[tuple[str, str, str]] = set()
@@ -391,7 +391,7 @@ def dedupe_entries(entries: list[EntryRecord]) -> list[EntryRecord]:
             continue
         if _is_synchronized_mirror_duplicate(entry, seen_synchronized):
             continue
-        if _is_near_diff_duplicate(entry, deduped):
+        if include_near_diff and _is_near_diff_duplicate(entry, deduped):
             continue
         if _is_legacy_duplicate(entry, seen_legacy):
             continue
@@ -843,7 +843,7 @@ def load_config(state_path: Path = STATE_PATH) -> AppConfig:
     raw_entries = [_decode_entry(item) for item in raw_entry_items]
     retained_entries = _prune_entries(raw_entries)
     visible_entries = [entry for entry in retained_entries if deleted_entry_key_for_entry(entry) not in deleted_entry_keys]
-    entries = _drop_noise_entries(dedupe_entries(visible_entries))
+    entries = _drop_noise_entries(dedupe_entries(visible_entries, include_near_diff=False))
     config = _base_config_from_data(data, entries, deleted_entries)
     if (
         _should_rewrite_saved_entries(raw_entries, entries, raw_entry_items)
