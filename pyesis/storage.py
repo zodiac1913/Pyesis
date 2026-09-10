@@ -124,15 +124,99 @@ def legacy_json_path(db_path: Path) -> Path:
     return candidate
 
 
+def _legacy_json_candidates(db_path: Path) -> list[Path]:
+    target = normalized_db_path(db_path)
+    candidates = [
+        target.parent / f"{LEGACY_JSON_NAME}.migrated",
+        target.parent / LEGACY_JSON_NAME,
+    ]
+    if db_path.suffix.lower() == ".json":
+        candidates = [db_path.with_name(db_path.name + ".migrated"), db_path, *candidates]
+    unique: list[Path] = []
+    seen: set[Path] = set()
+    for path in candidates:
+        resolved = path if not path.exists() else path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique.append(path)
+    return unique
+
+
+def _preferred_legacy_json_path(db_path: Path) -> Path | None:
+    for path in _legacy_json_candidates(db_path):
+        if path.exists():
+            return path
+    return None
+
+
+def _load_legacy_payload(path: Path) -> dict[str, Any] | None:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
+def _entry_values(entry: EntryRecord) -> tuple[Any, ...]:
+    data = asdict(entry)
+    return tuple(data[column] for column in ENTRY_COLUMNS)
+
+
+def _upsert_entries(connection: sqlite3.Connection, entries: list[EntryRecord]) -> None:
+    placeholders = ", ".join("?" for _ in ENTRY_COLUMNS)
+    insert_sql = f"INSERT INTO entries({', '.join(ENTRY_COLUMNS)}) VALUES ({placeholders})"
+    for entry in entries:
+        existing = connection.execute(
+            "SELECT id FROM entries WHERE repo_path = ? AND diff_hash = ?",
+            (entry.repo_path, entry.diff_hash),
+        ).fetchone()
+        if existing is None:
+            connection.execute(insert_sql, _entry_values(entry))
+
+
+def backfill_legacy_entries(db_path: Path) -> int:
+    from pyesis.git_monitor import is_noise_entry_record
+
+    target = normalized_db_path(db_path)
+    inserted = 0
+    for path in _legacy_json_candidates(db_path):
+        raw = _load_legacy_payload(path) if path.exists() else None
+        if raw is None:
+            continue
+        entries = _config_from_payload(raw, include_entries=True).entries
+        if not entries:
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with connect(target) as connection:
+            initialize_schema(connection)
+            insert_sql = f"INSERT INTO entries({', '.join(ENTRY_COLUMNS)}) VALUES ({', '.join('?' for _ in ENTRY_COLUMNS)})"
+            for entry in entries:
+                if is_noise_entry_record(entry.summary, entry.diff_excerpt, entry.repo_path, entry.repo_label):
+                    continue
+                existing = connection.execute(
+                    "SELECT id FROM entries WHERE repo_path = ? AND diff_hash = ?",
+                    (entry.repo_path, entry.diff_hash),
+                ).fetchone()
+                if existing is not None:
+                    continue
+                connection.execute(insert_sql, _entry_values(entry))
+                inserted += 1
+            connection.commit()
+        if inserted:
+            break
+    return inserted
+
+
 def migrate_legacy_json(db_path: Path) -> bool:
     target = normalized_db_path(db_path)
-    if target.exists() and target.stat().st_size > 0:
-        return False
-    json_path = legacy_json_path(target)
+    json_path = _preferred_legacy_json_path(target)
     if db_path.suffix.lower() == ".json" and db_path.exists():
         json_path = db_path
-    if not json_path.exists():
-        return False
+    if json_path is None or not json_path.exists():
+        return backfill_legacy_entries(target) > 0
+    if target.exists() and target.stat().st_size > 0:
+        return backfill_legacy_entries(target) > 0
     try:
         raw = json.loads(json_path.read_text(encoding="utf-8"))
     except Exception:
@@ -140,6 +224,8 @@ def migrate_legacy_json(db_path: Path) -> bool:
     if not isinstance(raw, dict):
         return False
     write_config(_config_from_payload(raw, include_entries=True), target)
+    if json_path.name.endswith(".migrated"):
+        return True
     migrated_path = json_path.with_name(json_path.name + ".migrated")
     if json_path.resolve() != target.resolve():
         try:
@@ -151,11 +237,11 @@ def migrate_legacy_json(db_path: Path) -> bool:
 
 def read_payload(db_path: Path, *, include_entries: bool) -> dict[str, Any] | None:
     target = normalized_db_path(db_path)
+    migrate_sidecar_files(target)
     migrate_legacy_json(target if db_path.suffix.lower() != ".json" else db_path)
+    backfill_legacy_entries(target)
     if not target.exists():
-        migrate_sidecar_files(target)
-        if not target.exists():
-            return None
+        return None
     with connect(target) as connection:
         initialize_schema(connection)
         settings = {str(row["key"]): json.loads(row["value"]) for row in connection.execute("SELECT key, value FROM settings")}
@@ -193,9 +279,9 @@ def write_config(config: AppConfig, db_path: Path) -> None:
     target = normalized_db_path(db_path)
     with connect(target) as connection:
         initialize_schema(connection)
+        existing_count = int(connection.execute("SELECT COUNT(*) AS count FROM entries").fetchone()["count"])
         connection.execute("DELETE FROM settings")
         connection.execute("DELETE FROM repos")
-        connection.execute("DELETE FROM entries")
         connection.execute("DELETE FROM deleted_entries")
         connection.executemany(
             "INSERT INTO settings(key, value) VALUES (?, ?)",
@@ -205,11 +291,21 @@ def write_config(config: AppConfig, db_path: Path) -> None:
             "INSERT INTO repos(position, path, label, poll_seconds) VALUES (?, ?, ?, ?)",
             [(index, repo.path, repo.label, int(repo.poll_seconds)) for index, repo in enumerate(config.repos)],
         )
-        placeholders = ", ".join("?" for _ in ENTRY_COLUMNS)
-        connection.executemany(
-            f"INSERT INTO entries({', '.join(ENTRY_COLUMNS)}) VALUES ({placeholders})",
-            [tuple(asdict(entry)[column] for column in ENTRY_COLUMNS) for entry in config.entries],
-        )
+        if config.entries or existing_count == 0:
+            incoming_keys = {(entry.repo_path, entry.diff_hash) for entry in config.entries}
+            existing_keys = {
+                (str(row["repo_path"]), str(row["diff_hash"]))
+                for row in connection.execute("SELECT repo_path, diff_hash FROM entries")
+            }
+            if incoming_keys and existing_keys - incoming_keys:
+                _upsert_entries(connection, config.entries)
+            else:
+                connection.execute("DELETE FROM entries")
+                placeholders = ", ".join("?" for _ in ENTRY_COLUMNS)
+                connection.executemany(
+                    f"INSERT INTO entries({', '.join(ENTRY_COLUMNS)}) VALUES ({placeholders})",
+                    [_entry_values(entry) for entry in config.entries],
+                )
         connection.executemany(
             "INSERT INTO deleted_entries(key, deleted_at) VALUES (?, ?)",
             [(item.key, item.deleted_at) for item in config.deleted_entries],

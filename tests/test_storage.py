@@ -127,6 +127,84 @@ class StorageMigrationTests(unittest.TestCase):
             items = load_buffer_day(db_path, "2026-09-08")
             self.assertEqual([item["diffHash"] for item in items], ["keep-buf"])
 
+    def test_backfill_imports_entries_when_db_already_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            db_path = root / "pyesis.db"
+            save_config(AppConfig(week_end_day="Thursday", entries=[]), state_path=db_path)
+            (root / "pyesis_state.json.migrated").write_text(
+                json.dumps({
+                    "week_end_day": "Thursday",
+                    "repos": [],
+                    "entries": [{
+                        "repo_label": "Pyesis",
+                        "repo_path": "/tmp/pyesis",
+                        "created_at": "2026-09-08T08:53:03",
+                        "day_name": "Tuesday",
+                        "week_start_iso": "2026-09-07T00:00:00",
+                        "summary": "I kept a real summary.",
+                        "diff_hash": "keep-backfill",
+                        "diff_excerpt": "diff --git a/pyesis/app.py b/pyesis/app.py\n",
+                    }],
+                }),
+                encoding="utf-8",
+            )
+            loaded = load_config(state_path=db_path)
+            self.assertEqual([entry.diff_hash for entry in loaded.entries], ["keep-backfill"])
+
+    def test_empty_save_does_not_wipe_existing_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "pyesis.db"
+            save_config(
+                AppConfig(
+                    entries=[
+                        EntryRecord(
+                            repo_label="Pyesis",
+                            repo_path="/tmp/pyesis",
+                            created_at="2026-09-08T08:53:03",
+                            day_name="Tuesday",
+                            week_start_iso="2026-09-07T00:00:00",
+                            summary="I kept a real summary.",
+                            diff_hash="keep-empty-save",
+                            diff_excerpt="diff --git a/pyesis/app.py b/pyesis/app.py\n",
+                        )
+                    ]
+                ),
+                state_path=db_path,
+            )
+            save_config(AppConfig(week_end_day="Friday", entries=[]), state_path=db_path)
+            loaded = load_config(state_path=db_path)
+            self.assertEqual([entry.diff_hash for entry in loaded.entries], ["keep-empty-save"])
+            self.assertEqual(loaded.week_end_day, "Friday")
+
+    def test_partial_save_does_not_wipe_existing_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "pyesis.db"
+            first = EntryRecord(
+                repo_label="Pyesis",
+                repo_path="/tmp/pyesis",
+                created_at="2026-09-08T08:53:03",
+                day_name="Tuesday",
+                week_start_iso="2026-09-07T00:00:00",
+                summary="I kept the original summary.",
+                diff_hash="keep-original",
+                diff_excerpt="diff --git a/pyesis/app.py b/pyesis/app.py\n",
+            )
+            second = EntryRecord(
+                repo_label="Pyesis",
+                repo_path="/tmp/pyesis",
+                created_at="2026-09-09T08:53:03",
+                day_name="Wednesday",
+                week_start_iso="2026-09-07T00:00:00",
+                summary="I added a later summary.",
+                diff_hash="keep-new",
+                diff_excerpt="diff --git a/pyesis/config.py b/pyesis/config.py\n",
+            )
+            save_config(AppConfig(entries=[first]), state_path=db_path)
+            save_config(AppConfig(entries=[second]), state_path=db_path)
+            loaded = load_config(state_path=db_path)
+            self.assertEqual(sorted(entry.diff_hash for entry in loaded.entries), ["keep-new", "keep-original"])
+
 
 if __name__ == "__main__":
     unittest.main()
