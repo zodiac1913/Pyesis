@@ -91,6 +91,55 @@ def validate_repo(path: str) -> tuple[bool, str]:
     return True, "OK"
 
 
+def parse_remote_repo_name(remote_url: str) -> str:
+    text = remote_url.strip()
+    if not text:
+        return ""
+    if text.startswith("git@") and ":" in text.split("/", 1)[0]:
+        path = text.partition(":")[2]
+    else:
+        without_scheme = text.split("://", 1)[1] if "://" in text else text
+        host_and_path = without_scheme.split("@", 1)[1] if "@" in without_scheme.split("/", 1)[0] else without_scheme
+        path = host_and_path.split("/", 1)[1] if "/" in host_and_path else host_and_path
+    path = path.strip().rstrip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    name = path.split("/")[-1].strip()
+    return name
+
+
+def github_repo_name(repo_path: str, fallback: str = "") -> str:
+    folder_name = fallback.strip() or Path(repo_path).name
+    try:
+        remote_listing = _run_git(repo_path, "remote", "-v")
+    except (RuntimeError, OSError):
+        return folder_name
+
+    origin_url = ""
+    github_url = ""
+    first_url = ""
+    for raw_line in remote_listing.splitlines():
+        parts = raw_line.split()
+        if len(parts) < 2:
+            continue
+        remote_name, remote_url = parts[0], parts[1]
+        parsed = parse_remote_repo_name(remote_url)
+        if not parsed:
+            continue
+        if not first_url:
+            first_url = remote_url
+        if remote_name == "origin" and not origin_url:
+            origin_url = remote_url
+        if "github." in remote_url.lower() and not github_url:
+            github_url = remote_url
+
+    for candidate in (origin_url, github_url, first_url):
+        name = parse_remote_repo_name(candidate)
+        if name:
+            return name
+    return folder_name
+
+
 def capture_snapshot(repo: RepoConfig) -> DiffSnapshot | None:
     diff_parts = [
         _run_diff(repo.path, "diff").strip(),

@@ -74,7 +74,7 @@ from pyesis.github_auth import (
     start_github_device_login,
     store_github_auth_token,
 )
-from pyesis.git_monitor import DiffSnapshot, capture_snapshot, is_noise_work_text, split_diff_by_file, summarize_file_changes, validate_repo
+from pyesis.git_monitor import DiffSnapshot, capture_snapshot, github_repo_name, is_noise_work_text, split_diff_by_file, summarize_file_changes, validate_repo
 from pyesis.summary_enhancer import run_periodic_enhancer
 from pyesis.week_archive import archive_completed_weeks
 
@@ -989,6 +989,7 @@ class PyesisApp:
         self.ai_status_var.set(self._initial_ai_status_text())
         self._apply_fonts()
         self._apply_theme()
+        self._resolve_monitored_repo_identities()
         self._refresh_repo_list()
         self._set_startup_loading_message("Saved settings loaded. Finishing startup...")
         self.root.after(0, self._begin_startup_finalize)
@@ -1057,7 +1058,7 @@ class PyesisApp:
             except ValueError:
                 continue
 
-            repo = RepoConfig(path=str(item["repoPath"]), label=str(item["repo"]))
+            repo = self._repo_config_for_buffer_item(str(item["repoPath"]), str(item["repo"]))
             entry = self._build_entry(
                 repo,
                 created_at,
@@ -1205,7 +1206,6 @@ class PyesisApp:
 
     def _add_or_update_repo(self) -> None:
         path = self.repo_path_var.get().strip()
-        label = self.repo_label_var.get().strip() or Path(path).name
         try:
             poll_seconds = max(5, int(self.poll_seconds_var.get().strip() or "120"))
         except ValueError:
@@ -1217,12 +1217,16 @@ class PyesisApp:
             messagebox.showerror("Invalid repository", message)
             return
 
+        label = self.repo_label_var.get().strip() or Path(path).name
+        repo_name = github_repo_name(path, fallback=label)
+
         current_index = self._selected_repo_index_from_selection()
         if current_index is None:
             if any(repo.path == path for repo in self.config.repos):
                 messagebox.showinfo("Already added", "This repository is already being monitored.")
                 return
-            self.config.repos.append(RepoConfig(path=path, label=label, poll_seconds=poll_seconds))
+            repo = RepoConfig(path=path, label=label, poll_seconds=poll_seconds, repo_name=repo_name)
+            self.config.repos.append(repo)
             status_text = f"Added {label}"
             current_index = len(self.config.repos) - 1
         else:
@@ -1230,13 +1234,88 @@ class PyesisApp:
                 messagebox.showinfo("Already added", "Another monitored repository already uses that path.")
                 return
 
-            self.config.repos[current_index] = RepoConfig(path=path, label=label, poll_seconds=poll_seconds)
+            repo = RepoConfig(path=path, label=label, poll_seconds=poll_seconds, repo_name=repo_name)
+            self.config.repos[current_index] = repo
             status_text = f"Updated {label}"
+
+        self._align_entries_to_repo_identity(repo)
 
         self._persist()
         self._refresh_repo_list()
         self._clear_repo_form()
         self.status_var.set(status_text)
+
+    def _resolve_monitored_repo_identities(self) -> None:
+        next_repos: list[RepoConfig] = []
+        identity_changed = False
+        entries_changed = False
+        for repo in self.config.repos:
+            repo_name = repo.repo_name.strip() or github_repo_name(repo.path, fallback=repo.label)
+            updated = repo if repo.repo_name == repo_name else replace(repo, repo_name=repo_name)
+            if updated.repo_name != repo.repo_name:
+                identity_changed = True
+            if self._align_entries_to_repo_identity(updated):
+                entries_changed = True
+            next_repos.append(updated)
+        self.config.repos = next_repos
+        if identity_changed or entries_changed:
+            self._save_config_snapshot_async()
+
+    def _align_entries_to_repo_identity(self, repo: RepoConfig) -> bool:
+        identity = repo.identity_name
+        aligned: list[EntryRecord] = []
+        changed = False
+        for entry in self.config.entries:
+            if entry.repo_path == repo.path and entry.repo_label != identity:
+                aligned.append(replace(entry, repo_label=identity))
+                changed = True
+            else:
+                aligned.append(entry)
+        if changed:
+            self.config.entries = aligned
+        return changed
+
+    def _repo_list_text(self, repo: RepoConfig) -> str:
+        identity = repo.identity_name
+        display = repo.label.strip() or identity
+        if display != identity:
+            return f"{display} [{identity}] ({repo.poll_seconds}s)"
+        return f"{display} ({repo.poll_seconds}s)"
+
+    def _display_repo_label(self, entry: EntryRecord) -> str:
+        for repo in self.config.repos:
+            if repo.path == entry.repo_path:
+                return repo.label.strip() or repo.identity_name
+            if entry.repo_label in {repo.identity_name, repo.label}:
+                return repo.label.strip() or repo.identity_name
+        return entry.repo_label
+
+    def _find_ledger_item(self, repo: RepoConfig, diff_text: str):
+        seen: set[str] = set()
+        for name in (repo.identity_name, repo.label):
+            text = name.strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            existing = find_item(text, diff_text, self._buffer_day)
+            if existing is not None:
+                return existing
+        return None
+
+    def _mark_ledger_shown(self, repo: RepoConfig, diff_text: str) -> None:
+        seen: set[str] = set()
+        for name in (repo.identity_name, repo.label):
+            text = name.strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            mark_as_shown(text, diff_text, self._buffer_day)
+
+    def _repo_config_for_buffer_item(self, repo_path: str, fallback_label: str) -> RepoConfig:
+        for repo in self.config.repos:
+            if repo.path == repo_path:
+                return repo
+        return RepoConfig(path=repo_path, label=fallback_label, repo_name=fallback_label)
 
     def _remove_selected_repo(self) -> None:
         index = self._selected_repo_index_from_selection()
@@ -1253,7 +1332,7 @@ class PyesisApp:
         self.repo_items = {}
         self.repo_list.delete(0, tk.END)
         for repo in self.config.repos:
-            label = f"{repo.label} ({repo.poll_seconds}s)"
+            label = self._repo_list_text(repo)
             self.repo_items[label] = repo
             self.repo_list.insert(tk.END, label)
 
@@ -1273,7 +1352,7 @@ class PyesisApp:
             return
 
         repo = self.config.repos[index]
-        label = f"{repo.label} ({repo.poll_seconds}s)"
+        label = self._repo_list_text(repo)
         self._selected_repo_index = index
         self.repo_items[label] = repo
         self.repo_list.delete(index)
@@ -1333,7 +1412,7 @@ class PyesisApp:
                 except ValueError:
                     continue
 
-                repo = RepoConfig(path=item["repoPath"], label=item["repo"])
+                repo = self._repo_config_for_buffer_item(item["repoPath"], item["repo"])
                 entry = self._build_entry(
                     repo,
                     created_at,
@@ -2829,7 +2908,7 @@ class PyesisApp:
             excerpt = f"{excerpt} [{evidence}]"
             if len(excerpt) > 128:
                 excerpt = excerpt[:125] + "..."
-        return f"{stamp} | {entry.repo_label} | {excerpt}"
+        return f"{stamp} | {self._display_repo_label(entry)} | {excerpt}"
 
     def _entry_evidence_from_diff_excerpt(self, diff_excerpt: str) -> str:
         for change in summarize_file_changes(diff_excerpt):
@@ -2900,7 +2979,7 @@ class PyesisApp:
 
             _, entry = indexed_entries[position]
             evidence = self._entry_evidence_from_diff_excerpt(entry.diff_excerpt)
-            metadata_text = f"{entry.day_name} | {entry.created_at} | {entry.repo_label}"
+            metadata_text = f"{entry.day_name} | {entry.created_at} | {self._display_repo_label(entry)}"
             if evidence:
                 metadata_text += f"\nEvidence: {evidence}"
             metadata_var.set(metadata_text)
@@ -2950,7 +3029,7 @@ class PyesisApp:
             listbox.selection_set(pos)
 
             self._persist()
-            self.status_var.set(f"Updated 1 entry for {updated_entry.repo_label}")
+            self.status_var.set(f"Updated 1 entry for {self._display_repo_label(updated_entry)}")
 
         def go_previous() -> None:
             load_position(state["position"] - 1)
@@ -3061,7 +3140,7 @@ class PyesisApp:
         if confirm:
             summary = re.sub(r"\s+", " ", entry.summary.strip())
             excerpt = summary[:140] + ("..." if len(summary) > 140 else "")
-            prompt = f"Delete this entry?\n\n{entry.day_name} | {entry.created_at} | {entry.repo_label}\n\n{excerpt}"
+            prompt = f"Delete this entry?\n\n{entry.day_name} | {entry.created_at} | {self._display_repo_label(entry)}\n\n{excerpt}"
             if not messagebox.askyesno("Delete entry", prompt):
                 return False
 
@@ -3069,7 +3148,7 @@ class PyesisApp:
         self.config.entries.pop(entry_index)
         save_config(self.config)
         self._refresh_editor()
-        self.status_var.set(f"Deleted 1 entry for {entry.repo_label}")
+        self.status_var.set(f"Deleted 1 entry for {self._display_repo_label(entry)}")
         return True
 
     def _delete_tag_from_event(self, event: tk.Event) -> str:
@@ -3282,7 +3361,7 @@ class PyesisApp:
             return None
 
     def _resolve_summary_from_ledger(self, repo: RepoConfig, diff_text: str) -> tuple[str, bool, str, str, dict[str, str | int]]:
-        existing = find_item(repo.label, diff_text, self._buffer_day)
+        existing = self._find_ledger_item(repo, diff_text)
         if existing is not None and existing["shown"]:
             return "", True, "Backup", HEURISTIC_MODE, {}
 
@@ -3467,7 +3546,7 @@ class PyesisApp:
         if not attempted_at and requested_summary_source and requested_summary_source != HEURISTIC_MODE:
             attempted_at = created_at.isoformat(timespec="seconds")
         return EntryRecord(
-            repo_label=repo.label,
+            repo_label=repo.identity_name,
             repo_path=repo.path,
             created_at=created_at.isoformat(timespec="seconds"),
             day_name=created_at.strftime("%A"),
@@ -3697,17 +3776,17 @@ class PyesisApp:
     ) -> bool:
         if self._is_possible_duplicate_diff(new_entry):
             self._set_possible_duplicate_status(f"[POSSIBLE DUPLICATE] {repo.label}: duplicate git diff detected for {file_path}")
-            mark_as_shown(repo.label, file_diff_text, self._buffer_day)
+            self._mark_ledger_shown(repo, file_diff_text)
             return True
 
         if self._is_possible_carryover_duplicate(new_entry):
             self._set_possible_duplicate_status(f"[POSSIBLE DUPLICATE] {repo.label}: carry-over git diff from previous day for {file_path}")
-            mark_as_shown(repo.label, file_diff_text, self._buffer_day)
+            self._mark_ledger_shown(repo, file_diff_text)
             return True
 
         if any(self._is_duplicate_entry(entry, new_entry) for entry in self.config.entries):
             self._set_possible_duplicate_status(f"[POSSIBLE DUPLICATE] {repo.label}: duplicate git diff detected for {file_path}")
-            mark_as_shown(repo.label, file_diff_text, self._buffer_day)
+            self._mark_ledger_shown(repo, file_diff_text)
             return True
 
         return False
@@ -3730,7 +3809,7 @@ class PyesisApp:
                 continue
 
             ledger_item = remember_diff(
-                repo.label,
+                repo.identity_name,
                 repo.path,
                 file_diff_text,
                 summary_text,
@@ -3763,14 +3842,14 @@ class PyesisApp:
                 str(ledger_item.get("lastAiAttemptAt", "")).strip(),
             )
             if self._has_deleted_entry_key(self._entry_deleted_key(new_entry)):
-                mark_as_shown(repo.label, file_diff_text, self._buffer_day)
+                self._mark_ledger_shown(repo, file_diff_text)
                 continue
             if self._should_skip_captured_entry(repo, file_path, file_diff_text, new_entry):
                 continue
 
             self._merge_or_append_captured_entry(new_entry)
             save_config(self.config)
-            mark_as_shown(repo.label, file_diff_text, self._buffer_day)
+            self._mark_ledger_shown(repo, file_diff_text)
             captured = True
 
         return captured

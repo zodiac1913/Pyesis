@@ -217,6 +217,14 @@ class RepoConfig:
     path: str
     label: str
     poll_seconds: int = 120
+    repo_name: str = ""
+
+    @property
+    def identity_name(self) -> str:
+        name = self.repo_name.strip()
+        if name:
+            return name
+        return self.label.strip() or Path(self.path).name
 
 
 @dataclass
@@ -656,10 +664,13 @@ def _fingerprint_overlap(current: list[str], previous: list[str]) -> bool:
 
 
 def _decode_repo(item: dict[str, Any]) -> RepoConfig:
+    path = item["path"]
+    label = item.get("label") or Path(path).name
     return RepoConfig(
-        path=item["path"],
-        label=item.get("label") or Path(item["path"]).name,
+        path=path,
+        label=label,
         poll_seconds=int(item.get("poll_seconds", 120)),
+        repo_name=str(item.get("repo_name", "")).strip(),
     )
 
 

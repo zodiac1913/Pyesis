@@ -15,7 +15,7 @@ from pyesis.config import (
 )
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 LEGACY_JSON_NAME = "pyesis_state.json"
 SKIP_SETTING_FIELDS = {"repos", "entries", "deleted_entries"}
 ENTRY_COLUMNS = tuple(field.name for field in fields(EntryRecord))
@@ -46,7 +46,8 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
             position INTEGER PRIMARY KEY,
             path TEXT NOT NULL,
             label TEXT NOT NULL,
-            poll_seconds INTEGER NOT NULL
+            poll_seconds INTEGER NOT NULL,
+            repo_name TEXT NOT NULL DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS entries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -105,10 +106,17 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_ai_attempts_recorded_at ON ai_attempts(recorded_at);
         """
     )
+    _ensure_column(connection, "repos", "repo_name", "TEXT NOT NULL DEFAULT ''")
     connection.execute(
         "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)",
         (str(SCHEMA_VERSION),),
     )
+
+
+def _ensure_column(connection: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    existing = {str(row["name"]) for row in connection.execute(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def normalized_db_path(db_path: Path) -> Path:
@@ -256,8 +264,13 @@ def read_payload(db_path: Path, *, include_entries: bool) -> dict[str, Any] | No
         payload: dict[str, Any] = {
             **settings,
             "repos": [
-                {"path": row["path"], "label": row["label"], "poll_seconds": int(row["poll_seconds"])}
-                for row in connection.execute("SELECT path, label, poll_seconds FROM repos ORDER BY position")
+                {
+                    "path": row["path"],
+                    "label": row["label"],
+                    "poll_seconds": int(row["poll_seconds"]),
+                    "repo_name": str(row["repo_name"] if "repo_name" in row.keys() else ""),
+                }
+                for row in connection.execute("SELECT path, label, poll_seconds, repo_name FROM repos ORDER BY position")
             ],
             "deleted_entries": [
                 {"key": row["key"], "deleted_at": row["deleted_at"]}
@@ -294,8 +307,11 @@ def write_config(config: AppConfig, db_path: Path) -> None:
             [(key, json.dumps(getattr(config, key))) for key in SETTING_COLUMNS],
         )
         connection.executemany(
-            "INSERT INTO repos(position, path, label, poll_seconds) VALUES (?, ?, ?, ?)",
-            [(index, repo.path, repo.label, int(repo.poll_seconds)) for index, repo in enumerate(config.repos)],
+            "INSERT INTO repos(position, path, label, poll_seconds, repo_name) VALUES (?, ?, ?, ?, ?)",
+            [
+                (index, repo.path, repo.label, int(repo.poll_seconds), repo.identity_name)
+                for index, repo in enumerate(config.repos)
+            ],
         )
         if config.entries or existing_count == 0:
             incoming_keys = {(entry.repo_path, entry.diff_hash) for entry in config.entries}

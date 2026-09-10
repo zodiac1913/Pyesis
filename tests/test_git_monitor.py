@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from unittest.mock import patch
 import unittest
 
-from pyesis.git_monitor import _is_excluded_path, is_noise_work_text, split_diff_by_file
+from pyesis.git_monitor import _is_excluded_path, github_repo_name, is_noise_work_text, parse_remote_repo_name, split_diff_by_file
 
 
 class GitMonitorExcludeTests(unittest.TestCase):
@@ -33,6 +34,26 @@ class GitMonitorExcludeTests(unittest.TestCase):
         )
         chunks = split_diff_by_file(diff_text)
         self.assertEqual([path for path, _text in chunks], ["generated/catsUpDate.json"])
+
+
+class GitRemoteNameTests(unittest.TestCase):
+    def test_parse_github_and_ssh_urls(self) -> None:
+        self.assertEqual(
+            parse_remote_repo_name("https://github.com/CMS-Enterprise/cms-dotnet-cats-source.git"),
+            "cms-dotnet-cats-source",
+        )
+        self.assertEqual(parse_remote_repo_name("git@github.com:cms-enterprise/Pyesis.git"), "Pyesis")
+        self.assertEqual(parse_remote_repo_name("ssh://git@github.com/foo/RustyPythia.git"), "RustyPythia")
+
+    def test_github_repo_name_uses_origin_not_folder_or_label(self) -> None:
+        listing = "\n".join(
+            [
+                "origin  https://github.com/CMS-Enterprise/cms-dotnet-cats-source.git (fetch)",
+                "origin  https://github.com/CMS-Enterprise/cms-dotnet-cats-source.git (push)",
+            ]
+        )
+        with patch("pyesis.git_monitor._run_git", return_value=listing):
+            self.assertEqual(github_repo_name("/tmp/local-nickname", fallback="Cats"), "cms-dotnet-cats-source")
 
 
 if __name__ == "__main__":

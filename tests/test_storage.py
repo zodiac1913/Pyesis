@@ -86,16 +86,24 @@ class StorageMigrationTests(unittest.TestCase):
             db_path = Path(temp_dir) / "pyesis.db"
             saved = AppConfig(
                 repos=[
-                    RepoConfig(path="/tmp/ipsum", label="CatsDbGetSomeIpsum", poll_seconds=90),
-                    RepoConfig(path="/tmp/cats", label="Cats", poll_seconds=120),
+                    RepoConfig(path="/tmp/ipsum", label="GetSomeIpsum", poll_seconds=90, repo_name="CatsDbGetSomeIpsum"),
+                    RepoConfig(path="/tmp/cats", label="Cats", poll_seconds=120, repo_name="cms-dotnet-cats-source"),
                 ]
             )
             save_config(saved, state_path=db_path)
             loaded = load_config(state_path=db_path)
-            self.assertEqual([(repo.label, repo.path, repo.poll_seconds) for repo in loaded.repos], [
-                ("CatsDbGetSomeIpsum", "/tmp/ipsum", 90),
-                ("Cats", "/tmp/cats", 120),
-            ])
+            self.assertEqual(
+                [(repo.label, repo.path, repo.poll_seconds, repo.repo_name) for repo in loaded.repos],
+                [
+                    ("GetSomeIpsum", "/tmp/ipsum", 90, "CatsDbGetSomeIpsum"),
+                    ("Cats", "/tmp/cats", 120, "cms-dotnet-cats-source"),
+                ],
+            )
+
+    def test_repo_identity_name_prefers_github_name(self) -> None:
+        repo = RepoConfig(path="/tmp/cats", label="Cats", repo_name="cms-dotnet-cats-source")
+        self.assertEqual(repo.identity_name, "cms-dotnet-cats-source")
+        self.assertEqual(RepoConfig(path="/tmp/cats", label="Cats").identity_name, "Cats")
 
     def test_buffer_rows_skip_sqlite_copy_diffs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
