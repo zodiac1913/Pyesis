@@ -11,7 +11,7 @@ Desktop tool for monitoring `git diff` activity across multiple repositories and
 ## Features
 
 - Add and remove repositories to monitor.
-- Periodically check for changed `git diff` output.
+- Periodically check for changed `git diff` output, skipping nested `cms-sqlLite-cats-source` copies so they are not treated as weekly work.
 - Generate first-person summaries through a pluggable AI hook.
 - Choose AI provider and model per machine in Settings (for example, lighter or heavier Ollama models based on local hardware).
 - Group entries by day with `@DayName` markers and then by repository name (alphabetical).
@@ -72,9 +72,109 @@ export PYESIS_AI_API_KEY="your-api-key"
 
 On Windows PowerShell, use `$env:PYESIS_AI_MODE = "openai-compatible"` style assignments.
 
+## Data storage
+
+Pyesis no longer uses JSON files as the live store. Runtime state is a SQLite database at `~/PyesisState/pyesis.db` on every OS.
+
+That database holds:
+
+- Settings (theme, AI mode, export folder, week-end day, and related options)
+- Monitored repositories (path, label, poll interval)
+- Work-log entries and deleted-entry keys
+- Daily diff buffers that used to live under `diff_buffers/`
+- AI attempt audit records that used to live in `logs/ai_attempts.jsonl`
+
+Closed weeks are still archived as files: `~/PyesisState/week_archives/PyesisWeek_YYYY-MM-DD.7z`. Those archives are long-term copies and are not rewritten after they are created. Live entries in the database are kept for 12 months.
+
+On first launch with this storage, leftover `pyesis_state.json`, `diff_buffers/*.json`, and `logs/ai_attempts.jsonl` under `~/PyesisState/` are imported into `pyesis.db` and renamed with a `.migrated` suffix. Nested `cms-sqlLite-cats-source` copies are skipped so they do not inflate the week log.
+
+A `pyesis_state.json` sitting in this git repo is not the live store. The running app reads and writes `~/PyesisState/pyesis.db`.
+
+Schema (`settings.value` is a JSON-encoded scalar per key; `meta` currently stores `schema_version`):
+
+```sql
+CREATE TABLE meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE repos (
+    position INTEGER PRIMARY KEY,
+    path TEXT NOT NULL,
+    label TEXT NOT NULL,
+    poll_seconds INTEGER NOT NULL,
+    repo_name TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE entries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo_label TEXT NOT NULL,
+    repo_path TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    day_name TEXT NOT NULL,
+    week_start_iso TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    diff_hash TEXT NOT NULL,
+    diff_excerpt TEXT NOT NULL,
+    summary_source TEXT NOT NULL DEFAULT '',
+    author TEXT NOT NULL DEFAULT 'Backup',
+    rewritten_by TEXT NOT NULL DEFAULT '',
+    rewritten_at TEXT NOT NULL DEFAULT '',
+    requested_summary_source TEXT NOT NULL DEFAULT '',
+    summary_warning TEXT NOT NULL DEFAULT '',
+    fallback_summary_source TEXT NOT NULL DEFAULT '',
+    summary_timing_ms INTEGER NOT NULL DEFAULT 0,
+    summary_provider_details TEXT NOT NULL DEFAULT '',
+    last_ai_attempt_at TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE deleted_entries (
+    key TEXT PRIMARY KEY,
+    deleted_at TEXT NOT NULL
+);
+
+CREATE TABLE diff_buffer (
+    day_key TEXT NOT NULL,
+    datetime TEXT NOT NULL,
+    repo TEXT NOT NULL,
+    git_diff_text TEXT NOT NULL,
+    git_diff_description TEXT NOT NULL,
+    shown INTEGER NOT NULL DEFAULT 0,
+    diff_hash TEXT NOT NULL,
+    repo_path TEXT NOT NULL DEFAULT '',
+    author TEXT NOT NULL DEFAULT 'Backup',
+    summary_source TEXT NOT NULL DEFAULT '',
+    rewritten_by TEXT NOT NULL DEFAULT '',
+    rewritten_at TEXT NOT NULL DEFAULT '',
+    requested_summary_source TEXT NOT NULL DEFAULT '',
+    summary_warning TEXT NOT NULL DEFAULT '',
+    fallback_summary_source TEXT NOT NULL DEFAULT '',
+    summary_timing_ms INTEGER NOT NULL DEFAULT 0,
+    summary_provider_details TEXT NOT NULL DEFAULT '',
+    last_ai_attempt_at TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (day_key, repo, diff_hash)
+);
+
+CREATE TABLE ai_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    recorded_at TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+
+CREATE INDEX idx_entries_created_at ON entries(created_at);
+CREATE INDEX idx_entries_repo_hash ON entries(repo_path, diff_hash);
+CREATE INDEX idx_diff_buffer_day ON diff_buffer(day_key);
+CREATE INDEX idx_ai_attempts_recorded_at ON ai_attempts(recorded_at);
+```
+
 ## Notes
 
-- The app stores runtime data in `~/PyesisState/pyesis.db` on every OS, including monitored repos, entries, diff buffers, and AI attempt logs. Legacy `pyesis_state.json` is imported once and renamed.
+- Debug launch (F5) is meant to use `.venv` with `requirements.txt` installed, including `py7zr` for week archives.
 - Each entry stores a larger diff excerpt to improve summary quality for future rewrites.
 - Exported documents are written to the configured DOCX output folder.
 - New installs default DOCX output to a `Pyesis` folder in your home Documents directory when available, and legacy `exports` settings are migrated away from the repo-local folder automatically.
@@ -126,7 +226,7 @@ The macOS app bundle produced by CI is unsigned. It runs locally, but distributi
 
 Build a periodic summary enhancer in Pyesis that:
 
-scans new entries in diff_buffers and pyesis_state
+scans new entries in the Pyesis database (diff buffers and saved work entries)
 rewrites weak gitDiffDescription or summary fields into high-quality rationale
 updates only description fields, never gitDiffText or diff hash
 tags rewritten entries with rewrittenBy and rewrittenAt
