@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026.9.14.1 - 2026-09-14
+
+### Changed
+- macOS uses a custom magenta title bar with rounded top corners and a single set of close, hide, and zoom controls.
+- The native white title bar is hidden so system chrome no longer stacks on top of the custom header.
+
 ## 2026.9.14.0 - 2026-09-14
 
 ### Added
