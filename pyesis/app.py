@@ -2853,6 +2853,13 @@ class PyesisApp:
             titlebar.configure(background=TITLEBAR_BG)
         if title_label is not None:
             title_label.configure(background=TITLEBAR_BG, foreground=TITLEBAR_FG, text=self._window_title())
+        root = getattr(self, "root", None)
+        if root is None or not hasattr(root, "winfo_id"):
+            return
+        try:
+            root.winfo_id()
+        except Exception:
+            return
         try:
             if sys.platform == "win32":
                 self._apply_windows_titlebar_colors()

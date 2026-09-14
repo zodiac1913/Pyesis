@@ -334,6 +334,7 @@ class AppSummaryProtectionTests(unittest.TestCase):
         app._apply_fonts = lambda: None
         app._apply_theme = lambda: None
         app._refresh_repo_list = lambda: repo_refreshes.append("repos")
+        app._save_config_snapshot_async = lambda: None
         app._refresh_editor = lambda: editor_refreshes.append("editor")
         app._set_startup_loading_message = lambda message: startup_messages.append(message)
         app.root.after = lambda delay, callback: scheduled.append((delay, callback))

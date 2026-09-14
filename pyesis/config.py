@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from difflib import SequenceMatcher
 import hashlib
+import os
 from pathlib import Path
 import re
 import shutil
@@ -52,6 +53,9 @@ def default_export_directory() -> str:
 
 
 def default_state_directory() -> Path:
+    override = os.environ.get("PYESIS_STATE_DIR", "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
     return Path.home() / STATE_HOME_DIRNAME
 
 
@@ -166,9 +170,19 @@ def _iter_legacy_log_candidates(root: Path) -> list[tuple[Path, float]]:
     return candidates
 
 
+def _search_root_is_unbounded(root: Path) -> bool:
+    try:
+        resolved = root.resolve()
+        home = Path.home().resolve()
+        fs_root = Path(resolved.anchor).resolve() if resolved.anchor else Path("/").resolve()
+    except OSError:
+        return True
+    return resolved in {home, fs_root}
+
+
 def find_latest_legacy_runtime_root(search_root: Path | None = None, state_directory: Path = STATE_DIRECTORY) -> Path | None:
-    root = (search_root or Path.home()).expanduser()
-    if not root.exists():
+    root = (search_root or Path.cwd()).expanduser()
+    if not root.exists() or (search_root is None and _search_root_is_unbounded(root)):
         return None
 
     latest_root: Path | None = None
@@ -753,13 +767,14 @@ def _should_rewrite_saved_entries(
     )
 
 
-def _load_state_data(state_path: Path = STATE_PATH, *, include_entries: bool = True) -> dict[str, Any] | None:
+def _load_state_data(state_path: Path | None = None, *, include_entries: bool = True) -> dict[str, Any] | None:
     from pyesis.storage import normalized_db_path, read_payload
 
-    if normalized_db_path(state_path) == STATE_PATH:
+    resolved = state_path or STATE_PATH
+    if normalized_db_path(resolved) == STATE_PATH:
         ensure_state_storage()
         migrate_legacy_runtime_data()
-    return read_payload(state_path, include_entries=include_entries)
+    return read_payload(resolved, include_entries=include_entries)
 
 
 def _drop_noise_entries(entries: list[EntryRecord]) -> list[EntryRecord]:
@@ -840,7 +855,7 @@ def _base_config_from_data(data: dict[str, Any], entries: list[EntryRecord], del
     )
 
 
-def load_startup_config_snapshot(state_path: Path = STATE_PATH) -> AppConfig:
+def load_startup_config_snapshot(state_path: Path | None = None) -> AppConfig:
     data = _load_state_data(state_path, include_entries=False)
     if data is None:
         return AppConfig()
@@ -849,7 +864,7 @@ def load_startup_config_snapshot(state_path: Path = STATE_PATH) -> AppConfig:
     return _base_config_from_data(data, [], deleted_entries)
 
 
-def load_config(state_path: Path = STATE_PATH) -> AppConfig:
+def load_config(state_path: Path | None = None) -> AppConfig:
     from pyesis.storage import write_config
 
     data = _load_state_data(state_path, include_entries=True)
@@ -871,13 +886,14 @@ def load_config(state_path: Path = STATE_PATH) -> AppConfig:
         or len(entries) != len(visible_entries)
         or data.get("deleted_entries", []) != [asdict(entry) for entry in deleted_entries]
     ):
-        write_config(config, state_path)
+        write_config(config, state_path or STATE_PATH)
     return config
 
 
-def save_config(config: AppConfig, state_path: Path = STATE_PATH) -> None:
+def save_config(config: AppConfig, state_path: Path | None = None) -> None:
     from pyesis.storage import write_config
 
+    resolved = state_path or STATE_PATH
     config.deleted_entries = _prune_deleted_entries(config.deleted_entries)
     deleted_entry_keys = {entry.key for entry in config.deleted_entries}
     config.entries = _drop_noise_entries(
@@ -885,4 +901,4 @@ def save_config(config: AppConfig, state_path: Path = STATE_PATH) -> None:
             [entry for entry in _prune_entries(config.entries) if deleted_entry_key_for_entry(entry) not in deleted_entry_keys]
         )
     )
-    write_config(config, state_path)
+    write_config(config, resolved)

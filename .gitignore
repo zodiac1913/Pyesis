@@ -186,6 +186,9 @@ cython_debug/
 # Local runtime capture buffers (never commit)
 diff_buffers/
 
+# Isolated unittest state
+tests/.tmp-state/
+
 # Local app state (never commit)
 pyesis_state.json
 pyesis_state.backup_*.json

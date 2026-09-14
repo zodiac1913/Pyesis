@@ -11,11 +11,30 @@ import pyesis.config as config
 
 
 class ConfigStatePathTests(unittest.TestCase):
+    def test_default_legacy_search_skips_home_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fake_home = Path(temp_dir) / "home"
+            fake_home.mkdir()
+            leftover = fake_home / "old-repo"
+            leftover.mkdir()
+            (leftover / "pyesis_state.json").write_text("{}", encoding="utf-8")
+            with patch("pyesis.config.Path.home", return_value=fake_home), patch("pyesis.config.Path.cwd", return_value=fake_home):
+                self.assertIsNone(config.find_latest_legacy_runtime_root())
+
     def test_default_state_directory_uses_fixed_home_folder(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             fake_home = Path(temp_dir)
-            with patch("pyesis.config.Path.home", return_value=fake_home):
-                self.assertEqual(config.default_state_directory(), fake_home / "PyesisState")
+            env = os.environ.copy()
+            env.pop("PYESIS_STATE_DIR", None)
+            with patch.dict(os.environ, env, clear=True):
+                with patch("pyesis.config.Path.home", return_value=fake_home):
+                    self.assertEqual(config.default_state_directory(), fake_home / "PyesisState")
+
+    def test_default_state_directory_honors_pyesis_state_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            override = Path(temp_dir) / "custom-state"
+            with patch.dict(os.environ, {"PYESIS_STATE_DIR": str(override)}):
+                self.assertEqual(config.default_state_directory(), override.resolve())
 
     def test_ollama_thread_count_round_trips_through_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

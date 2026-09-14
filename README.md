@@ -191,6 +191,7 @@ CREATE INDEX idx_ai_attempts_recorded_at ON ai_attempts(recorded_at);
 
 ## Release Automation
 
+- GitHub Actions unit tests run on every push and pull request (`.github/workflows/tests.yml`). Tests use a temporary state directory (`PYESIS_STATE_DIR` / `tests/.tmp-state`), not `~/PyesisState`. Locally: `python -m unittest discover -t . -s tests -q`.
 - GitHub Actions release workflow lives at `.github/workflows/release.yml`.
 - Versioning format can be compact (`YYYY.M.D.x`) or zero-padded (`YYYY.MM.DD.xx`) for example `2026.6.3.0` or `2026.06.03.00`.
 - Release tags must use the same format with a `v` prefix (for example: `v2026.6.3.0` or `v2026.06.03.00`).
