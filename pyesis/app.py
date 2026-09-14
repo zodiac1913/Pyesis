@@ -11,6 +11,7 @@ import shutil
 import tomllib
 import os
 from pathlib import Path
+import platform
 import re
 import subprocess
 import sys
@@ -91,6 +92,15 @@ NEAR_DUP_DIFF_SIMILARITY_THRESHOLD = 0.80
 WINDOWS_APP_ID = "rxjr.pyesis.app"
 TITLEBAR_BG = "#ff00ff"
 TITLEBAR_FG = "#001f5c"
+TITLEBAR_HEIGHT = 40
+MACOS_TRAFFIC_LIGHT_PAD_X = 78
+MACOS_TRAFFIC_LIGHT_SIZE = 12
+MACOS_TRAFFIC_LIGHT_GAP = 8
+MACOS_TRAFFIC_LIGHTS = (
+    ("close", "#ff5f57", "#e0443e"),
+    ("minimize", "#febc2e", "#dea123"),
+    ("zoom", "#28c840", "#1aad2f"),
+)
 PYESIS_GITHUB_URL = "https://github.com/cms-enterprise/Pyesis"
 MOUSEWHEEL_EVENT = "<MouseWheel>"
 VSCODE_OLLAMA_AUTOCODER_MODEL_SETTING = "ollama-autocoder.model"
@@ -795,17 +805,31 @@ class PyesisApp:
         self.root.rowconfigure(0, weight=0)
         self.root.rowconfigure(1, weight=1)
 
-        self._titlebar = tk.Frame(self.root, background=TITLEBAR_BG, height=28)
-        self._titlebar.grid(row=0, column=0, columnspan=2, sticky="ew")
-        self._titlebar.grid_propagate(False)
-        self._title_label = tk.Label(
-            self._titlebar,
-            text=self._window_title(),
-            background=TITLEBAR_BG,
-            foreground=TITLEBAR_FG,
-            anchor="w",
-        )
-        self._title_label.pack(fill="x", padx=12, pady=4)
+        if sys.platform == "darwin":
+            self._titlebar = tk.Canvas(
+                self.root,
+                height=TITLEBAR_HEIGHT,
+                highlightthickness=0,
+                bd=0,
+                background="systemTransparent",
+            )
+            self._titlebar.grid(row=0, column=0, columnspan=2, sticky="ew")
+            self._title_label = None
+            self._titlebar.bind("<Configure>", lambda _event: self._redraw_macos_titlebar())
+            self._bind_titlebar_window_drag()
+        else:
+            self._titlebar = tk.Frame(self.root, background=TITLEBAR_BG, height=TITLEBAR_HEIGHT)
+            self._titlebar.grid(row=0, column=0, columnspan=2, sticky="ew")
+            self._titlebar.grid_propagate(False)
+            self._title_label = tk.Label(
+                self._titlebar,
+                text=self._window_title(),
+                background=TITLEBAR_BG,
+                foreground=TITLEBAR_FG,
+                anchor="w",
+            )
+            self._title_label.pack(fill="x", padx=12, pady=6)
+            self._bind_titlebar_window_drag()
 
         sidebar = ttk.Frame(self.root, padding=12)
         sidebar.grid(row=1, column=0, sticky="nsew")
@@ -2846,27 +2870,148 @@ class PyesisApp:
         value = color.lstrip("#")
         return int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
 
-    def _apply_titlebar_colors(self) -> None:
+    def _bind_titlebar_window_drag(self) -> None:
         titlebar = getattr(self, "_titlebar", None)
         title_label = getattr(self, "_title_label", None)
-        if titlebar is not None:
-            titlebar.configure(background=TITLEBAR_BG)
+        if titlebar is None:
+            return
+
+        def on_press(event: tk.Event) -> None:
+            if isinstance(titlebar, tk.Canvas):
+                item = titlebar.find_closest(event.x, event.y)
+                tags = titlebar.gettags(item[0]) if item else ()
+                if any(tag.startswith("light-") for tag in tags):
+                    return
+            self._titlebar_drag_pointer = (event.x_root, event.y_root)
+            try:
+                self._titlebar_drag_window = (self.root.winfo_x(), self.root.winfo_y())
+            except Exception:
+                self._titlebar_drag_pointer = None
+                self._titlebar_drag_window = None
+
+        def on_drag(event: tk.Event) -> None:
+            pointer = getattr(self, "_titlebar_drag_pointer", None)
+            origin = getattr(self, "_titlebar_drag_window", None)
+            if pointer is None or origin is None:
+                return
+            x = origin[0] + (event.x_root - pointer[0])
+            y = origin[1] + (event.y_root - pointer[1])
+            try:
+                self.root.geometry(f"+{x}+{y}")
+            except Exception:
+                return
+
+        widgets = [titlebar]
         if title_label is not None:
-            title_label.configure(background=TITLEBAR_BG, foreground=TITLEBAR_FG, text=self._window_title())
+            widgets.append(title_label)
+        for widget in widgets:
+            widget.bind("<ButtonPress-1>", on_press)
+            widget.bind("<B1-Motion>", on_drag)
+
+    def _has_real_tk_window(self) -> bool:
         root = getattr(self, "root", None)
         if root is None or not hasattr(root, "winfo_id"):
-            return
+            return False
         try:
             root.winfo_id()
         except Exception:
+            return False
+        return True
+
+    def _apply_titlebar_colors(self) -> None:
+        titlebar = getattr(self, "_titlebar", None)
+        title_label = getattr(self, "_title_label", None)
+        if isinstance(titlebar, tk.Canvas):
+            self._redraw_macos_titlebar()
+        elif titlebar is not None:
+            titlebar.configure(background=TITLEBAR_BG)
+        if title_label is not None:
+            title_label.configure(background=TITLEBAR_BG, foreground=TITLEBAR_FG, text=self._window_title())
+        if not self._has_real_tk_window():
             return
         try:
             if sys.platform == "win32":
                 self._apply_windows_titlebar_colors()
             elif sys.platform == "darwin":
-                self._apply_macos_titlebar_colors()
+                self._apply_macos_hidden_inset_titlebar()
         except Exception:
             return
+
+    def _canvas_round_top_rect(self, canvas: tk.Canvas, width: int, height: int, radius: int, fill: str) -> None:
+        radius = max(0, min(radius, height, width // 2))
+        canvas.create_rectangle(0, radius, width, height, fill=fill, outline=fill, tags="shape")
+        canvas.create_rectangle(radius, 0, width - radius, radius, fill=fill, outline=fill, tags="shape")
+        canvas.create_oval(0, 0, radius * 2, radius * 2, fill=fill, outline=fill, tags="shape")
+        canvas.create_oval(width - radius * 2, 0, width, radius * 2, fill=fill, outline=fill, tags="shape")
+
+    def _redraw_macos_titlebar(self) -> None:
+        canvas = getattr(self, "_titlebar", None)
+        if not isinstance(canvas, tk.Canvas):
+            return
+        try:
+            width = max(canvas.winfo_width(), 1)
+            height = max(canvas.winfo_height(), TITLEBAR_HEIGHT)
+        except tk.TclError:
+            return
+        canvas.delete("all")
+        radius = int(self._macos_expected_corner_radius())
+        self._canvas_round_top_rect(canvas, width, height, radius, TITLEBAR_BG)
+        size = MACOS_TRAFFIC_LIGHT_SIZE
+        y0 = max((height - size) // 2, 2)
+        x = 12
+        for action, fill, hover in MACOS_TRAFFIC_LIGHTS:
+            canvas.create_oval(
+                x,
+                y0,
+                x + size,
+                y0 + size,
+                fill=fill,
+                outline=fill,
+                tags=("light", f"light-{action}"),
+            )
+            canvas.tag_bind(f"light-{action}", "<Enter>", lambda _e, color=hover, name=action: self._tint_traffic_light(name, color))
+            canvas.tag_bind(f"light-{action}", "<Leave>", lambda _e, color=fill, name=action: self._tint_traffic_light(name, color))
+            canvas.tag_bind(f"light-{action}", "<Button-1>", lambda event, name=action: self._on_traffic_light(name, event))
+            x += size + MACOS_TRAFFIC_LIGHT_GAP
+        canvas.create_text(
+            x + 8,
+            height / 2,
+            anchor="w",
+            text=self._window_title(),
+            fill=TITLEBAR_FG,
+            tags="title",
+        )
+
+    def _tint_traffic_light(self, action: str, color: str) -> None:
+        canvas = getattr(self, "_titlebar", None)
+        if not isinstance(canvas, tk.Canvas):
+            return
+        canvas.itemconfigure(f"light-{action}", fill=color, outline=color)
+
+    def _on_traffic_light(self, action: str, event: tk.Event) -> str:
+        if action == "close":
+            self.root.destroy()
+        elif action == "minimize":
+            self.root.iconify()
+        elif action == "zoom":
+            self._toggle_titlebar_zoom()
+        return "break"
+
+    def _toggle_titlebar_zoom(self) -> None:
+        if getattr(self, "_titlebar_zoomed", False):
+            geometry = getattr(self, "_titlebar_restore_geometry", "")
+            if geometry:
+                self.root.geometry(geometry)
+            self._titlebar_zoomed = False
+            return
+        try:
+            self._titlebar_restore_geometry = self.root.geometry()
+            screen_w = self.root.winfo_screenwidth()
+            screen_h = self.root.winfo_screenheight()
+        except Exception:
+            return
+        self.root.geometry(f"{screen_w}x{max(screen_h - 40, 400)}+0+25")
+        self._titlebar_zoomed = True
 
     def _apply_windows_titlebar_colors(self) -> None:
         get_parent = getattr(ctypes.windll.user32, "GetParent", None)
@@ -2887,58 +3032,114 @@ class PyesisApp:
         return red | (green << 8) | (blue << 16)
 
     def _apply_macos_titlebar_colors(self) -> None:
+        self._apply_macos_hidden_inset_titlebar()
+
+    def _macos_expected_corner_radius(self) -> float:
+        version = platform.mac_ver()[0]
+        try:
+            major = int(version.split(".")[0])
+        except (TypeError, ValueError):
+            major = 0
+        if major >= 26:
+            return 26.0
+        if major >= 11:
+            return 10.0
+        return 5.0
+
+    def _macos_objc_msg_send(self):
         objc = ctypes.cdll.LoadLibrary("/usr/lib/libobjc.A.dylib")
         objc.objc_getClass.restype = ctypes.c_void_p
+        objc.objc_getClass.argtypes = [ctypes.c_char_p]
         objc.sel_registerName.restype = ctypes.c_void_p
-        objc.objc_msgSend.restype = ctypes.c_void_p
-        objc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        objc.sel_registerName.argtypes = [ctypes.c_char_p]
+        send_ptr = ctypes.cast(objc.objc_msgSend, ctypes.c_void_p).value
+        return objc, send_ptr
 
-        def sel(name: str) -> ctypes.c_void_p:
-            return ctypes.c_void_p(objc.sel_registerName(name.encode("utf-8")))
+    def _macos_sel(self, objc, name: str):
+        encoded = name.encode("utf-8")
+        return objc.sel_registerName(encoded)
 
-        def cls(name: str) -> ctypes.c_void_p:
-            return ctypes.c_void_p(objc.objc_getClass(name.encode("utf-8")))
+    def _macos_cls(self, objc, name: str):
+        encoded = name.encode("utf-8")
+        return objc.objc_getClass(encoded)
 
-        send = objc.objc_msgSend
-        send_bool = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_bool)(send)
-        send_id = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)(send)
-        send_color = ctypes.CFUNCTYPE(
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_double,
-            ctypes.c_double,
-            ctypes.c_double,
-            ctypes.c_double,
-        )(send)
+    def _macos_hide_native_titlebar(self) -> bool:
+        objc, send_ptr = self._macos_objc_msg_send()
+        send = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)(send_ptr)
+        send_bool = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_bool)(send_ptr)
+        send_id = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)(send_ptr)
+        send_long = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long)(send_ptr)
+        send_button = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long)(send_ptr)
+        send_mask_get = ctypes.CFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p, ctypes.c_void_p)(send_ptr)
+        send_mask_set = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong)(send_ptr)
+        send_alpha = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_double)(send_ptr)
 
-        ns_app = send(cls("NSApplication"), sel("sharedApplication"))
+        ns_app = send(self._macos_cls(objc, "NSApplication"), self._macos_sel(objc, "sharedApplication"))
         if not ns_app:
-            return
-        windows = send(ctypes.c_void_p(ns_app), sel("windows"))
-        if not windows:
-            return
-        count = ctypes.CFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p, ctypes.c_void_p)(send)(
-            ctypes.c_void_p(windows), sel("count")
-        )
-        red, green, blue = self._hex_to_rgb(TITLEBAR_BG)
-        color = send_color(
-            cls("NSColor"),
-            sel("colorWithCalibratedRed:green:blue:alpha:"),
-            red / 255.0,
-            green / 255.0,
-            blue / 255.0,
-            1.0,
-        )
-        if not color:
-            return
-        object_at = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong)(send)
-        for index in range(int(count)):
-            window = object_at(ctypes.c_void_p(windows), sel("objectAtIndex:"), index)
-            if not window:
+            return False
+        window = send(ns_app, self._macos_sel(objc, "keyWindow")) or send(ns_app, self._macos_sel(objc, "mainWindow"))
+        if not window:
+            return False
+
+        titled_mask = 1
+        mask = send_mask_get(window, self._macos_sel(objc, "styleMask"))
+        send_mask_set(window, self._macos_sel(objc, "setStyleMask:"), (mask | 8 | 4 | 2) & ~titled_mask)
+        send_bool(window, self._macos_sel(objc, "setTitlebarAppearsTransparent:"), True)
+        send_long(window, self._macos_sel(objc, "setTitleVisibility:"), 1)
+        send_id(window, self._macos_sel(objc, "setToolbar:"), ctypes.c_void_p(0))
+        send_bool(window, self._macos_sel(objc, "setOpaque:"), False)
+        clear = send(self._macos_cls(objc, "NSColor"), self._macos_sel(objc, "clearColor"))
+        if clear:
+            send_id(window, self._macos_sel(objc, "setBackgroundColor:"), clear)
+        send_bool(window, self._macos_sel(objc, "setHasShadow:"), True)
+
+        container = 0
+        for button_id in (0, 1, 2):
+            button = send_button(window, self._macos_sel(objc, "standardWindowButton:"), button_id)
+            if not button:
                 continue
-            send_bool(ctypes.c_void_p(window), sel("setTitlebarAppearsTransparent:"), True)
-            send_id(ctypes.c_void_p(window), sel("setBackgroundColor:"), ctypes.c_void_p(color))
+            send_bool(button, self._macos_sel(objc, "setHidden:"), True)
+            send_alpha(button, self._macos_sel(objc, "setAlphaValue:"), 0.0)
+            if not container:
+                container = send(button, self._macos_sel(objc, "superview"))
+        view = container
+        for _ in range(3):
+            if not view:
+                break
+            send_bool(view, self._macos_sel(objc, "setHidden:"), True)
+            send_alpha(view, self._macos_sel(objc, "setAlphaValue:"), 0.0)
+            view = send(view, self._macos_sel(objc, "superview"))
+        return True
+
+    def _apply_macos_hidden_inset_titlebar(self) -> None:
+        try:
+            self.root.wm_attributes("-transparent", True)
+        except tk.TclError:
+            pass
+        try:
+            self.root.configure(bg="systemTransparent")
+        except tk.TclError:
+            pass
+        for style, attributes in (
+            ("plain", "noTitleBar"),
+            ("document", "noTitleBar"),
+            ("help", "noTitleBar"),
+        ):
+            try:
+                self.root.tk.call(
+                    "::tk::unsupported::MacWindowStyle",
+                    "style",
+                    self.root._w,
+                    style,
+                    attributes,
+                )
+                break
+            except Exception:
+                continue
+        try:
+            self._macos_hide_native_titlebar()
+        except Exception:
+            return
 
     def _alert_palette(self, base_palette: dict[str, str]) -> dict[str, str]:
         palette = dict(base_palette)

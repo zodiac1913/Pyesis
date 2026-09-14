@@ -8,7 +8,7 @@ from unittest.mock import patch
 import threading
 
 from pyesis.ai_summary import AISummaryResult, AIWeeklyReportResult, GITHUB_GPT_MODE, HEURISTIC_MODE, OLLAMA_MODE
-from pyesis.app import TITLEBAR_BG, TITLEBAR_FG, PyesisApp
+from pyesis.app import MACOS_TRAFFIC_LIGHTS, TITLEBAR_BG, TITLEBAR_FG, PyesisApp
 from pyesis.config import AppConfig, DeletedEntryRecord, EntryRecord, RepoConfig, deleted_entry_key_for_entry
 
 
@@ -931,6 +931,7 @@ class AppSummaryProtectionTests(unittest.TestCase):
         app._title_label = DummyTitleLabel()
         app._apply_windows_titlebar_colors = lambda: None
         app._apply_macos_titlebar_colors = lambda: None
+        app._apply_macos_hidden_inset_titlebar = lambda: None
         app._refresh_window_title()
 
         self.assertEqual(TITLEBAR_BG, "#ff00ff")
@@ -939,6 +940,14 @@ class AppSummaryProtectionTests(unittest.TestCase):
         self.assertEqual(updates[-1]["text"], "Pyesis v2026.9.14.0")
         self.assertEqual(updates[-1]["background"], TITLEBAR_BG)
         self.assertEqual(updates[-1]["foreground"], TITLEBAR_FG)
+        self.assertEqual([item[0] for item in MACOS_TRAFFIC_LIGHTS], ["close", "minimize", "zoom"])
+
+    def test_macos_expected_corner_radius_matches_tahoe_windows(self) -> None:
+        app = self._make_app()
+        with patch("pyesis.app.platform.mac_ver", return_value=("26.6.2", ("", "", ""), "")):
+            self.assertEqual(app._macos_expected_corner_radius(), 26.0)
+        with patch("pyesis.app.platform.mac_ver", return_value=("15.6.0", ("", "", ""), "")):
+            self.assertEqual(app._macos_expected_corner_radius(), 10.0)
 
     def test_queue_startup_poll_schedules_immediate_poll_when_repos_exist(self) -> None:
         app = self._make_app()
