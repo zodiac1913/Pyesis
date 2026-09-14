@@ -24,7 +24,7 @@ LEGACY_BUFFER_DIR = Path("diff_buffers")
 LEGACY_LOG_DIR = Path("logs")
 NEAR_DUP_DIFF_SIMILARITY_THRESHOLD = 0.80
 OLLAMA_DEFAULT_URL = "http://localhost:11434/api/chat"
-OLLAMA_DEFAULT_TIMEOUT_SECONDS = 0
+OLLAMA_DEFAULT_TIMEOUT_SECONDS = 180
 OLLAMA_DEFAULT_NUM_THREADS = 2
 MIRROR_ROOT_PREFIXES = ("demo/", "extension/", "src/runtime/")
 SUPPORTED_AI_MODES = {"heuristic", "ollama", "openai-compatible", "github-gpt"}
@@ -785,6 +785,14 @@ def _config_export_directory(data: dict[str, Any]) -> str:
     return raw_export_directory
 
 
+def _config_ollama_timeout_seconds(data: dict[str, Any]) -> int:
+    try:
+        raw = int(data.get("ai_ollama_timeout_seconds", OLLAMA_DEFAULT_TIMEOUT_SECONDS) or 0)
+    except (TypeError, ValueError):
+        return OLLAMA_DEFAULT_TIMEOUT_SECONDS
+    return raw if raw > 0 else OLLAMA_DEFAULT_TIMEOUT_SECONDS
+
+
 def _config_theme_mode(data: dict[str, Any]) -> str:
     theme_mode = str(data.get("theme_mode", "system")).lower()
     if theme_mode not in {"system", "light", "dark"}:
@@ -808,7 +816,7 @@ def _base_config_from_data(data: dict[str, Any], entries: list[EntryRecord], del
         ai_ollama_url=str(data.get("ai_ollama_url", OLLAMA_DEFAULT_URL)).strip() or OLLAMA_DEFAULT_URL,
         ai_ollama_model=str(data.get("ai_ollama_model", "")).strip(),
         ai_ollama_keep_alive=str(data.get("ai_ollama_keep_alive", "30m")).strip() or "30m",
-        ai_ollama_timeout_seconds=max(0, int(data.get("ai_ollama_timeout_seconds", OLLAMA_DEFAULT_TIMEOUT_SECONDS) or OLLAMA_DEFAULT_TIMEOUT_SECONDS)),
+        ai_ollama_timeout_seconds=_config_ollama_timeout_seconds(data),
         ai_ollama_num_threads=max(1, int(data.get("ai_ollama_num_threads", OLLAMA_DEFAULT_NUM_THREADS) or OLLAMA_DEFAULT_NUM_THREADS)),
         ai_openai_url=str(data.get("ai_openai_url", "")).strip(),
         ai_openai_model=str(data.get("ai_openai_model", "")).strip(),

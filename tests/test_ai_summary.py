@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import unittest
 from unittest.mock import patch
+from urllib import error
 
 from pyesis.ai_summary import (
     AIWeeklyReportResult,
@@ -635,7 +636,7 @@ class AISummaryTests(unittest.TestCase):
         self.assertEqual(result.source, "ollama")
         self.assertEqual(mock_urlopen.call_args.kwargs["timeout"], 240)
 
-    def test_build_summary_allows_ollama_to_wait_indefinitely(self) -> None:
+    def test_build_summary_treats_zero_ollama_timeout_as_three_minutes(self) -> None:
         diff_text = (
             "diff --git a/pyesis/diff_buffer.py b/pyesis/diff_buffer.py\n"
             "+++ b/pyesis/diff_buffer.py\n"
@@ -683,7 +684,66 @@ class AISummaryTests(unittest.TestCase):
                 result = build_summary("Pyesis", diff_text, repo_path="/tmp/repo", mode="ollama")
 
         self.assertEqual(result.source, "ollama")
-        self.assertIsNone(mock_urlopen.call_args.kwargs["timeout"])
+        self.assertEqual(mock_urlopen.call_args.kwargs["timeout"], 180)
+
+    def test_ollama_timeout_retries_once_then_succeeds(self) -> None:
+        diff_text = (
+            "diff --git a/pyesis/diff_buffer.py b/pyesis/diff_buffer.py\n"
+            "+++ b/pyesis/diff_buffer.py\n"
+            "@@ -1,5 +1,6 @@\n"
+            " class DiffLedgerItem(TypedDict):\n"
+            "+    summarySource: str\n"
+            "     rewrittenBy: str\n"
+        )
+        response_payload = {
+            "message": {
+                "content": json.dumps(
+                    {
+                        "who": "I",
+                        "what": "I added summarySource in pyesis/diff_buffer.py",
+                        "where": "pyesis/diff_buffer.py",
+                        "when": "Not available from the diff.",
+                        "why": "track summary source metadata",
+                        "how": "adding the summarySource field",
+                    }
+                )
+            }
+        }
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return json.dumps(response_payload).encode("utf-8")
+
+        calls = {"count": 0}
+
+        def fake_urlopen(req, timeout=None):
+            del req, timeout
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise error.URLError(TimeoutError("timed out"))
+            return FakeResponse()
+
+        with patch("pyesis.ai_summary.request.urlopen", side_effect=fake_urlopen):
+            with patch.dict(
+                "os.environ",
+                {
+                    "PYESIS_OLLAMA_URL": "http://localhost:11434/api/chat",
+                    "PYESIS_OLLAMA_MODEL": "qwen3-coder:30b",
+                    "PYESIS_OLLAMA_KEEP_ALIVE": "5m",
+                    "PYESIS_OLLAMA_TIMEOUT_SECONDS": "180",
+                },
+                clear=False,
+            ):
+                result = build_summary("Pyesis", diff_text, repo_path="/tmp/repo", mode="ollama")
+
+        self.assertEqual(calls["count"], 2)
+        self.assertEqual(result.source, "ollama")
 
     def test_build_summary_requests_json_mode_from_ollama(self) -> None:
         diff_text = (

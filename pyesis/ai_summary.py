@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import socket
 from time import perf_counter
 from urllib import error, request
 
@@ -141,7 +142,8 @@ AI_REPO_CONTEXT_CHAR_LIMIT = 7000
 REPO_CONTEXT_SUFFIXES = (".py", ".cs", ".js", ".ts", ".tsx", ".jsx", ".md", ".toml", ".json", ".yml", ".yaml")
 DEFAULT_OLLAMA_SUMMARY_MODEL = "qwen3-coder:30b"
 DEFAULT_OLLAMA_WEEKLY_REPORT_MODEL = DEFAULT_OLLAMA_SUMMARY_MODEL
-DEFAULT_OLLAMA_TIMEOUT_SECONDS = 0
+DEFAULT_OLLAMA_TIMEOUT_SECONDS = 180
+OLLAMA_TIMEOUT_RETRIES = 1
 DEFAULT_OLLAMA_NUM_THREADS = 2
 JSON_CONTENT_TYPE = "application/json"
 HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
@@ -157,13 +159,41 @@ BAD_WRITING_EXAMPLES = (
 )
 
 
-def _ollama_timeout_seconds() -> int | None:
+def _ollama_timeout_seconds() -> int:
     raw_value = os.getenv("PYESIS_OLLAMA_TIMEOUT_SECONDS", str(DEFAULT_OLLAMA_TIMEOUT_SECONDS)).strip()
     try:
         timeout = int(raw_value or DEFAULT_OLLAMA_TIMEOUT_SECONDS)
     except ValueError:
         timeout = DEFAULT_OLLAMA_TIMEOUT_SECONDS
-    return timeout if timeout > 0 else None
+    return timeout if timeout > 0 else DEFAULT_OLLAMA_TIMEOUT_SECONDS
+
+
+def _is_ollama_timeout_error(exc: BaseException) -> bool:
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return True
+    if isinstance(exc, error.URLError):
+        reason = exc.reason
+        if isinstance(reason, (TimeoutError, socket.timeout)):
+            return True
+    return "timed out" in str(exc).lower()
+
+
+def _ollama_read_json(req: request.Request, timeout: int) -> dict:
+    last_error: BaseException | None = None
+    for attempt in range(1 + OLLAMA_TIMEOUT_RETRIES):
+        try:
+            with request.urlopen(req, timeout=timeout) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            if isinstance(payload, dict):
+                return payload
+            raise RuntimeError("Ollama returned a non-object JSON payload")
+        except Exception as exc:
+            last_error = exc
+            if not _is_ollama_timeout_error(exc) or attempt >= OLLAMA_TIMEOUT_RETRIES:
+                if isinstance(exc, error.URLError):
+                    raise RuntimeError(str(exc)) from exc
+                raise
+    raise RuntimeError(str(last_error) if last_error else "Ollama request timed out")
 
 
 def _ollama_num_threads() -> int:
@@ -348,9 +378,8 @@ def _ollama_request_weekly_report(
     req = request.Request(url, data=body, headers=headers, method="POST")
     started_at = perf_counter()
     try:
-        with request.urlopen(req, timeout=timeout) as response:
-            data = json.loads(response.read().decode("utf-8"))
-    except error.URLError as exc:
+        data = _ollama_read_json(req, timeout if timeout and timeout > 0 else DEFAULT_OLLAMA_TIMEOUT_SECONDS)
+    except Exception as exc:
         elapsed_ms = int(round((perf_counter() - started_at) * 1000))
         raise RuntimeError(f"{exc} ({elapsed_ms} ms)") from exc
 
@@ -2015,9 +2044,8 @@ def _ollama_request_structured_summary(
     req = request.Request(url, data=body, headers=headers, method="POST")
     started_at = perf_counter()
     try:
-        with request.urlopen(req, timeout=timeout) as response:
-            data = json.loads(response.read().decode("utf-8"))
-    except error.URLError as exc:
+        data = _ollama_read_json(req, timeout if timeout and timeout > 0 else DEFAULT_OLLAMA_TIMEOUT_SECONDS)
+    except Exception as exc:
         elapsed_ms = int(round((perf_counter() - started_at) * 1000))
         raise RuntimeError(f"{exc} ({elapsed_ms} ms)") from exc
 

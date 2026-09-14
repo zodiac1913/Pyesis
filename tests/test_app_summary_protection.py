@@ -8,7 +8,7 @@ from unittest.mock import patch
 import threading
 
 from pyesis.ai_summary import AISummaryResult, AIWeeklyReportResult, GITHUB_GPT_MODE, HEURISTIC_MODE, OLLAMA_MODE
-from pyesis.app import PyesisApp
+from pyesis.app import TITLEBAR_BG, TITLEBAR_FG, PyesisApp
 from pyesis.config import AppConfig, DeletedEntryRecord, EntryRecord, RepoConfig, deleted_entry_key_for_entry
 
 
@@ -917,6 +917,27 @@ class AppSummaryProtectionTests(unittest.TestCase):
         self.assertFalse(app.config.summary_enhancer_dry_run)
         self.assertEqual(run_calls, [(True, True)])
         self.assertTrue(mock_save.called)
+
+    def test_titlebar_uses_magenta_background_and_navy_text(self) -> None:
+        app = self._make_app()
+        app._app_version = lambda: "2026.9.14.0"
+        updates: list[dict[str, str]] = []
+
+        class DummyTitleLabel:
+            def configure(self, **kwargs) -> None:
+                updates.append(kwargs)
+
+        app._title_label = DummyTitleLabel()
+        app._apply_windows_titlebar_colors = lambda: None
+        app._apply_macos_titlebar_colors = lambda: None
+        app._refresh_window_title()
+
+        self.assertEqual(TITLEBAR_BG, "#ff00ff")
+        self.assertEqual(TITLEBAR_FG, "#001f5c")
+        self.assertEqual(app.root.title_text, "Pyesis v2026.9.14.0")
+        self.assertEqual(updates[-1]["text"], "Pyesis v2026.9.14.0")
+        self.assertEqual(updates[-1]["background"], TITLEBAR_BG)
+        self.assertEqual(updates[-1]["foreground"], TITLEBAR_FG)
 
     def test_queue_startup_poll_schedules_immediate_poll_when_repos_exist(self) -> None:
         app = self._make_app()

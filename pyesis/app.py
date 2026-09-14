@@ -41,6 +41,7 @@ from pyesis.ai_summary import (
 from pyesis.config import (
     AI_ATTEMPT_LOG_PATH,
     ARCHIVE_DIR,
+    STATE_DIRECTORY,
     STATE_PATH,
     AppConfig,
     DeletedEntryRecord,
@@ -57,6 +58,12 @@ from pyesis.config import (
     save_config,
 )
 from pyesis.diff_buffer import BUFFER_DIR, find_item, list_buffer_day_keys, load_buffer_items, mark_as_shown, purge_noise_buffer_items, purge_old_daily_buffers, remember_diff
+from pyesis.instance_lock import (
+    acquire_instance_lock,
+    already_running_message,
+    fatal_error_message,
+    show_startup_dialog,
+)
 from pyesis.document_formatter import export_ai_weekly_report_docx, export_docx, render_plain_text, render_text_chunks, render_weekly_evidence_text
 from pyesis.github_auth import (
     GITHUB_DOTCOM_AUTH_MODE,
@@ -82,6 +89,8 @@ from pyesis.week_archive import archive_completed_weeks
 DIFF_EXCERPT_LIMIT = 12_000
 NEAR_DUP_DIFF_SIMILARITY_THRESHOLD = 0.80
 WINDOWS_APP_ID = "rxjr.pyesis.app"
+TITLEBAR_BG = "#ff00ff"
+TITLEBAR_FG = "#001f5c"
 PYESIS_GITHUB_URL = "https://github.com/cms-enterprise/Pyesis"
 MOUSEWHEEL_EVENT = "<MouseWheel>"
 VSCODE_OLLAMA_AUTOCODER_MODEL_SETTING = "ollama-autocoder.model"
@@ -315,6 +324,8 @@ class PyesisApp:
         self._refresh_repo_list()
         self._set_startup_loading_message("Loading saved data...")
         self.root.after(0, self._begin_startup_load)
+        self.root.after(0, self._apply_titlebar_colors)
+        self.root.bind("<Map>", lambda _event: self._apply_titlebar_colors(), add="+")
 
     def _set_windows_app_id(self) -> None:
         if os.name != "nt":
@@ -391,7 +402,9 @@ class PyesisApp:
             "PYESIS_OLLAMA_URL": self.config.ai_ollama_url,
             "PYESIS_OLLAMA_MODEL": ollama_model,
             "PYESIS_OLLAMA_KEEP_ALIVE": self.config.ai_ollama_keep_alive,
-            "PYESIS_OLLAMA_TIMEOUT_SECONDS": str(max(0, int(self.config.ai_ollama_timeout_seconds))),
+            "PYESIS_OLLAMA_TIMEOUT_SECONDS": str(
+                int(self.config.ai_ollama_timeout_seconds) if int(self.config.ai_ollama_timeout_seconds) > 0 else OLLAMA_DEFAULT_TIMEOUT_SECONDS
+            ),
             "PYESIS_OLLAMA_NUM_THREADS": str(max(1, int(self.config.ai_ollama_num_threads))),
             "PYESIS_AI_URL": self.config.ai_openai_url,
             "PYESIS_AI_MODEL": self.config.ai_openai_model,
@@ -711,7 +724,12 @@ class PyesisApp:
         return base_title
 
     def _refresh_window_title(self) -> None:
-        self.root.title(self._window_title())
+        title = self._window_title()
+        self.root.title(title)
+        title_label = getattr(self, "_title_label", None)
+        if title_label is not None:
+            title_label.configure(text=title)
+        self._apply_titlebar_colors()
 
     def _app_version(self) -> str:
         version_file_names = ("pyproject.toml",)
@@ -774,12 +792,25 @@ class PyesisApp:
 
     def _build_layout(self) -> None:
         self.root.columnconfigure(1, weight=1)
-        self.root.rowconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=0)
+        self.root.rowconfigure(1, weight=1)
+
+        self._titlebar = tk.Frame(self.root, background=TITLEBAR_BG, height=28)
+        self._titlebar.grid(row=0, column=0, columnspan=2, sticky="ew")
+        self._titlebar.grid_propagate(False)
+        self._title_label = tk.Label(
+            self._titlebar,
+            text=self._window_title(),
+            background=TITLEBAR_BG,
+            foreground=TITLEBAR_FG,
+            anchor="w",
+        )
+        self._title_label.pack(fill="x", padx=12, pady=4)
 
         sidebar = ttk.Frame(self.root, padding=12)
-        sidebar.grid(row=0, column=0, sticky="nsew")
+        sidebar.grid(row=1, column=0, sticky="nsew")
         editor_area = ttk.Frame(self.root, padding=(0, 12, 12, 12))
-        editor_area.grid(row=0, column=1, sticky="nsew")
+        editor_area.grid(row=1, column=1, sticky="nsew")
         editor_area.columnconfigure(0, weight=1)
         editor_area.rowconfigure(1, weight=1)
 
@@ -1895,7 +1926,11 @@ class PyesisApp:
             ai_ollama_url=state.ollama_url_var.get().strip(),
             ai_ollama_model=state.ollama_model_var.get().strip(),
             ai_ollama_keep_alive=state.ollama_keep_alive_var.get().strip() or "30m",
-            ai_ollama_timeout_seconds=max(0, int(state.ollama_timeout_var.get() or OLLAMA_DEFAULT_TIMEOUT_SECONDS)),
+            ai_ollama_timeout_seconds=(
+                int(state.ollama_timeout_var.get())
+                if int(state.ollama_timeout_var.get() or 0) > 0
+                else OLLAMA_DEFAULT_TIMEOUT_SECONDS
+            ),
             ai_ollama_num_threads=max(1, int(round(state.ollama_num_threads_var.get()))),
             ai_openai_url=state.openai_url_var.get().strip(),
             ai_openai_model=state.openai_model_var.get().strip(),
@@ -2218,7 +2253,9 @@ class PyesisApp:
         ollama_model_var = tk.StringVar(value=self.config.ai_ollama_model or DEFAULT_OLLAMA_SUMMARY_MODEL)
         ollama_model_status_var = tk.StringVar(value="Refresh to load installed Ollama models.")
         ollama_keep_alive_var = tk.StringVar(value=self.config.ai_ollama_keep_alive)
-        ollama_timeout_var = tk.IntVar(value=max(0, int(self.config.ai_ollama_timeout_seconds)))
+        ollama_timeout_var = tk.IntVar(
+            value=int(self.config.ai_ollama_timeout_seconds) if int(self.config.ai_ollama_timeout_seconds) > 0 else OLLAMA_DEFAULT_TIMEOUT_SECONDS
+        )
         ollama_max_threads = max(2, os.cpu_count() or 2)
         ollama_num_threads_var = tk.DoubleVar(
             value=min(ollama_max_threads, max(1, int(self.config.ai_ollama_num_threads)))
@@ -2345,8 +2382,8 @@ class PyesisApp:
         ttk.Label(frame, textvariable=ollama_model_status_var, wraplength=560, justify="left").grid(row=24, column=0, sticky="w", pady=(0, 6))
         ttk.Label(frame, text="Ollama keep alive").grid(row=25, column=0, sticky="w")
         ttk.Entry(frame, textvariable=ollama_keep_alive_var, width=18).grid(row=26, column=0, sticky="w", pady=(4, 12))
-        ttk.Label(frame, text="Ollama timeout (seconds; 0 waits indefinitely)").grid(row=27, column=0, sticky="w")
-        ttk.Spinbox(frame, from_=0, to=1800, textvariable=ollama_timeout_var, width=8).grid(row=28, column=0, sticky="w", pady=(4, 12))
+        ttk.Label(frame, text="Ollama timeout (seconds; default 180, then retry once)").grid(row=27, column=0, sticky="w")
+        ttk.Spinbox(frame, from_=30, to=1800, textvariable=ollama_timeout_var, width=8).grid(row=28, column=0, sticky="w", pady=(4, 12))
 
         def update_ollama_impact(value: str | float) -> None:
             threads = max(1, min(ollama_max_threads, int(round(float(value)))))
@@ -2803,6 +2840,98 @@ class PyesisApp:
         self.editor.tag_configure(ENTRY_DELETE_TAG, foreground=palette["failed_fg"], underline=True)
         if self._editor_bg_canvas is not None:
             self._editor_bg_canvas.configure(bg=palette["surface"])
+        self._apply_titlebar_colors()
+
+    def _hex_to_rgb(self, color: str) -> tuple[int, int, int]:
+        value = color.lstrip("#")
+        return int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
+
+    def _apply_titlebar_colors(self) -> None:
+        titlebar = getattr(self, "_titlebar", None)
+        title_label = getattr(self, "_title_label", None)
+        if titlebar is not None:
+            titlebar.configure(background=TITLEBAR_BG)
+        if title_label is not None:
+            title_label.configure(background=TITLEBAR_BG, foreground=TITLEBAR_FG, text=self._window_title())
+        try:
+            if sys.platform == "win32":
+                self._apply_windows_titlebar_colors()
+            elif sys.platform == "darwin":
+                self._apply_macos_titlebar_colors()
+        except Exception:
+            return
+
+    def _apply_windows_titlebar_colors(self) -> None:
+        get_parent = getattr(ctypes.windll.user32, "GetParent", None)
+        dwm_set = getattr(ctypes.windll.dwmapi, "DwmSetWindowAttribute", None)
+        winfo_id = getattr(self.root, "winfo_id", None)
+        if get_parent is None or dwm_set is None or winfo_id is None:
+            return
+        hwnd = get_parent(int(winfo_id()))
+        if not hwnd:
+            hwnd = int(winfo_id())
+        caption = ctypes.c_int(self._colorref(TITLEBAR_BG))
+        text = ctypes.c_int(self._colorref(TITLEBAR_FG))
+        dwm_set(hwnd, 35, ctypes.byref(caption), ctypes.sizeof(caption))
+        dwm_set(hwnd, 36, ctypes.byref(text), ctypes.sizeof(text))
+
+    def _colorref(self, color: str) -> int:
+        red, green, blue = self._hex_to_rgb(color)
+        return red | (green << 8) | (blue << 16)
+
+    def _apply_macos_titlebar_colors(self) -> None:
+        objc = ctypes.cdll.LoadLibrary("/usr/lib/libobjc.A.dylib")
+        objc.objc_getClass.restype = ctypes.c_void_p
+        objc.sel_registerName.restype = ctypes.c_void_p
+        objc.objc_msgSend.restype = ctypes.c_void_p
+        objc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+
+        def sel(name: str) -> ctypes.c_void_p:
+            return ctypes.c_void_p(objc.sel_registerName(name.encode("utf-8")))
+
+        def cls(name: str) -> ctypes.c_void_p:
+            return ctypes.c_void_p(objc.objc_getClass(name.encode("utf-8")))
+
+        send = objc.objc_msgSend
+        send_bool = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_bool)(send)
+        send_id = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)(send)
+        send_color = ctypes.CFUNCTYPE(
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_double,
+            ctypes.c_double,
+            ctypes.c_double,
+            ctypes.c_double,
+        )(send)
+
+        ns_app = send(cls("NSApplication"), sel("sharedApplication"))
+        if not ns_app:
+            return
+        windows = send(ctypes.c_void_p(ns_app), sel("windows"))
+        if not windows:
+            return
+        count = ctypes.CFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p, ctypes.c_void_p)(send)(
+            ctypes.c_void_p(windows), sel("count")
+        )
+        red, green, blue = self._hex_to_rgb(TITLEBAR_BG)
+        color = send_color(
+            cls("NSColor"),
+            sel("colorWithCalibratedRed:green:blue:alpha:"),
+            red / 255.0,
+            green / 255.0,
+            blue / 255.0,
+            1.0,
+        )
+        if not color:
+            return
+        object_at = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong)(send)
+        for index in range(int(count)):
+            window = object_at(ctypes.c_void_p(windows), sel("objectAtIndex:"), index)
+            if not window:
+                continue
+            send_bool(ctypes.c_void_p(window), sel("setTitlebarAppearsTransparent:"), True)
+            send_id(ctypes.c_void_p(window), sel("setBackgroundColor:"), ctypes.c_void_p(color))
 
     def _alert_palette(self, base_palette: dict[str, str]) -> dict[str, str]:
         palette = dict(base_palette)
@@ -2891,6 +3020,9 @@ class PyesisApp:
             pass
         if hasattr(self, "editor"):
             self.editor.configure(font=(DEFAULT_EDITOR_FONT_FAMILY, size))
+        title_label = getattr(self, "_title_label", None)
+        if title_label is not None:
+            title_label.configure(font=(DEFAULT_UI_FONT_FAMILY, size, "bold"))
 
     def _editable_entries(self) -> list[tuple[int, EntryRecord]]:
         indexed_entries = list(enumerate(self.config.entries))
@@ -4481,4 +4613,16 @@ def launch() -> None:
 
 
 def main() -> None:
-    launch()
+    lock = None
+    try:
+        lock = acquire_instance_lock(STATE_DIRECTORY)
+        if lock is None:
+            show_startup_dialog("Pyesis is already running", already_running_message())
+            return
+        launch()
+    except Exception as exc:
+        show_startup_dialog("Pyesis failed to start", fatal_error_message(exc))
+        raise SystemExit(1) from exc
+    finally:
+        if lock is not None:
+            lock.release()

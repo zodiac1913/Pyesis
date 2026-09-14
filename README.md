@@ -36,6 +36,15 @@ On Windows PowerShell, activate the environment with `.venv\Scripts\Activate.ps1
 
 The same source tree is intended to run on Windows, macOS, and Linux. Use the platform's normal Python and git installation; there is no platform-specific branch.
 
+## Running as a standalone app
+
+Pyesis is meant to run without an IDE. After the venv install above, `python main.py` is the supported daily launch. A second start is blocked so two copies do not fight over `~/PyesisState/pyesis.db`.
+
+Native zips from `scripts/build_native.py` or GitHub Releases are unsigned on purpose. This project will not pay Apple (or anyone else) for a certificate to give the code away.
+
+- **Windows / Linux:** unzip and run the shipped executable.
+- **macOS:** Gatekeeper will complain because the `.app` is not notarized. That is Apple's tax on distribution, not a Pyesis defect. On the machine that built or downloaded it: control-click `Pyesis.app` and choose Open, or run `xattr -dr com.apple.quarantine dist/Pyesis.app`. Source launch (`python main.py`) does not need that dance.
+
 ## AI configuration
 
 The app works without an external model. By default it uses a local heuristic summarizer that rewrites git changes in first person.
@@ -220,7 +229,7 @@ xattr -dr com.apple.quarantine dist/Pyesis.app
 open dist/Pyesis.app
 ```
 
-The macOS app bundle produced by CI is unsigned. It runs locally, but distribution outside your own machine will require the usual Apple signing and notarization work.
+The macOS app bundle produced by CI is unsigned and will stay that way. We are not buying an Apple Developer ID to ship open source. Use the local Open / `xattr` steps above, or run from source.
 
 # For Extra Smart write ups build an agent to help:
 
