@@ -1,5 +1,23 @@
 # Changelog
 
+## 2026.9.14.0 - 2026-09-14
+
+### Added
+- Live state now lives in SQLite under `~/PyesisState`, with a one-time migrate from JSON/buffers/jsonl.
+- Closed weeks archive as `.7z`; live entries keep a 12-month window.
+- Single-instance lock so a second launch fails instead of sharing the live database.
+- GitHub Actions unit tests on every push and pull request, isolated from live state via `PYESIS_STATE_DIR`.
+
+### Changed
+- Ollama defaults to a 180s timeout with one retry; stored `0` is treated as 180.
+- Title bar uses magenta on navy when the real window supports native coloring.
+- Legacy runtime search stays in the current tree and does not walk `$HOME`.
+
+### Fixed
+- Empty or partial config writes no longer wipe existing entry rows.
+- Startup loads saved entries before the first repo scan.
+- Tests no longer abort on dummy Tk roots or write the live home database.
+
 ## 2026.9.1.0 - 2026-09-01
 
 ### Added
