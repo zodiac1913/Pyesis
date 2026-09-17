@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026.9.17.0 - 2026-09-17
+
+### Changed
+- macOS uses the native curved title bar, painted magenta, with system close, hide, and zoom controls and the window title.
+- Removed the extra Tk header that stacked a second magenta row under the system chrome.
+- Cursor/VS Code F5 launch uses the `debugpy` debugger and the project `.venv`.
+
+### Fixed
+- Button hover and window dragging follow the native title bar instead of a transparent custom overlay.
+
 ## 2026.9.14.1 - 2026-09-14
 
 ### Changed

@@ -3,13 +3,33 @@
     "configurations": [
         {
             "name": "Pyesis",
-            "type": "python",
+            "type": "debugpy",
             "request": "launch",
-            "python": "${workspaceFolder}/.venv/bin/python",
             "program": "${workspaceFolder}/main.py",
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
-            "justMyCode": true
+            "justMyCode": true,
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "windows": {
+                "python": "${workspaceFolder}/.venv/Scripts/python.exe"
+            }
+        },
+        {
+            "name": "Pyesis tests",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "unittest",
+            "args": ["discover", "-t", ".", "-s", "tests", "-q"],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "env": {
+                "PYESIS_STATE_DIR": "${workspaceFolder}/tests/.tmp-state"
+            },
+            "windows": {
+                "python": "${workspaceFolder}/.venv/Scripts/python.exe"
+            }
         }
     ]
 }

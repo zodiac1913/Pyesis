@@ -183,7 +183,7 @@ CREATE INDEX idx_ai_attempts_recorded_at ON ai_attempts(recorded_at);
 
 ## Notes
 
-- Debug launch (F5) is meant to use `.venv` with `requirements.txt` installed, including `py7zr` for week archives.
+- Debug launch (F5) uses `.vscode/launch.json` with the `debugpy` debugger and `.venv` (`python.defaultInterpreterPath`). Install `requirements.txt` in that venv, including `py7zr` for week archives. Quit a running Pyesis window first; the instance lock blocks a second start.
 - Each entry stores a larger diff excerpt to improve summary quality for future rewrites.
 - Exported documents are written to the configured DOCX output folder.
 - New installs default DOCX output to a `Pyesis` folder in your home Documents directory when available, and legacy `exports` settings are migrated away from the repo-local folder automatically.
