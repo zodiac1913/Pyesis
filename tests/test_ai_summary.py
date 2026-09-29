@@ -9,6 +9,7 @@ from pyesis.ai_summary import (
     AIWeeklyReportResult,
     ProviderStructuredSummary,
     _build_ai_user_prompt,
+    _weekly_report_system_prompt,
     _build_weekly_report_user_prompt,
     _coalesce_changes,
     _first_evidence_reference,
@@ -141,6 +142,24 @@ class AISummaryTests(unittest.TestCase):
         self.assertNotIn("refined logic", result.text.lower())
         self.assertIn("Controllers/Configurer/Configs/AppConfig.cs", result.text)
         self.assertIn("Evidence:", result.text)
+
+    def test_heuristic_summary_does_not_call_added_function_return_flow(self) -> None:
+        diff_text = (
+            "diff --git a/wwwroot/tzedek/smlComplianceRunner.js b/wwwroot/tzedek/smlComplianceRunner.js\n"
+            "+++ b/wwwroot/tzedek/smlComplianceRunner.js\n"
+            "@@ -239,0 +239,6 @@\n"
+            "+function getIssueActionLabel(label, title, opensInNewWindow = false) {\n"
+            "+    if (!title) {\n"
+            "+        return label;\n"
+            "+    }\n"
+            "+    return `${label} for ${title}`;\n"
+            "+}\n"
+        )
+
+        result = build_summary("cms-dotnet-cats-source", diff_text, mode="heuristic")
+
+        self.assertNotIn("return flow", result.text.lower())
+        self.assertIn("getIssueActionLabel", result.text)
 
     def test_heuristic_summary_avoids_short_ambiguous_symbol_anchor(self) -> None:
         diff_text = (
@@ -387,9 +406,16 @@ class AISummaryTests(unittest.TestCase):
         self.assertIn("one sentence or at most a short paragraph", prompt)
         self.assertIn("same general order", prompt)
         self.assertIn("Do not repeat evidence field labels like 'Summary:'", prompt)
-        self.assertIn("do not emit markdown markers", prompt)
+        self.assertIn("without markdown heading markers", prompt)
         self.assertIn("Day: Monday", prompt)
         self.assertIn("Repo: Pyesis", prompt)
+
+    def test_weekly_report_system_prompt_includes_tone_guidance(self) -> None:
+        prompt = _weekly_report_system_prompt()
+
+        self.assertIn("Prioritize clarity over cleverness", prompt)
+        self.assertIn("Use active voice", prompt)
+        self.assertIn("positive, insightful, and approachable", prompt)
 
     def test_build_weekly_report_uses_ollama_chat(self) -> None:
         response_payload = {

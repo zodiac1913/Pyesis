@@ -8,9 +8,12 @@ import re
 
 from docx import Document
 from docx.shared import Inches
+from odf.opendocument import OpenDocumentText
+from odf.style import ParagraphProperties, Style, TextProperties
+from odf.text import List, ListItem, P
 
 from pyesis.config import AppConfig, EntryRecord
-from pyesis.git_monitor import summarize_file_changes
+from pyesis.git_monitor import should_skip_work_diff, summarize_file_changes
 
 
 DAY_ORDER = [
@@ -108,6 +111,17 @@ def render_weekly_evidence_text(
     else:
         selected_week_start_iso = week_start_iso
         selected_week_entries = _entries_for_week_start(config.entries, selected_week_start_iso)
+    selected_week_entries = {
+        day_name: [
+            entry
+            for entry in entries
+            if not should_skip_work_diff(entry.repo_label, entry.diff_excerpt)
+        ]
+        for day_name, entries in selected_week_entries.items()
+    }
+    selected_week_entries = {
+        day_name: entries for day_name, entries in selected_week_entries.items() if entries
+    }
 
     week_start = datetime.fromisoformat(selected_week_start_iso)
     week_end = _week_end_date(week_start)
@@ -303,6 +317,117 @@ def export_ai_weekly_report_docx(
         target = output_dir / f"WhatIDidThisWeek{datetime.now().strftime('%Y%m%d')}.docx"
     document.save(target)
     return target
+
+
+def export_ai_weekly_report_odt(
+    report_text: str,
+    output_dir: Path,
+    week_start_iso: str,
+    provider_details: str = "",
+    file_name: str | None = None,
+) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    document = OpenDocumentText()
+    heading_style = Style(name="AIWeeklyHeading", family="paragraph", parentstylename="Heading 1")
+    heading_style.addElement(TextProperties(fontsize="18pt", fontweight="bold"))
+    document.styles.addElement(heading_style)
+    day_style = Style(name="AIWeeklyDay", family="paragraph", parentstylename="Heading 2")
+    day_style.addElement(TextProperties(fontsize="14pt", fontweight="bold"))
+    document.styles.addElement(day_style)
+    repo_style = Style(name="AIWeeklyRepo", family="paragraph", parentstylename="Heading 3")
+    repo_style.addElement(TextProperties(fontsize="12pt", fontweight="bold"))
+    document.styles.addElement(repo_style)
+    body_style = Style(name="AIWeeklyBody", family="paragraph")
+    body_style.addElement(ParagraphProperties(marginbottom="0.08in"))
+    document.styles.addElement(body_style)
+
+    week_start = datetime.fromisoformat(week_start_iso)
+    week_end = _week_end_date(week_start)
+    document.text.addElement(P(text=f"AI Weekly Report ({week_end.strftime('%Y %b %d')})", stylename=heading_style))
+    if provider_details.strip():
+        document.text.addElement(P(text=f"Generated with {provider_details.strip()}", stylename=body_style))
+
+    _write_ai_weekly_report_odt(document, report_text, day_style, repo_style, body_style)
+
+    target = output_dir / (file_name or f"WhatIDidThisWeek{datetime.now().strftime('%Y%m%d')}.odt")
+    document.save(target)
+    return target
+
+
+def _write_ai_weekly_report_odt(
+    document: OpenDocumentText,
+    report_text: str,
+    day_style: Style,
+    repo_style: Style,
+    body_style: Style,
+) -> None:
+    paragraph_parts: list[str] = []
+    current_list: List | None = None
+
+    def flush_paragraph() -> None:
+        nonlocal paragraph_parts
+        if paragraph_parts:
+            document.text.addElement(P(text=" ".join(paragraph_parts).strip(), stylename=body_style))
+            paragraph_parts = []
+
+    def flush_list() -> None:
+        nonlocal current_list
+        if current_list is not None:
+            document.text.addElement(current_list)
+            current_list = None
+
+    for raw_line in report_text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            flush_paragraph()
+            flush_list()
+            continue
+
+        markdown_heading = _weekly_markdown_heading(stripped)
+        if markdown_heading:
+            flush_paragraph()
+            flush_list()
+            _, heading_text = markdown_heading
+            heading_text = _clean_weekly_report_inline_text(heading_text)
+            day_heading = _parse_weekly_report_day_heading(heading_text)
+            repo_heading = _parse_weekly_report_repo_heading(heading_text)
+            if day_heading:
+                document.text.addElement(P(text=day_heading, stylename=day_style))
+            elif repo_heading:
+                document.text.addElement(P(text=repo_heading, stylename=repo_style))
+            else:
+                document.text.addElement(P(text=heading_text, stylename=repo_style))
+            continue
+
+        day_heading = _parse_weekly_report_day_heading(stripped)
+        if day_heading:
+            flush_paragraph()
+            flush_list()
+            document.text.addElement(P(text=day_heading, stylename=day_style))
+            continue
+
+        repo_heading = _parse_weekly_report_repo_heading(stripped)
+        if repo_heading:
+            flush_paragraph()
+            flush_list()
+            document.text.addElement(P(text=repo_heading, stylename=repo_style))
+            continue
+
+        list_item = _weekly_report_list_item(stripped)
+        if list_item:
+            flush_paragraph()
+            if current_list is None:
+                current_list = List()
+            _, body = list_item
+            item = ListItem()
+            item.addElement(P(text=_clean_weekly_report_item_text(body), stylename=body_style))
+            current_list.addElement(item)
+            continue
+
+        paragraph_parts.append(_clean_weekly_report_item_text(_clean_weekly_report_inline_text(stripped)))
+
+    flush_paragraph()
+    flush_list()
 
 
 def _write_ai_weekly_report(document: Document, report_text: str) -> None:

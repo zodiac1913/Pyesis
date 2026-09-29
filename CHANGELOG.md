@@ -38,7 +38,7 @@
 
 ### Added
 - Weekly JSON export and import for moving the current week between machines.
-- AI Weekly DOCX export built from current-week evidence.
+- AI Weekly ODT export built from current-week evidence with dedicated tone guidance.
 - Click-to-delete preview markers with confirmation for cleaning up individual entries.
 
 ### Changed

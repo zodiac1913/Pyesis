@@ -445,7 +445,7 @@ class AppSummaryProtectionTests(unittest.TestCase):
         with patch("pyesis.app.render_weekly_evidence_text", return_value="Day: Monday\nRepo: Pyesis\n- Summary: Added prompt"), patch(
             "pyesis.app.build_weekly_report",
             side_effect=fake_build,
-        ), patch("pyesis.app.export_ai_weekly_report_docx", return_value=Path("/tmp/pyesis-docx/WhatIDidThisWeek20260826.docx")), patch(
+        ), patch("pyesis.app.export_ai_weekly_report_odt", return_value=Path("/tmp/pyesis-docx/WhatIDidThisWeek20260826.odt")), patch(
             "pyesis.app.messagebox.showinfo"
         ), patch("pyesis.app.threading.Thread", ImmediateThread), patch("pyesis.app.datetime") as mock_datetime:
             mock_datetime.now.return_value = now
@@ -513,7 +513,7 @@ class AppSummaryProtectionTests(unittest.TestCase):
                 timing_ms=1234,
                 provider_details="qwen3-coder:30b",
             ),
-        ) as mock_build, patch("pyesis.app.export_ai_weekly_report_docx", return_value=Path("/tmp/pyesis-docx/WhatIDidThisWeek20260826.docx")) as mock_export, patch("pyesis.app.messagebox.showinfo") as mock_info, patch("pyesis.app.threading.Thread", ImmediateThread), patch("pyesis.app.datetime") as mock_datetime:
+        ) as mock_build, patch("pyesis.app.export_ai_weekly_report_odt", return_value=Path("/tmp/pyesis-docx/WhatIDidThisWeek20260826.odt")) as mock_export, patch("pyesis.app.messagebox.showinfo") as mock_info, patch("pyesis.app.threading.Thread", ImmediateThread), patch("pyesis.app.datetime") as mock_datetime:
             mock_datetime.now.return_value = now
             mock_datetime.fromisoformat.side_effect = datetime.fromisoformat
             app._open_ai_weekly_report()
@@ -526,8 +526,8 @@ class AppSummaryProtectionTests(unittest.TestCase):
         self.assertEqual(mock_export.call_args.args[0], "Monday\nPyesis\nDetailed weekly report.")
         self.assertEqual(mock_export.call_args.args[1], Path("/tmp/pyesis-docx"))
         self.assertEqual(mock_export.call_args.args[2], "2026-06-26T00:00:00")
-        self.assertEqual(app.status_var.get(), "AI weekly report exported to WhatIDidThisWeek20260826.docx")
-        self.assertEqual(opened, [Path("/tmp/pyesis-docx/WhatIDidThisWeek20260826.docx")])
+        self.assertEqual(app.status_var.get(), "AI weekly report exported to WhatIDidThisWeek20260826.odt")
+        self.assertEqual(opened, [Path("/tmp/pyesis-docx/WhatIDidThisWeek20260826.odt")])
         self.assertTrue(mock_info.called)
 
     def test_repo_action_button_shows_add_when_path_present_without_selection(self) -> None:

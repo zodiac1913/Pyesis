@@ -55,7 +55,12 @@ AI_PROVIDER_LABELS = {
 }
 NO_INTENT_SENTINEL = "made updates"
 IMPORT_INTENT = "adding imports"
-LOW_SIGNAL_INTENTS = {IMPORT_INTENT, "adding follow-up notes", "cleaning up code layout"}
+LOW_SIGNAL_INTENTS = {
+    IMPORT_INTENT,
+    "adding follow-up notes",
+    "cleaning up code layout",
+    "adjusting return flow",
+}
 LOW_QUALITY_AI_MARKERS = (
     "refined logic",
     "clarify behavior",
@@ -332,9 +337,15 @@ def _weekly_report_system_prompt() -> str:
         "Call out warnings or uncertainty only when the evidence explicitly shows them. "
         "Treat each evidence item as its own sentence or short paragraph unless adjacent items are clearly related enough to combine without losing specificity or order. "
         "Keep the original day order, then repository order, and generally keep the original item order inside each repo section. "
-        "Return plain text with readable sections and paragraphs, not JSON. "
-        "Do not use markdown markers such as #, ##, ###, bullets, code fences, or backticks. "
-        "Use explicit section lines like 'Day: Monday' and 'Repo: ExampleRepo'."
+        "Use a professional, positive, insightful, and approachable voice. "
+        "Prioritize clarity over cleverness. "
+        "Use active voice, concise direct sentences, specific evidence-based wording, and inclusive language such as teams, people, or clients. "
+        "Focus on solutions, progress, and practical insight without exaggeration, sales language, clichés, filler, or unexplained jargon. "
+        "Prefer vocabulary such as partner, empower, streamline, optimize, unlock, and future-ready; avoid disrupt, crush, dominate, hustle, killer, ninja, and guru. "
+        "Use clear subheadings and bullets when they improve readability, but do not use emojis, excessive punctuation, or all caps. "
+        "Return plain text, not JSON, and do not use code fences or backticks. "
+        "Use explicit section lines like 'Day: Monday' and 'Repo: ExampleRepo'. "
+        "Keep statistics or other data attributed to the supplied evidence."
     )
 
 
@@ -346,8 +357,9 @@ def _build_weekly_report_user_prompt(evidence_text: str) -> str:
         "If you combine related items, keep the combination tight and do not absorb unrelated work into it. "
         "Do not collapse a whole repo day into one broad blended paragraph when the evidence contains distinct items. "
         "Do not repeat evidence field labels like 'Summary:' in the report body. "
-        "Prefer complete prose over bullet fragments, and keep the report suitable for a human weekly status write-up. "
-        "Use 'Day:' and 'Repo:' section lines and do not emit markdown markers.\n\n"
+        "Prefer complete prose over fragments, and keep the report suitable for a human weekly status write-up. "
+        "Use concise paragraphs and bullets only where they improve readability. "
+        "Use 'Day:' and 'Repo:' section lines without markdown heading markers.\n\n"
         "Weekly evidence:\n"
         f"{evidence_text.strip()}"
     )
@@ -1900,13 +1912,21 @@ def _intents_for_change(change: FileChangeSummary) -> list[str]:
     ]
 
 
+def _return_statement_lines(text: str) -> set[str]:
+    return {
+        line.strip()
+        for line in text.splitlines()
+        if re.match(r"^return\b", line.strip())
+    }
+
+
 def _intent_rules(added: str, removed: str, combined: str) -> list[tuple[str, bool]]:
     return [
         ("hardening null recovery", (("if (" in added or "if " in added) and "null" in added and "appsec" in combined)),
         ("adding null checks", ("if (" in added or "if " in added) and "null" in added),
         ("adding exception handling", "throw new" in added),
         ("updating logging", any(token in combined for token in ("logger", "log.", "console."))),
-        ("adjusting return flow", "return " in added and "return " in removed),
+        ("adjusting return flow", _return_statement_lines(added) and _return_statement_lines(removed) and _return_statement_lines(added) != _return_statement_lines(removed)),
         ("updating mapping logic", "map(" in combined or "mapper" in combined),
         ("tightening validation", "validate" in combined or "validator" in combined),
         ("cleaning up code layout", any(token in combined for token in ("/// <summary>", "public ", "function ", "class ")) and abs(len(added.splitlines()) - len(removed.splitlines())) <= 6),

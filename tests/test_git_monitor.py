@@ -3,10 +3,47 @@ from __future__ import annotations
 from unittest.mock import patch
 import unittest
 
-from pyesis.git_monitor import _is_excluded_path, github_repo_name, is_noise_work_text, parse_remote_repo_name, split_diff_by_file
+from pyesis.git_monitor import (
+    _is_excluded_path,
+    github_repo_name,
+    is_formatting_only_diff,
+    is_noise_work_text,
+    is_non_substantive_work_diff,
+    parse_remote_repo_name,
+    should_skip_work_diff,
+    split_diff_by_file,
+)
 
 
 class GitMonitorExcludeTests(unittest.TestCase):
+    def test_formatting_only_json_diff_ignores_trailing_comma(self) -> None:
+        diff_text = "\n".join(
+            [
+                "diff --git a/.vscode/settings.json b/.vscode/settings.json",
+                "--- a/.vscode/settings.json",
+                "+++ b/.vscode/settings.json",
+                "@@ -28,1 +28,1 @@",
+                '-    "activityBarTop.activeBorder": "#e7e7e7"',
+                '+    "activityBarTop.activeBorder": "#e7e7e7",',
+            ]
+        )
+
+        self.assertTrue(is_formatting_only_diff(".vscode/settings.json", diff_text))
+
+    def test_json_value_change_is_not_formatting_only(self) -> None:
+        diff_text = "\n".join(
+            [
+                "diff --git a/.vscode/settings.json b/.vscode/settings.json",
+                "--- a/.vscode/settings.json",
+                "+++ b/.vscode/settings.json",
+                "@@ -28,1 +28,1 @@",
+                '-    "workbench.colorTheme": "Light"',
+                '+    "workbench.colorTheme": "Dark",',
+            ]
+        )
+
+        self.assertFalse(is_formatting_only_diff(".vscode/settings.json", diff_text))
+
     def test_excludes_nested_sqlite_copy_paths(self) -> None:
         self.assertTrue(_is_excluded_path("cms-sqlLite-cats-source/Views/Home/Index.cshtml"))
         self.assertTrue(_is_excluded_path("vendor/cms-sqlLite-cats-source/CATS.csproj"))
@@ -14,7 +51,53 @@ class GitMonitorExcludeTests(unittest.TestCase):
 
     def test_noise_text_detects_sqlite_copy_diffs(self) -> None:
         self.assertTrue(is_noise_work_text("I created cms-sqlLite-cats-source/CATS.csproj."))
+        self.assertTrue(is_noise_work_text("wwwroot/tzedek/sync-metadata.json"))
         self.assertFalse(is_noise_work_text("I added SourceFolderLastWriteUtcTicks in generated/catsUpDate.JSON."))
+
+    def test_excludes_sync_metadata_path(self) -> None:
+        self.assertTrue(_is_excluded_path("wwwroot/tzedek/sync-metadata.json"))
+        self.assertFalse(_is_excluded_path("wwwroot/tzedek/smlCompliance.js"))
+
+    def test_timestamp_only_json_is_non_substantive(self) -> None:
+        diff_text = "\n".join(
+            [
+                "diff --git a/wwwroot/tzedek/sync-metadata.json b/wwwroot/tzedek/sync-metadata.json",
+                "--- a/wwwroot/tzedek/sync-metadata.json",
+                "+++ b/wwwroot/tzedek/sync-metadata.json",
+                "@@ -2,1 +2,1 @@",
+                '-  "syncedAtUtc": "2026-08-31T16:53:52.716Z",',
+                '+  "syncedAtUtc": "2026-09-28T16:14:27.245Z",',
+            ]
+        )
+        self.assertTrue(is_non_substantive_work_diff("wwwroot/tzedek/sync-metadata.json", diff_text))
+        self.assertTrue(should_skip_work_diff("wwwroot/tzedek/sync-metadata.json", diff_text))
+
+    def test_version_constant_only_diff_is_non_substantive(self) -> None:
+        diff_text = "\n".join(
+            [
+                "diff --git a/wwwroot/tzedek/smlComplianceRunner.js b/wwwroot/tzedek/smlComplianceRunner.js",
+                "--- a/wwwroot/tzedek/smlComplianceRunner.js",
+                "+++ b/wwwroot/tzedek/smlComplianceRunner.js",
+                "@@ -9,1 +9,1 @@",
+                '-const TZEDEK_VERSION = "2026.08.13.01";',
+                '+const TZEDEK_VERSION = "2026.09.28.01";',
+            ]
+        )
+        self.assertTrue(is_non_substantive_work_diff("wwwroot/tzedek/smlComplianceRunner.js", diff_text))
+
+    def test_behavior_change_is_substantive(self) -> None:
+        diff_text = "\n".join(
+            [
+                "diff --git a/wwwroot/tzedek/smlCompliance.js b/wwwroot/tzedek/smlCompliance.js",
+                "--- a/wwwroot/tzedek/smlCompliance.js",
+                "+++ b/wwwroot/tzedek/smlCompliance.js",
+                "@@ -4151,1 +4151,1 @@",
+                '-fixButton.setAttribute("title", "Developer Fix");',
+                '+fixButton.setAttribute("title", `Developer Fix for ${normalizedTitle}`);',
+            ]
+        )
+        self.assertFalse(is_non_substantive_work_diff("wwwroot/tzedek/smlCompliance.js", diff_text))
+        self.assertFalse(should_skip_work_diff("wwwroot/tzedek/smlCompliance.js", diff_text))
 
     def test_split_diff_by_file_drops_sqlite_copy_chunks(self) -> None:
         diff_text = "\n".join(

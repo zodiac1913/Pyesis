@@ -5,11 +5,12 @@ build-backend = "hatchling.build"
 [project]
 name = "pyesis"
 version = "2026.9.17.0"
-description = "Desktop git diff monitor with weekly Word output"
+description = "Desktop git diff monitor with weekly report output"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "python-docx>=1.1.2",
+  "odfpy>=1.4.1",
   "markdown>=3.7",
   "py7zr>=0.22.0",
 ]

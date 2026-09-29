@@ -65,7 +65,7 @@ from pyesis.instance_lock import (
     fatal_error_message,
     show_startup_dialog,
 )
-from pyesis.document_formatter import export_ai_weekly_report_docx, export_docx, render_plain_text, render_text_chunks, render_weekly_evidence_text
+from pyesis.document_formatter import export_ai_weekly_report_odt, export_docx, render_plain_text, render_text_chunks, render_weekly_evidence_text
 from pyesis.github_auth import (
     GITHUB_DOTCOM_AUTH_MODE,
     GITHUB_ENTERPRISE_AUTH_MODE,
@@ -82,7 +82,7 @@ from pyesis.github_auth import (
     start_github_device_login,
     store_github_auth_token,
 )
-from pyesis.git_monitor import DiffSnapshot, capture_snapshot, github_repo_name, is_noise_work_text, split_diff_by_file, summarize_file_changes, validate_repo
+from pyesis.git_monitor import DiffSnapshot, capture_snapshot, github_repo_name, is_noise_work_text, should_skip_work_diff, split_diff_by_file, summarize_file_changes, validate_repo
 from pyesis.summary_enhancer import run_periodic_enhancer
 from pyesis.week_archive import archive_completed_weeks
 
@@ -4077,7 +4077,8 @@ class PyesisApp:
             summary_text, already_shown, author, summary_source, summary_metadata = self._resolve_summary_from_ledger(repo, file_diff_text)
             if already_shown:
                 continue
-            if is_noise_work_text(file_path) or is_noise_work_text(file_diff_text):
+            if should_skip_work_diff(file_path, file_diff_text):
+                self._mark_ledger_shown(repo, file_diff_text)
                 continue
 
             ledger_item = remember_diff(
@@ -4501,7 +4502,7 @@ class PyesisApp:
     def _build_ai_weekly_report_worker(self, evidence_text: str, week_start_iso: str, output_dir: Path) -> None:
         try:
             result = build_weekly_report(evidence_text, model_override=DEFAULT_OLLAMA_WEEKLY_REPORT_MODEL)
-            target = export_ai_weekly_report_docx(
+            target = export_ai_weekly_report_odt(
                 result.text,
                 output_dir,
                 week_start_iso,

@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+from collections import Counter
 
 from pyesis.config import EntryRecord, RepoConfig
 
@@ -27,12 +28,20 @@ DEFAULT_EXCLUDES = [
     ".venv/**",
     "__pycache__/**",
     "cms-sqlLite-cats-source/**",
+    "sync-metadata.json",
 ]
 NOISE_TEXT_MARKERS = (
     "pyesis_state.json",
     "logs/ai_attempts.jsonl",
     "cms-sqllite-cats-source/",
+    "sync-metadata.json",
 )
+ISO_TIMESTAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?")
+VERSION_STAMP_RE = re.compile(
+    r"(?:version|tzedek_version|app_version)\s*[:=]\s*[\"']?\d",
+    re.IGNORECASE,
+)
+VERSION_VALUE_RE = re.compile(r"\b\d{4}\.\d{1,2}\.\d{1,2}\.\d{1,2}\b")
 DIFF_CONTEXT_LINES = 20
 DIFF_SAMPLE_LIMIT = 12
 HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
@@ -377,6 +386,69 @@ def is_noise_work_text(text: str) -> bool:
 
 def is_noise_entry_record(summary: str, excerpt: str, repo_path: str = "", repo_label: str = "") -> bool:
     return any(is_noise_work_text(part) for part in (summary, excerpt, repo_path, repo_label))
+
+
+def should_skip_work_diff(path: str, diff_text: str) -> bool:
+    if is_noise_work_text(path) or is_noise_work_text(diff_text):
+        return True
+    if is_formatting_only_diff(path, diff_text):
+        return True
+    return is_non_substantive_work_diff(path, diff_text)
+
+
+def is_non_substantive_work_diff(path: str, diff_text: str) -> bool:
+    del path
+    added = _meaningful_diff_lines(diff_text, "+")
+    removed = _meaningful_diff_lines(diff_text, "-")
+    changed = [line for line in (*added, *removed) if line.strip()]
+    if not changed:
+        return False
+    return all(_is_metadata_stamp_line(line) for line in changed)
+
+
+def _is_metadata_stamp_line(line: str) -> bool:
+    text = line.strip().rstrip(",")
+    if not text or text in {"{", "}", "[", "]"}:
+        return True
+    if ISO_TIMESTAMP_RE.search(text):
+        return True
+    if VERSION_STAMP_RE.search(text) or VERSION_VALUE_RE.search(text):
+        return True
+    return False
+
+
+def is_formatting_only_diff(path: str, diff_text: str) -> bool:
+    normalized_path = path.replace("\\", "/").lower()
+    if not normalized_path.endswith((".json", ".jsonc")):
+        for line in diff_text.splitlines():
+            if line.startswith(DIFF_START):
+                parts = line.split()
+                if len(parts) >= 4:
+                    normalized_path = parts[3].removeprefix("b/").lower()
+                break
+    if not normalized_path.endswith((".json", ".jsonc")):
+        return False
+
+    removed = _meaningful_diff_lines(diff_text, "-")
+    added = _meaningful_diff_lines(diff_text, "+")
+    if not removed or len(removed) != len(added):
+        return False
+
+    return Counter(_normalize_formatting_line(line) for line in removed) == Counter(
+        _normalize_formatting_line(line) for line in added
+    )
+
+
+def _meaningful_diff_lines(diff_text: str, prefix: str) -> list[str]:
+    return [
+        line[1:]
+        for line in diff_text.splitlines()
+        if line.startswith(prefix) and not line.startswith("+++" if prefix == "+" else "---")
+    ]
+
+
+def _normalize_formatting_line(line: str) -> str:
+    return re.sub(r",\s*$", "", line.strip())
 
 
 def _is_excluded_path(path: str) -> bool:

@@ -4,15 +4,39 @@ from datetime import datetime
 from pathlib import Path
 import tempfile
 import unittest
+from zipfile import ZipFile
 from unittest.mock import patch
 
 from docx import Document
 
 from pyesis.config import AppConfig, EntryRecord
-from pyesis.document_formatter import export_ai_weekly_report_docx, render_plain_text, render_text_chunks, render_weekly_evidence_text
+from pyesis.document_formatter import export_ai_weekly_report_docx, export_ai_weekly_report_odt, render_plain_text, render_text_chunks, render_weekly_evidence_text
 
 
 class DocumentFormatterTests(unittest.TestCase):
+    def test_export_ai_weekly_report_odt_writes_structured_report(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with patch("pyesis.document_formatter.datetime") as mock_datetime:
+                mock_datetime.now.return_value = datetime(2026, 8, 26, 19, 15, 0)
+                mock_datetime.fromisoformat.side_effect = datetime.fromisoformat
+                target = export_ai_weekly_report_odt(
+                    "Day: Monday\nRepo: Pyesis\n- I added parser recovery details.\n- I clarified the import path changes.",
+                    Path(tmp_dir),
+                    "2026-06-26T00:00:00",
+                    provider_details="qwen3-coder:30b",
+                )
+
+            self.assertEqual(target.name, "WhatIDidThisWeek20260826.odt")
+            self.assertTrue(target.exists())
+            with ZipFile(target) as archive:
+                content = archive.read("content.xml").decode("utf-8")
+
+        self.assertIn("AI Weekly Report (2026 Jul 02)", content)
+        self.assertIn(">Monday<", content)
+        self.assertIn(">Pyesis<", content)
+        self.assertIn("I added parser recovery details.", content)
+        self.assertIn("I clarified the import path changes.", content)
+
     def test_export_ai_weekly_report_docx_writes_word_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             with patch("pyesis.document_formatter.datetime") as mock_datetime:
@@ -69,6 +93,68 @@ class DocumentFormatterTests(unittest.TestCase):
         self.assertIn("Week ending: 2026-07-02", output)
         self.assertIn("Day: Monday", output)
         self.assertIn("Repo: Pyesis", output)
+
+    def test_render_weekly_evidence_text_omits_formatting_only_json_entries(self) -> None:
+        config = AppConfig(
+            entries=[
+                EntryRecord(
+                    repo_label="RustyPythia",
+                    repo_path="/tmp/rusty",
+                    created_at="2026-06-29T06:37:47",
+                    day_name="Monday",
+                    week_start_iso="2026-06-26T00:00:00",
+                    summary="I adjusted configuration data in .vscode/settings.JSON.",
+                    diff_hash="formatting-only",
+                    diff_excerpt=(
+                        "diff --git a/.vscode/settings.json b/.vscode/settings.json\n"
+                        "--- a/.vscode/settings.json\n"
+                        "+++ b/.vscode/settings.json\n"
+                        "@@ -28,1 +28,1 @@\n"
+                        '-    \"activityBarTop.activeBorder\": \"#e7e7e7\"\n'
+                        '+    \"activityBarTop.activeBorder\": \"#e7e7e7\",\n'
+                    ),
+                    summary_source="heuristic",
+                    author="Backup",
+                )
+            ],
+        )
+
+        output = render_weekly_evidence_text(config, week_start_iso="2026-06-26T00:00:00")
+
+        self.assertIn("No captured entries for the current week.", output)
+        self.assertNotIn("RustyPythia", output)
+        self.assertNotIn("adjusted configuration data", output)
+
+    def test_render_weekly_evidence_text_omits_timestamp_only_entries(self) -> None:
+        config = AppConfig(
+            entries=[
+                EntryRecord(
+                    repo_label="cms-dotnet-cats-source",
+                    repo_path="/tmp/cats",
+                    created_at="2026-09-28T16:14:27",
+                    day_name="Monday",
+                    week_start_iso="2026-09-28T00:00:00",
+                    summary="I added syncedAtUtc in wwwroot/tzedek/sync-metadata.JSON.",
+                    diff_hash="timestamp-only",
+                    diff_excerpt=(
+                        "diff --git a/wwwroot/tzedek/sync-metadata.json b/wwwroot/tzedek/sync-metadata.json\n"
+                        "--- a/wwwroot/tzedek/sync-metadata.json\n"
+                        "+++ b/wwwroot/tzedek/sync-metadata.json\n"
+                        "@@ -2,1 +2,1 @@\n"
+                        '-  "syncedAtUtc": "2026-08-31T16:53:52.716Z",\n'
+                        '+  "syncedAtUtc": "2026-09-28T16:14:27.245Z",\n'
+                    ),
+                    summary_source="heuristic",
+                    author="heuristic",
+                )
+            ],
+        )
+
+        output = render_weekly_evidence_text(config, week_start_iso="2026-09-28T00:00:00")
+
+        self.assertIn("No captured entries for the current week.", output)
+        self.assertNotIn("syncedAtUtc", output)
+
     def test_render_plain_text_uses_configured_week_boundary_for_active_week(self) -> None:
         config = AppConfig(
             week_end_day="Thursday",

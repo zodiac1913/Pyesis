@@ -18,8 +18,9 @@ Desktop tool for monitoring `git diff` activity across multiple repositories and
 - Edit one saved summary entry at a time when you need to correct wording or add detail.
 - Start each Monday with blank spacing and a weekly header.
 - Export the current log to `.docx`.
+- Generate the AI Weekly Report as a structured `.odt` document, organized by day and repository.
 - Optional daily auto-export at a configured time from Settings, saved as `YYYYMMMddPyesis.docx`.
-- Settings include a configurable DOCX export folder, so generated files do not need to live inside the repo.
+- Settings include a configurable document export folder, so generated files do not need to live inside the repo.
 - Accessibility options in Settings: high contrast mode and adjustable UI font size.
 - Keyboard shortcuts for common actions (Settings, README, GitHub, add/remove/check/export repo actions).
 
@@ -185,8 +186,8 @@ CREATE INDEX idx_ai_attempts_recorded_at ON ai_attempts(recorded_at);
 
 - Debug launch (F5) uses `.vscode/launch.json` with the `debugpy` debugger and `.venv` (`python.defaultInterpreterPath`). Install `requirements.txt` in that venv, including `py7zr` for week archives. Quit a running Pyesis window first; the instance lock blocks a second start.
 - Each entry stores a larger diff excerpt to improve summary quality for future rewrites.
-- Exported documents are written to the configured DOCX output folder.
-- New installs default DOCX output to a `Pyesis` folder in your home Documents directory when available, and legacy `exports` settings are migrated away from the repo-local folder automatically.
+- Exported documents are written to the configured document output folder.
+- New installs default the document output to a `Pyesis` folder in your home Documents directory when available, and legacy `exports` settings are migrated away from the repo-local folder automatically.
 - On macOS, the app follows the current light/dark appearance when Theme is set to `System`.
 
 ## Release Automation
