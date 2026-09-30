@@ -29,12 +29,14 @@ DEFAULT_EXCLUDES = [
     "__pycache__/**",
     "cms-sqlLite-cats-source/**",
     "sync-metadata.json",
+    "schema_docs/**",
 ]
 NOISE_TEXT_MARKERS = (
     "pyesis_state.json",
     "logs/ai_attempts.jsonl",
     "cms-sqllite-cats-source/",
     "sync-metadata.json",
+    "schema_docs/",
 )
 ISO_TIMESTAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?")
 VERSION_STAMP_RE = re.compile(

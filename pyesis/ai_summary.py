@@ -330,39 +330,128 @@ def build_weekly_report(evidence_text: str, model_override: str | None = None) -
 
 def _weekly_report_system_prompt() -> str:
     return (
-        "Write a thorough weekly engineering report from evidence-based git work tracking. "
-        "Organize the report by day, then by repository, using clear section headers. "
-        "Stay grounded in the supplied evidence only and do not invent work that is not supported. "
-        "Explain concrete changes, likely intent, and notable outcomes in precise engineering language. "
-        "Call out warnings or uncertainty only when the evidence explicitly shows them. "
-        "Treat each evidence item as its own sentence or short paragraph unless adjacent items are clearly related enough to combine without losing specificity or order. "
-        "Keep the original day order, then repository order, and generally keep the original item order inside each repo section. "
+        "You write a manager-facing weekly status report from git work evidence. "
+        "This is not a changelog, release notes, commit message, or code review. "
+        "Organize only with the lines 'Day: <weekday>' and 'Repo: <name>', in the order those appear in the evidence. "
+        "Do not invent extra days, repos, theme headings, or categories such as Configuration, Testing, UI, or Documentation. "
+        "Under each repo, write complete paragraphs in prose. Each evidence item becomes its own paragraph of two to four sentences unless two adjacent items are clearly the same change. "
+        "A paragraph is several full sentences, not a stack of one-line status fragments. "
+        "A paragraph should say what changed, why it mattered, and the outcome in plain engineering language. "
+        "Do not use bullets, numbered lists, dashes used as list markers, emojis, markdown, code fences, or backticks. "
+        "Do not inventory files as 'Updated path:' lines. Mention a path only when the work cannot be understood without it, and then keep it inside a sentence. "
+        "Do not open with a preamble such as a concise summary of repositories, and do not close with an offer to reformat the text. "
+        "Stay grounded in the supplied evidence only. Call out uncertainty only when the evidence shows a warning. "
         "Use a professional, positive, insightful, and approachable voice. "
         "Prioritize clarity over cleverness. "
         "Use active voice, concise direct sentences, specific evidence-based wording, and inclusive language such as teams, people, or clients. "
         "Focus on solutions, progress, and practical insight without exaggeration, sales language, clichés, filler, or unexplained jargon. "
-        "Prefer vocabulary such as partner, empower, streamline, optimize, unlock, and future-ready; avoid disrupt, crush, dominate, hustle, killer, ninja, and guru. "
-        "Use clear subheadings and bullets when they improve readability, but do not use emojis, excessive punctuation, or all caps. "
-        "Return plain text, not JSON, and do not use code fences or backticks. "
-        "Use explicit section lines like 'Day: Monday' and 'Repo: ExampleRepo'. "
-        "Keep statistics or other data attributed to the supplied evidence."
+        "Avoid disrupt, crush, dominate, hustle, killer, ninja, and guru. "
+        "Return plain text, not JSON."
     )
 
 
 def _build_weekly_report_user_prompt(evidence_text: str) -> str:
     return (
-        "Using the weekly evidence below, write a detailed weekly report sectioned by day and then repo. "
-        "For each evidence item, write one sentence or at most a short paragraph that explains that item in plain engineering language. "
+        "Write the weekly status from the evidence below. "
+        "Start each day with 'Day: <weekday>' and each repository with 'Repo: <name>'. "
+        "Do not add any other headings. "
+        "For every evidence item, write one short paragraph of complete sentences that a colleague could read in standup. "
+        "Wrong: 'Updated app.py:' then a new line 'Replaced bind_all for drag events'. "
+        "Right: 'I limited window dragging to the title bar so scrolling the week log no longer moves the window.' "
         "Keep items in the same general order they appear under each repo unless two adjacent items are clearly related enough to combine. "
         "If you combine related items, keep the combination tight and do not absorb unrelated work into it. "
         "Do not collapse a whole repo day into one broad blended paragraph when the evidence contains distinct items. "
-        "Do not repeat evidence field labels like 'Summary:' in the report body. "
-        "Prefer complete prose over fragments, and keep the report suitable for a human weekly status write-up. "
-        "Use concise paragraphs and bullets only where they improve readability. "
-        "Use 'Day:' and 'Repo:' section lines without markdown heading markers.\n\n"
+        "Do not repeat evidence field labels like 'Summary:'. "
+        "Do not write file-by-file bullets, emoji section titles, or changelog phrasing such as 'Updated X:' or 'Modified Y:'. "
+        "Do not use markdown heading markers.\n\n"
         "Weekly evidence:\n"
         f"{evidence_text.strip()}"
     )
+
+
+_WEEKLY_DAY_LINE = re.compile(r"^Day:\s+\S", re.IGNORECASE)
+_WEEKLY_REPO_LINE = re.compile(r"^Repo:\s+\S", re.IGNORECASE)
+_WEEKLY_PREAMBLE_LINE = re.compile(
+    r"^(here'?s\b|this (is|week)\b|ai weekly\b|generated with\b|let me know\b|---+$)",
+    re.IGNORECASE,
+)
+_WEEKLY_CATEGORY_LINE = re.compile(r"^[A-Z][A-Za-z0-9 /&-]{1,48}$")
+
+
+def _is_weekly_section_heading(line: str) -> bool:
+    return bool(_WEEKLY_DAY_LINE.match(line) or _WEEKLY_REPO_LINE.match(line))
+
+
+def _is_discardable_weekly_line(line: str) -> bool:
+    if not line or _WEEKLY_PREAMBLE_LINE.match(line):
+        return True
+    if re.search(r"[\U0001F300-\U0001FAFF]", line) and not line.endswith((".", "!", "?")):
+        return True
+    if "&" in line and _WEEKLY_CATEGORY_LINE.match(line):
+        return True
+    return False
+
+
+def _weekly_clause(line: str) -> str:
+    text = re.sub(r"^[-*•]+\s*", "", line).strip()
+    text = re.sub(r"\s+", " ", text)
+    if text.endswith(":"):
+        text = text[:-1].rstrip()
+    return text
+
+
+def _paragraph_from_weekly_fragments(fragments: list[str]) -> str:
+    clauses = [clause for clause in (_weekly_clause(item) for item in fragments) if clause]
+    if not clauses:
+        return ""
+    if len(clauses) == 1 and clauses[0][-1:] in ".!?" and " " in clauses[0]:
+        return clauses[0]
+    joined: list[str] = []
+    for index, clause in enumerate(clauses):
+        piece = clause[:-1] if clause[-1:] in ".!?" else clause
+        if index and piece[:1].isupper() and not piece[:2].isupper():
+            piece = piece[0].lower() + piece[1:]
+        joined.append(piece)
+    text = "; ".join(joined).strip()
+    if text and text[-1:] not in ".!?":
+        text += "."
+    if text:
+        text = text[0].upper() + text[1:]
+    return text
+
+
+def _join_weekly_report_parts(parts: list[str]) -> str:
+    if not parts:
+        return ""
+    pieces = [parts[0]]
+    for previous, current in zip(parts, parts[1:]):
+        separator = "\n" if _is_weekly_section_heading(previous) and _is_weekly_section_heading(current) else "\n\n"
+        pieces.append(separator + current)
+    return "".join(pieces)
+
+
+def _normalize_weekly_report_prose(text: str) -> str:
+    parts: list[str] = []
+    pending: list[str] = []
+
+    def flush_pending() -> None:
+        paragraph = _paragraph_from_weekly_fragments(pending)
+        pending.clear()
+        if paragraph:
+            parts.append(paragraph)
+
+    for raw_line in text.replace("\r\n", "\n").split("\n"):
+        line = raw_line.strip()
+        if _is_weekly_section_heading(line):
+            flush_pending()
+            parts.append(re.sub(r"\s+", " ", line))
+            continue
+        if not line or _is_discardable_weekly_line(line):
+            flush_pending()
+            continue
+        pending.append(line)
+    flush_pending()
+    return _join_weekly_report_parts(parts)
 
 
 def _ollama_request_weekly_report(
@@ -400,7 +489,7 @@ def _ollama_request_weekly_report(
     if not content:
         raise RuntimeError(f"Empty Ollama response for model {model}")
     return AIWeeklyReportResult(
-        text=content,
+        text=_normalize_weekly_report_prose(content),
         timing_ms=int(round((perf_counter() - started_at) * 1000)),
         provider_details=model,
     )

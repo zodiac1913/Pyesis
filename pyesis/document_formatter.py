@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -13,7 +15,32 @@ from odf.style import ParagraphProperties, Style, TextProperties
 from odf.text import List, ListItem, P
 
 from pyesis.config import AppConfig, EntryRecord
-from pyesis.git_monitor import should_skip_work_diff, summarize_file_changes
+from pyesis.git_monitor import FileChangeSummary, is_noise_work_text, should_skip_work_diff, summarize_file_changes
+
+_FILE_CHANGE_CACHE: ContextVar[dict[str, list[FileChangeSummary]] | None] = ContextVar(
+    "pyesis_file_change_cache",
+    default=None,
+)
+
+
+@contextmanager
+def cached_file_change_summaries():
+    token = _FILE_CHANGE_CACHE.set({})
+    try:
+        yield
+    finally:
+        _FILE_CHANGE_CACHE.reset(token)
+
+
+def _summarize_excerpt(diff_excerpt: str) -> list[FileChangeSummary]:
+    cache = _FILE_CHANGE_CACHE.get()
+    if cache is None:
+        return summarize_file_changes(diff_excerpt)
+    cached = cache.get(diff_excerpt)
+    if cached is None:
+        cached = summarize_file_changes(diff_excerpt)
+        cache[diff_excerpt] = cached
+    return cached
 
 
 DAY_ORDER = [
@@ -115,7 +142,8 @@ def render_weekly_evidence_text(
         day_name: [
             entry
             for entry in entries
-            if not should_skip_work_diff(entry.repo_label, entry.diff_excerpt)
+            if not is_noise_work_text(entry.summary)
+            and not should_skip_work_diff(entry.repo_path or entry.repo_label, entry.diff_excerpt)
         ]
         for day_name, entries in selected_week_entries.items()
     }
@@ -187,9 +215,10 @@ def render_text_chunks(
     active_week_start_iso, active_week_entries = _active_week_entries(config.entries, config.week_end_day, now=now)
     chunks: list[RenderedTextChunk] = []
 
-    _append_week_header(chunks, active_week_start_iso)
-    if active_week_entries:
-        _append_week_entries(chunks, active_week_entries, entry_tag_resolver, warning_comment_resolver, delete_tag_resolver)
+    with cached_file_change_summaries():
+        _append_week_header(chunks, active_week_start_iso)
+        if active_week_entries:
+            _append_week_entries(chunks, active_week_entries, entry_tag_resolver, warning_comment_resolver, delete_tag_resolver)
 
     return chunks
 
@@ -235,7 +264,8 @@ def _append_day_repo_entries(
             for line_index, line in enumerate(summary_lines):
                 if line_index == 0 and delete_tags:
                     chunks.append(RenderedTextChunk(f"\t\t• {line}", tags=tags))
-                    chunks.append(RenderedTextChunk("  x\n", tags=delete_tags))
+                    chunks.append(RenderedTextChunk(" [X]", tags=delete_tags))
+                    chunks.append(RenderedTextChunk("\n"))
                     continue
                 chunks.append(RenderedTextChunk(f"\t\t• {line}\n", tags=tags))
             evidence = _entry_evidence_line(entry)
@@ -665,7 +695,7 @@ def _entry_evidence_line(entry: EntryRecord) -> str:
     if inline_evidence and _evidence_has_line_number(inline_evidence) and _evidence_matches_changed_line(inline_evidence, entry.diff_excerpt):
         return inline_evidence
 
-    changes = summarize_file_changes(entry.diff_excerpt)
+    changes = _summarize_excerpt(entry.diff_excerpt)
     for change in changes:
         if change.added_line_samples:
             line_no, snippet = change.added_line_samples[0]
@@ -706,7 +736,7 @@ def _evidence_matches_changed_line(evidence: str, diff_excerpt: str) -> bool:
     if not evidence_snippet:
         return False
 
-    for change in summarize_file_changes(diff_excerpt):
+    for change in _summarize_excerpt(diff_excerpt):
         change_path = change.path.replace("\\", "/").strip().lower()
         if change_path != evidence_path:
             continue
@@ -754,7 +784,7 @@ def _strip_unverified_around_claims(summary_body: str, diff_excerpt: str) -> str
 
 def _changed_snippet_set(diff_excerpt: str) -> set[str]:
     snippets: set[str] = set()
-    for change in summarize_file_changes(diff_excerpt):
+    for change in _summarize_excerpt(diff_excerpt):
         _add_normalized_snippets(snippets, (snippet for _line_no, snippet in change.added_line_samples))
         _add_normalized_snippets(snippets, change.added_samples)
         _add_normalized_snippets(snippets, change.removed_samples)

@@ -1144,7 +1144,7 @@ class AppSummaryProtectionTests(unittest.TestCase):
         app.root.after_calls[0][1]()
 
         self.assertIn(entry_key, app._active_ai_entry_keys)
-        self.assertTrue(refresh_calls)
+        self.assertFalse(refresh_calls)
 
     def test_failed_ai_fallback_renders_as_orange_retry_without_inline_error(self) -> None:
         app = self._make_app()

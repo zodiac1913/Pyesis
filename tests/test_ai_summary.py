@@ -11,6 +11,7 @@ from pyesis.ai_summary import (
     _build_ai_user_prompt,
     _weekly_report_system_prompt,
     _build_weekly_report_user_prompt,
+    _normalize_weekly_report_prose,
     _coalesce_changes,
     _first_evidence_reference,
     _is_summary_excluded_path,
@@ -402,11 +403,14 @@ class AISummaryTests(unittest.TestCase):
     def test_weekly_report_prompt_includes_evidence(self) -> None:
         prompt = _build_weekly_report_user_prompt("Day: Monday\nRepo: Pyesis\n- Summary: Added parser")
 
-        self.assertIn("write a detailed weekly report", prompt.lower())
-        self.assertIn("one sentence or at most a short paragraph", prompt)
+        self.assertIn("weekly status", prompt.lower())
+        self.assertIn("one short paragraph of complete sentences", prompt)
+        self.assertIn("Wrong:", prompt)
+        self.assertIn("Right:", prompt)
         self.assertIn("same general order", prompt)
         self.assertIn("Do not repeat evidence field labels like 'Summary:'", prompt)
-        self.assertIn("without markdown heading markers", prompt)
+        self.assertIn("Do not use markdown heading markers", prompt)
+        self.assertIn("Do not write file-by-file bullets", prompt)
         self.assertIn("Day: Monday", prompt)
         self.assertIn("Repo: Pyesis", prompt)
 
@@ -416,6 +420,31 @@ class AISummaryTests(unittest.TestCase):
         self.assertIn("Prioritize clarity over cleverness", prompt)
         self.assertIn("Use active voice", prompt)
         self.assertIn("positive, insightful, and approachable", prompt)
+        self.assertIn("not a changelog", prompt)
+        self.assertIn("Do not use bullets", prompt)
+        self.assertIn("not a stack of one-line status fragments", prompt)
+
+    def test_normalize_weekly_report_collapses_changelog_lines(self) -> None:
+        text = _normalize_weekly_report_prose(
+            "Here's a concise summary of the changes:\n"
+            "Day: Wednesday\n"
+            "Repo: Tzedek\n"
+            "Configuration & Setup\n"
+            "Updated src-tauri/Cargo.toml:\n"
+            "Changed description to Rusty Pythia SQL workspace\n"
+            "---\n"
+            "Repo: Pyesis\n"
+            "I limited window dragging to the title bar so scrolling no longer moves the window.\n"
+        )
+
+        self.assertIn("Day: Wednesday", text)
+        self.assertIn("Repo: Tzedek", text)
+        self.assertIn("Repo: Pyesis", text)
+        self.assertNotIn("Here's a concise summary", text)
+        self.assertNotIn("Configuration & Setup", text)
+        self.assertNotIn("Updated src-tauri/Cargo.toml:\n", text)
+        self.assertIn("Updated src-tauri/Cargo.toml; changed description to Rusty Pythia SQL workspace.", text)
+        self.assertIn("I limited window dragging to the title bar so scrolling no longer moves the window.", text)
 
     def test_build_weekly_report_uses_ollama_chat(self) -> None:
         response_payload = {

@@ -155,6 +155,30 @@ class DocumentFormatterTests(unittest.TestCase):
         self.assertIn("No captured entries for the current week.", output)
         self.assertNotIn("syncedAtUtc", output)
 
+    def test_render_weekly_evidence_text_omits_schema_docs_entries(self) -> None:
+        config = AppConfig(
+            entries=[
+                EntryRecord(
+                    repo_label="RustyPythia",
+                    repo_path="/tmp/rusty",
+                    created_at="2026-09-29T09:40:07",
+                    day_name="Tuesday",
+                    week_start_iso="2026-09-28T00:00:00",
+                    summary="I created src-tauri/resources/AI/schema_docs/tables/PMAP2/PMAP2_Rating.md",
+                    diff_hash="schema-docs",
+                    diff_excerpt="diff --git a/src-tauri/resources/AI/schema_docs/tables/PMAP2/PMAP2_Rating.md b/src-tauri/resources/AI/schema_docs/tables/PMAP2/PMAP2_Rating.md\n",
+                    summary_source="heuristic",
+                    author="Backup",
+                )
+            ],
+        )
+
+        output = render_weekly_evidence_text(config, week_start_iso="2026-09-28T00:00:00")
+
+        self.assertIn("No captured entries for the current week.", output)
+        self.assertNotIn("PMAP2_Rating", output)
+        self.assertNotIn("schema_docs", output)
+
     def test_render_plain_text_uses_configured_week_boundary_for_active_week(self) -> None:
         config = AppConfig(
             week_end_day="Thursday",
@@ -288,8 +312,11 @@ class DocumentFormatterTests(unittest.TestCase):
             mock_datetime.fromisoformat.side_effect = datetime.fromisoformat
             chunks = render_text_chunks(config, delete_tag_resolver=lambda _entry: ("entry-delete", "entry-delete-1"))
 
-        delete_chunk = next(chunk for chunk in chunks if chunk.text == "  x\n")
+        delete_chunk = next(chunk for chunk in chunks if chunk.text == " [X]")
         self.assertEqual(delete_chunk.tags, ("entry-delete", "entry-delete-1"))
+        delete_index = chunks.index(delete_chunk)
+        self.assertEqual(chunks[delete_index + 1].text, "\n")
+        self.assertEqual(chunks[delete_index + 1].tags, ())
 
     def test_render_text_chunks_adds_evidence_from_diff_when_summary_has_none(self) -> None:
         entry = EntryRecord(

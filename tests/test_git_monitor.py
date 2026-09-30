@@ -58,6 +58,12 @@ class GitMonitorExcludeTests(unittest.TestCase):
         self.assertTrue(_is_excluded_path("wwwroot/tzedek/sync-metadata.json"))
         self.assertFalse(_is_excluded_path("wwwroot/tzedek/smlCompliance.js"))
 
+    def test_excludes_schema_docs_dump_paths(self) -> None:
+        self.assertTrue(_is_excluded_path("src-tauri/resources/AI/schema_docs/tables/PMAP2/PMAP2_Rating.md"))
+        self.assertTrue(_is_excluded_path("docs/schema_docs/query_playbook.md"))
+        self.assertTrue(is_noise_work_text("I created src-tauri/resources/AI/schema_docs/tables/PMAP2/PMAP2_Rating.md"))
+        self.assertFalse(_is_excluded_path("src-tauri/src/ai.rs"))
+
     def test_timestamp_only_json_is_non_substantive(self) -> None:
         diff_text = "\n".join(
             [

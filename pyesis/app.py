@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, ttk
@@ -65,7 +66,7 @@ from pyesis.instance_lock import (
     fatal_error_message,
     show_startup_dialog,
 )
-from pyesis.document_formatter import export_ai_weekly_report_odt, export_docx, render_plain_text, render_text_chunks, render_weekly_evidence_text
+from pyesis.document_formatter import RenderedTextChunk, export_ai_weekly_report_odt, export_docx, render_plain_text, render_text_chunks, render_weekly_evidence_text
 from pyesis.github_auth import (
     GITHUB_DOTCOM_AUTH_MODE,
     GITHUB_ENTERPRISE_AUTH_MODE,
@@ -319,6 +320,14 @@ class PyesisApp:
         self._ai_last_warning = ""
         self._last_rendered_week_start_iso = ""
         self._editor_scroll_initialized = False
+        self._editor_refresh_generation = 0
+        self._editor_refresh_pending = False
+        self._editor_refresh_after = None
+        self._editor_refresh_thread: threading.Thread | None = None
+        self._editor_idle_after = None
+        self._editor_pointer_down = False
+        self._last_ui_input_at = 0.0
+        self._editor_render_fingerprint = ""
         self._editor_delete_tag_map: dict[str, str] = {}
         self._buffer_day = datetime.now().strftime("%Y-%m-%d")
         purge_old_daily_buffers(7, self._buffer_day)
@@ -966,6 +975,10 @@ class PyesisApp:
         editor_scrollbar = ttk.Scrollbar(preview_shell, orient="vertical", command=self.editor.yview)
         editor_scrollbar.grid(row=0, column=1, sticky="ns")
         self.editor.configure(yscrollcommand=editor_scrollbar.set)
+        self.editor.bind("<ButtonPress-1>", self._on_editor_pointer_down, add="+")
+        self.editor.bind("<ButtonRelease-1>", self._on_editor_pointer_up, add="+")
+        self.root.bind("<ButtonPress-1>", self._on_editor_pointer_down, add="+")
+        self.root.bind("<ButtonRelease-1>", self._on_editor_pointer_up, add="+")
         self.editor.tag_bind(ENTRY_DELETE_TAG, "<Button-1>", self._on_entry_delete_click)
         self.editor.tag_bind(ENTRY_DELETE_TAG, "<Enter>", self._on_entry_delete_hover_enter)
         self.editor.tag_bind(ENTRY_DELETE_TAG, "<Leave>", self._on_entry_delete_hover_leave)
@@ -1201,6 +1214,8 @@ class PyesisApp:
         self.root.bind_all("<Alt-l>", lambda _e: self._open_ai_attempt_log())
         self.root.bind_all("<Alt-W>", lambda _e: self._refresh_current_week_weak_summaries())
         self.root.bind_all("<Alt-w>", lambda _e: self._force_upgrade_heuristic_backlog())
+        self.root.bind_all("<ButtonPress>", self._on_ui_input, add="+")
+        self.root.bind_all("<KeyPress>", self._on_ui_input, add="+")
 
     def _on_shortcut_settings(self, _event: tk.Event) -> str:
         self._open_settings()
@@ -2855,7 +2870,12 @@ class PyesisApp:
         self.editor.tag_configure("ai-working-dim", foreground=palette["working_fg_dim"])
         self.editor.tag_configure("ai-comment", foreground=palette["failed_fg"])
         self.editor.tag_configure("empty-week-note", foreground=palette["muted_fg"])
-        self.editor.tag_configure(ENTRY_DELETE_TAG, foreground=palette["failed_fg"], underline=True)
+        self.editor.tag_configure(
+            ENTRY_DELETE_TAG,
+            foreground=palette["accent_fg"],
+            background=palette["failed_fg"],
+            underline=False,
+        )
         if self._editor_bg_canvas is not None:
             self._editor_bg_canvas.configure(bg=palette["surface"])
         self._apply_titlebar_colors()
@@ -2900,8 +2920,8 @@ class PyesisApp:
             widgets.append(title_label)
         for widget in widgets:
             widget.bind("<ButtonPress-1>", on_press)
-        self.root.bind_all("<B1-Motion>", on_drag, add="+")
-        self.root.bind_all("<ButtonRelease-1>", on_release, add="+")
+            widget.bind("<B1-Motion>", on_drag)
+            widget.bind("<ButtonRelease-1>", on_release)
 
     def _has_real_tk_window(self) -> bool:
         root = getattr(self, "root", None)
@@ -3014,7 +3034,7 @@ class PyesisApp:
         send_bool(window, self._macos_sel(objc, "setOpaque:"), True)
         send_bool(window, self._macos_sel(objc, "setHasShadow:"), True)
         send_bool(window, self._macos_sel(objc, "setMovable:"), True)
-        send_bool(window, self._macos_sel(objc, "setMovableByWindowBackground:"), True)
+        send_bool(window, self._macos_sel(objc, "setMovableByWindowBackground:"), False)
 
         for button_id in (0, 1, 2):
             button = send_button(window, self._macos_sel(objc, "standardWindowButton:"), button_id)
@@ -3325,31 +3345,153 @@ class PyesisApp:
         return end_fraction >= 0.995
 
     def _refresh_editor(self) -> None:
+        if self._has_real_tk_window():
+            self._queue_editor_refresh()
+            return
+        payload = self._build_editor_render_payload()
+        self._apply_editor_render_payload(payload)
+
+    def _queue_editor_refresh(self) -> None:
+        self._editor_refresh_generation += 1
+        self._editor_refresh_pending = True
+        cancel = getattr(self.root, "after_cancel", None)
+        handle = getattr(self, "_editor_refresh_after", None)
+        if handle is not None and callable(cancel):
+            try:
+                cancel(handle)
+            except Exception:
+                pass
+        after = getattr(self.root, "after", None)
+        if callable(after) and self._has_real_tk_window():
+            self._editor_refresh_after = after(120, self._start_editor_refresh_thread)
+            return
+        self._start_editor_refresh_thread()
+
+    def _start_editor_refresh_thread(self) -> None:
+        self._editor_refresh_after = None
+        if self._editor_refresh_thread is not None and self._editor_refresh_thread.is_alive():
+            self._editor_refresh_pending = True
+            return
+        generation = self._editor_refresh_generation
+        self._editor_refresh_pending = False
+        self._editor_refresh_thread = threading.Thread(
+            target=self._editor_refresh_worker,
+            args=(generation,),
+            daemon=True,
+        )
+        self._editor_refresh_thread.start()
+
+    def _editor_refresh_worker(self, generation: int) -> None:
+        try:
+            payload = self._build_editor_render_payload()
+        except Exception:
+            payload = None
+        try:
+            self.root.after(0, lambda: self._complete_editor_refresh(generation, payload))
+        except Exception:
+            return
+
+    def _complete_editor_refresh(self, generation: int, payload: dict | None) -> None:
+        self._editor_refresh_thread = None
+        if self._editor_should_defer_apply():
+            self._editor_refresh_pending = True
+            self._schedule_idle_editor_apply()
+            return
+        if payload is not None and generation == self._editor_refresh_generation:
+            self._apply_editor_render_payload(payload)
+        if self._editor_refresh_pending:
+            self._editor_refresh_pending = False
+            self._queue_editor_refresh()
+
+    def _on_ui_input(self, _event: tk.Event | None = None) -> None:
+        self._last_ui_input_at = time.monotonic()
+
+    def _editor_should_defer_apply(self) -> bool:
+        if getattr(self, "_editor_pointer_down", False):
+            return True
+        last = float(getattr(self, "_last_ui_input_at", 0.0) or 0.0)
+        return last > 0.0 and (time.monotonic() - last) < 0.4
+
+    def _schedule_idle_editor_apply(self) -> None:
+        after = getattr(self.root, "after", None)
+        cancel = getattr(self.root, "after_cancel", None)
+        handle = getattr(self, "_editor_idle_after", None)
+        if handle is not None and callable(cancel):
+            try:
+                cancel(handle)
+            except Exception:
+                pass
+        if callable(after) and self._has_real_tk_window():
+            self._editor_idle_after = after(400, self._retry_deferred_editor_apply)
+            return
+        self._retry_deferred_editor_apply()
+
+    def _retry_deferred_editor_apply(self) -> None:
+        self._editor_idle_after = None
+        if self._editor_should_defer_apply():
+            self._schedule_idle_editor_apply()
+            return
+        if self._editor_refresh_pending and (
+            self._editor_refresh_thread is None or not self._editor_refresh_thread.is_alive()
+        ):
+            self._start_editor_refresh_thread()
+
+    def _build_editor_render_payload(self) -> dict:
+        delete_map: dict[str, str] = {}
+
+        def delete_tags(entry: EntryRecord) -> tuple[str, ...]:
+            unique_tag = self._entry_delete_tag(entry)
+            delete_map[unique_tag] = self._entry_status_key(entry)
+            return (ENTRY_DELETE_TAG, unique_tag)
+
+        config_copy = replace(
+            self.config,
+            repos=list(self.config.repos),
+            entries=list(self.config.entries),
+            deleted_entries=list(self.config.deleted_entries),
+        )
+        chunks = render_text_chunks(
+            config_copy,
+            entry_tag_resolver=self._entry_render_tags,
+            warning_comment_resolver=self._entry_warning_comment,
+            delete_tag_resolver=delete_tags,
+        )
+        week_count = sum(1 for entry in config_copy.entries if self._is_current_week_entry(entry))
+        return {
+            "chunks": chunks,
+            "delete_map": delete_map,
+            "week_start_iso": self._active_week_start().isoformat(),
+            "empty_week": week_count == 0,
+        }
+
+    def _apply_editor_render_payload(self, payload: dict) -> None:
         previous_scroll_first = 0.0
         keep_bottom_magnet = False
         if self._editor_scroll_initialized:
             previous_scroll_first, previous_scroll_end = self.editor.yview()
             keep_bottom_magnet = self._is_editor_view_near_bottom(previous_scroll_end)
 
-        self._last_rendered_week_start_iso = self._active_week_start().isoformat()
-        self._editor_delete_tag_map = {}
-        self.editor.delete("1.0", tk.END)
-        current_week_count = self._current_week_entry_count()
-        for chunk in render_text_chunks(
-            self.config,
-            entry_tag_resolver=self._entry_render_tags,
-            warning_comment_resolver=self._entry_warning_comment,
-            delete_tag_resolver=self._entry_delete_tags,
-        ):
-            self.editor.insert(tk.END, chunk.text, chunk.tags)
-        if current_week_count == 0:
-            self.editor.insert(
-                tk.END,
-                "No captured code changes for this week yet. Make a change and refresh to populate this week.\n",
-                ("empty-week-note",),
+        chunks = list(payload["chunks"])
+        if payload["empty_week"]:
+            chunks.append(
+                RenderedTextChunk(
+                    "No captured code changes for this week yet. Make a change and refresh to populate this week.\n",
+                    ("empty-week-note",),
+                )
             )
-
-        self.editor.update_idletasks()
+        self._last_rendered_week_start_iso = str(payload["week_start_iso"])
+        self._editor_delete_tag_map = dict(payload["delete_map"])
+        fingerprint = self._editor_payload_fingerprint(payload, chunks)
+        if fingerprint == getattr(self, "_editor_render_fingerprint", ""):
+            self._update_backlog_button()
+            return
+        self._editor_render_fingerprint = fingerprint
+        self.editor.delete("1.0", tk.END)
+        if hasattr(self.editor, "tag_add"):
+            self._insert_editor_chunks_batched(self._merge_editor_chunks(chunks))
+        else:
+            for chunk in chunks:
+                self.editor.insert(tk.END, chunk.text, chunk.tags)
         if keep_bottom_magnet:
             self.editor.yview_moveto(1.0)
         elif self._editor_scroll_initialized:
@@ -3357,6 +3499,51 @@ class PyesisApp:
 
         self._editor_scroll_initialized = True
         self._update_backlog_button()
+
+    def _editor_payload_fingerprint(self, payload: dict, chunks: list[RenderedTextChunk]) -> str:
+        digest = hashlib.sha1()
+        digest.update(str(payload["week_start_iso"]).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(payload["empty_week"]).encode("utf-8"))
+        for chunk in chunks:
+            digest.update(chunk.text.encode("utf-8", "replace"))
+            digest.update(b"\0")
+            digest.update(",".join(chunk.tags).encode("utf-8"))
+            digest.update(b"\n")
+        return digest.hexdigest()
+
+    def _on_editor_pointer_down(self, _event: tk.Event) -> None:
+        self._editor_pointer_down = True
+        self._on_ui_input()
+
+    def _on_editor_pointer_up(self, _event: tk.Event) -> None:
+        self._editor_pointer_down = False
+        self._on_ui_input()
+        if self._editor_refresh_pending:
+            self._schedule_idle_editor_apply()
+
+    def _merge_editor_chunks(self, chunks: list[RenderedTextChunk]) -> list[RenderedTextChunk]:
+        merged: list[RenderedTextChunk] = []
+        for chunk in chunks:
+            if merged and merged[-1].tags == chunk.tags:
+                previous = merged[-1]
+                merged[-1] = RenderedTextChunk(previous.text + chunk.text, previous.tags)
+            else:
+                merged.append(chunk)
+        return merged
+
+    def _insert_editor_chunks_batched(self, chunks: list[RenderedTextChunk]) -> None:
+        body = "".join(chunk.text for chunk in chunks)
+        self.editor.insert("1.0", body)
+        offset = 0
+        for chunk in chunks:
+            length = len(chunk.text)
+            if chunk.tags:
+                start = f"1.0+{offset}c"
+                end = f"1.0+{offset + length}c"
+                for tag in chunk.tags:
+                    self.editor.tag_add(tag, start, end)
+            offset += length
 
     def _current_week_entry_count(self) -> int:
         return sum(1 for entry in self.config.entries if self._is_current_week_entry(entry))
@@ -3418,7 +3605,10 @@ class PyesisApp:
 
         self._remember_deleted_entry(entry)
         self.config.entries.pop(entry_index)
-        save_config(self.config)
+        if self._has_real_tk_window():
+            self._save_config_snapshot_async()
+        else:
+            save_config(self.config)
         self._refresh_editor()
         self.status_var.set(f"Deleted 1 entry for {self._display_repo_label(entry)}")
         return True
@@ -3440,7 +3630,7 @@ class PyesisApp:
         return "break"
 
     def _on_entry_delete_hover_enter(self, _event: tk.Event) -> str:
-        self.editor.configure(cursor="hand2")
+        self.editor.configure(cursor="arrow")
         return "break"
 
     def _on_entry_delete_hover_leave(self, _event: tk.Event) -> str:
@@ -3475,7 +3665,6 @@ class PyesisApp:
                 self._active_ai_entry_keys.add(entry_key)
             else:
                 self._active_ai_entry_keys.discard(entry_key)
-            self._refresh_editor()
 
         self.root.after(0, apply)
 
@@ -4267,12 +4456,14 @@ class PyesisApp:
             provider_mode = self._effective_ai_mode()
             if provider_mode != HEURISTIC_MODE:
                 provider = self._ai_provider_label(provider_mode)
+                previous_severity = self._ai_status_severity
                 self._ai_backend_unavailable = False
                 self._ai_last_warning = ""
                 self._ai_status_severity = "ok"
                 self.ai_status_var.set(f"[OK] Healthy: {provider} summaries active")
                 self._sync_ollama_alert_state()
-                self._apply_theme()
+                if previous_severity != "ok":
+                    self._apply_theme()
 
         self._reset_poll_state()
         self._start_ai_recovery_probe_if_needed()
