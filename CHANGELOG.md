@@ -1,5 +1,20 @@
 # Changelog
 
+## 2026.10.8.0 - 2026-10-08
+
+### Added
+- AI Weekly Report exports a structured `.odt` document organized by day and repository.
+
+### Changed
+- AI Weekly Report uses the Ollama model selected in Settings instead of always using `qwen3-coder:30b`.
+- Weekly evidence is sent one day at a time with a context window sized to the prompt, so long weeks keep the instructions.
+- Weekly report output is flattened into Day/Repo prose paragraphs instead of changelog-style lists.
+- Schema documentation and stamp-only changes are skipped as noise.
+
+### Fixed
+- Long weeks no longer produce a generic "Summary of Changes" report because Ollama's default 4K window truncated the prompt.
+- Week-pane redraws are deferred while clicking.
+
 ## 2026.9.17.0 - 2026-09-17
 
 ### Changed
