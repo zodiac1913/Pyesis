@@ -522,7 +522,7 @@ class AppSummaryProtectionTests(unittest.TestCase):
 
         self.assertIn("env", export_results)
         self.assertEqual(mock_build.call_args.args[0], "Day: Monday\nRepo: Pyesis\n- Summary: Added prompt")
-        self.assertEqual(mock_build.call_args.kwargs["model_override"], "qwen3-coder:30b")
+        self.assertEqual(mock_build.call_args.kwargs["model_override"], "qwen2.5-coder:latest")
         self.assertEqual(mock_export.call_args.args[0], "Monday\nPyesis\nDetailed weekly report.")
         self.assertEqual(mock_export.call_args.args[1], Path("/tmp/pyesis-docx"))
         self.assertEqual(mock_export.call_args.args[2], "2026-06-26T00:00:00")

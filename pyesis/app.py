@@ -4692,7 +4692,8 @@ class PyesisApp:
 
     def _build_ai_weekly_report_worker(self, evidence_text: str, week_start_iso: str, output_dir: Path) -> None:
         try:
-            result = build_weekly_report(evidence_text, model_override=DEFAULT_OLLAMA_WEEKLY_REPORT_MODEL)
+            model = self.config.ai_ollama_model.strip() or DEFAULT_OLLAMA_WEEKLY_REPORT_MODEL
+            result = build_weekly_report(evidence_text, model_override=model)
             target = export_ai_weekly_report_odt(
                 result.text,
                 output_dir,

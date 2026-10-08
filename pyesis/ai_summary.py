@@ -469,7 +469,11 @@ def _ollama_request_weekly_report(
             {"role": "user", "content": _build_weekly_report_user_prompt(evidence_text)},
         ],
         "stream": False,
-        "options": {"temperature": 0.2, "num_thread": _ollama_num_threads()},
+        "options": {
+            "temperature": 0.2,
+            "num_thread": _ollama_num_threads(),
+            "num_ctx": _weekly_report_num_ctx(evidence_text),
+        },
     }
     if keep_alive:
         payload["keep_alive"] = keep_alive
@@ -510,20 +514,56 @@ def _ollama_weekly_report(evidence_text: str, model_override: str | None = None)
     if not models:
         raise RuntimeError("Missing Ollama model configuration")
 
+    chunks = _split_weekly_evidence_by_day(evidence_text)
     errors: list[str] = []
     for candidate in models:
         try:
-            return _ollama_request_weekly_report(
-                evidence_text,
-                url=url,
-                model=candidate,
-                keep_alive=keep_alive,
-                timeout=timeout,
-            )
+            results = [
+                _ollama_request_weekly_report(
+                    chunk,
+                    url=url,
+                    model=candidate,
+                    keep_alive=keep_alive,
+                    timeout=timeout,
+                )
+                for chunk in chunks
+            ]
         except Exception as exc:
             errors.append(f"{candidate}: {exc}")
+            continue
+        return AIWeeklyReportResult(
+            text=_join_weekly_report_parts([result.text for result in results if result.text.strip()]),
+            timing_ms=sum(result.timing_ms for result in results),
+            provider_details=candidate,
+        )
 
     raise RuntimeError("; ".join(errors) if errors else "Ollama weekly report failed")
+
+
+# Ollama defaults to a 4K context and silently truncates the prompt start (the instructions),
+# so each day is sent separately with a window sized to fit the prompt plus the reply.
+WEEKLY_REPORT_MIN_NUM_CTX = 8192
+WEEKLY_REPORT_MAX_NUM_CTX = 32768
+WEEKLY_REPORT_REPLY_TOKENS = 2048
+
+
+def _weekly_report_num_ctx(evidence_text: str) -> int:
+    prompt_chars = len(_weekly_report_system_prompt()) + len(_build_weekly_report_user_prompt(evidence_text))
+    needed = prompt_chars // 3 + WEEKLY_REPORT_REPLY_TOKENS
+    rounded = -(-needed // 1024) * 1024
+    return max(WEEKLY_REPORT_MIN_NUM_CTX, min(WEEKLY_REPORT_MAX_NUM_CTX, rounded))
+
+
+def _split_weekly_evidence_by_day(evidence_text: str) -> list[str]:
+    chunks: list[list[str]] = []
+    for line in evidence_text.strip().split("\n"):
+        if _WEEKLY_DAY_LINE.match(line.strip()):
+            chunks.append([line])
+        elif chunks:
+            chunks[-1].append(line)
+    if not chunks:
+        return [evidence_text]
+    return ["\n".join(chunk).strip() for chunk in chunks]
 
 
 def _ai_provider_label(mode: str) -> str:

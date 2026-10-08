@@ -21,6 +21,7 @@ from pyesis.ai_summary import (
     _parse_ai_json_payload,
     _structured_summary_from_json,
     _to_past_tense,
+    _weekly_report_num_ctx,
     build_weekly_report,
     build_summary,
 )
@@ -543,6 +544,34 @@ class AISummaryTests(unittest.TestCase):
 
         self.assertEqual(attempts, [("qwen3-coder:30b", 225)])
         self.assertEqual(result.provider_details, "qwen3-coder:30b")
+
+    def test_build_weekly_report_sends_one_request_per_day_with_sized_context(self) -> None:
+        sent: list[str] = []
+
+        def fake_request(evidence_text, *, url, model, keep_alive, timeout):
+            del url, keep_alive, timeout
+            sent.append(evidence_text)
+            day = evidence_text.split("\n", 1)[0]
+            return AIWeeklyReportResult(text=f"{day}\nRepo: Pyesis\n\nI did work.", timing_ms=10, provider_details=model)
+
+        evidence = (
+            "Week ending: 2026-10-08\nWeek start: 2026-10-02\n\n"
+            "Day: Monday\nRepo: Pyesis\n- Summary: Added parser\n\n"
+            "Day: Tuesday\nRepo: Pyesis\n- Summary: Fixed export\n"
+        )
+        with patch("pyesis.ai_summary._ollama_request_weekly_report", side_effect=fake_request):
+            result = build_weekly_report(evidence, model_override="hermes3:latest")
+
+        self.assertEqual(len(sent), 2)
+        self.assertTrue(sent[0].startswith("Day: Monday"))
+        self.assertNotIn("Tuesday", sent[0])
+        self.assertTrue(sent[1].startswith("Day: Tuesday"))
+        self.assertIn("Day: Monday", result.text)
+        self.assertIn("Day: Tuesday", result.text)
+        self.assertEqual(result.timing_ms, 20)
+        self.assertEqual(_weekly_report_num_ctx("short"), 8192)
+        self.assertEqual(_weekly_report_num_ctx("x" * 200_000), 32768)
+        self.assertGreater(_weekly_report_num_ctx("x" * 30_000), 8192)
 
     def test_ollama_structured_summary_falls_through_multiple_models(self) -> None:
         diff_text = (
