@@ -5,6 +5,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from pyesis.config import AppConfig, EntryRecord, RepoConfig, load_config, save_config
 from pyesis.storage import load_buffer_day, migrate_legacy_json, normalized_db_path, read_payload, replace_buffer_day
@@ -59,6 +60,34 @@ class StorageMigrationTests(unittest.TestCase):
             payload = read_payload(db_path, include_entries=True)
             self.assertIsNotNone(payload)
             self.assertEqual(payload["ai_ollama_num_threads"], 3)
+
+    def test_save_does_not_repeat_historical_fuzzy_deduplication(self) -> None:
+        entries = [
+            EntryRecord(
+                repo_label="Pyesis",
+                repo_path="/tmp/pyesis",
+                created_at=f"2026-10-{day:02d}T09:00:00",
+                day_name=day_name,
+                week_start_iso="2026-10-09T00:00:00",
+                summary=summary,
+                diff_hash=f"hash-{day}",
+                diff_excerpt=f"+++ b/main.py\n@@ -1 +1 @@\n-{old}\n+{new}\n",
+            )
+            for day, day_name, summary, old, new in (
+                (14, "Wednesday", "I added capture logging.", "before()", "log_capture()"),
+                (15, "Thursday", "I added capture timing.", "log_capture()", "time_capture()"),
+            )
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "pyesis.db"
+            with patch(
+                "pyesis.config._diff_similarity",
+                side_effect=AssertionError("Saving must not fuzzy-match historical entries"),
+            ):
+                save_config(AppConfig(entries=[*entries, entries[1]]), state_path=db_path)
+                loaded = load_config(state_path=db_path)
+
+            self.assertEqual([entry.diff_hash for entry in loaded.entries], ["hash-14", "hash-15"])
 
     def test_save_config_strips_sqlite_copy_entries(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

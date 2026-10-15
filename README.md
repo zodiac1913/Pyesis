@@ -12,6 +12,7 @@ Desktop tool for monitoring `git diff` activity across multiple repositories and
 
 - Add and remove repositories to monitor.
 - Periodically check for changed `git diff` output, skipping nested `cms-sqlLite-cats-source` copies so they are not treated as weekly work.
+- Check new captures for carry-over duplicates without repeating fuzzy comparisons across the entire saved history on every file save.
 - Generate first-person summaries through a pluggable AI hook.
 - Choose AI provider and model per machine in Settings (for example, lighter or heavier Ollama models based on local hardware).
 - Group entries by day with `@DayName` markers and then by repository name (alphabetical).
@@ -99,6 +100,23 @@ Closed weeks are still archived as files: `~/PyesisState/week_archives/PyesisWee
 On first launch with this storage, leftover `pyesis_state.json`, `diff_buffers/*.json`, and `logs/ai_attempts.jsonl` under `~/PyesisState/` are imported into `pyesis.db` and renamed with a `.migrated` suffix. Nested `cms-sqlLite-cats-source` copies are skipped so they do not inflate the week log.
 
 A `pyesis_state.json` sitting in this git repo is not the live store. The running app reads and writes `~/PyesisState/pyesis.db`.
+
+### Recovering work committed between scans
+
+Polling captures staged, unstaged, and untracked changes, not commit history. Work
+committed while Pyesis is closed or between scans can therefore be missing.
+Quit Pyesis before recovering entries so its in-memory state cannot overwrite them.
+Preview recovery for each repository with:
+
+```bash
+python scripts/backfill_entries_from_git.py --repo /path/to/repo \
+  --since 2026-10-14T00:00:00 --until 2026-10-16T00:00:00
+```
+
+Check the author filter and proposed entries, then repeat with `--apply` to save.
+Use `--author` if the desired commits use a different email from the repository's
+current `git config user.email`. Restart Pyesis after recovery. This script does
+not recover uncommitted changes from past days.
 
 Schema (`settings.value` is a JSON-encoded scalar per key; `meta` currently stores `schema_version`):
 

@@ -896,9 +896,12 @@ def save_config(config: AppConfig, state_path: Path | None = None) -> None:
     resolved = state_path or STATE_PATH
     config.deleted_entries = _prune_deleted_entries(config.deleted_entries)
     deleted_entry_keys = {entry.key for entry in config.deleted_entries}
+    # Capture already checks new diffs for carry-over duplicates. Rechecking all
+    # historical pairs on every file save stalls scans before later repos run.
     config.entries = _drop_noise_entries(
         dedupe_entries(
-            [entry for entry in _prune_entries(config.entries) if deleted_entry_key_for_entry(entry) not in deleted_entry_keys]
+            [entry for entry in _prune_entries(config.entries) if deleted_entry_key_for_entry(entry) not in deleted_entry_keys],
+            include_near_diff=False,
         )
     )
     write_config(config, resolved)
