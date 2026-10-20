@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta
-from difflib import SequenceMatcher
 from html import escape
 import json
 import hashlib
@@ -89,7 +88,6 @@ from pyesis.week_archive import archive_completed_weeks
 
 
 DIFF_EXCERPT_LIMIT = 12_000
-NEAR_DUP_DIFF_SIMILARITY_THRESHOLD = 0.80
 WINDOWS_APP_ID = "rxjr.pyesis.app"
 TITLEBAR_BG = "#ff00ff"
 TITLEBAR_FG = "#001f5c"
@@ -4035,34 +4033,6 @@ class PyesisApp:
 
         for idx, existing in enumerate(self.config.entries):
             existing_fp = self._entry_files_fingerprint(existing)
-            if self._same_scope_entry(existing, candidate) and self._fingerprint_overlap(candidate_fp, existing_fp) and self._same_summary_duplicate(existing, candidate):
-                existing_source = (existing.summary_source or "").strip().lower()
-                candidate_source = (candidate.summary_source or "").strip().lower()
-                if existing_source != HEURISTIC_MODE and candidate_source == HEURISTIC_MODE:
-                    return
-
-                self.config.entries[idx] = EntryRecord(
-                    repo_label=candidate.repo_label,
-                    repo_path=candidate.repo_path,
-                    created_at=existing.created_at,
-                    day_name=self._entry_day_name(existing),
-                    week_start_iso=self._entry_week_start_iso(existing),
-                    summary=candidate.summary,
-                    summary_source=candidate.summary_source,
-                    diff_hash=candidate.diff_hash,
-                    diff_excerpt=candidate.diff_excerpt,
-                    author=candidate.author,
-                    rewritten_by=candidate.rewritten_by,
-                    rewritten_at=candidate.rewritten_at,
-                    requested_summary_source=candidate.requested_summary_source,
-                    summary_warning=candidate.summary_warning,
-                    fallback_summary_source=candidate.fallback_summary_source,
-                    summary_timing_ms=candidate.summary_timing_ms,
-                    summary_provider_details=candidate.summary_provider_details,
-                    last_ai_attempt_at=candidate.last_ai_attempt_at,
-                )
-                return
-
             if not self._should_merge_entries(existing, candidate):
                 continue
             if not self._fingerprint_overlap(candidate_fp, existing_fp):
@@ -4100,13 +4070,6 @@ class PyesisApp:
 
     def _entry_day_key(self, created_at_iso: str) -> str:
         return created_at_iso[:10] if len(created_at_iso) >= 10 else ""
-
-    def _same_scope_entry(self, previous: EntryRecord, current: EntryRecord) -> bool:
-        return (
-            previous.repo_path == current.repo_path
-            and self._entry_day_name(previous) == self._entry_day_name(current)
-            and self._entry_week_start_iso(previous) == self._entry_week_start_iso(current)
-        )
 
     def _entry_diff_fingerprint(self, entry: EntryRecord) -> str:
         diff_hash = entry.diff_hash.strip()
@@ -4166,12 +4129,6 @@ class PyesisApp:
             return False
         return (len(intersect) / union_size) >= 0.6
 
-    def _same_summary_duplicate(self, existing: EntryRecord, candidate: EntryRecord) -> bool:
-        return self._normalized_repeat_summary(existing.summary) == self._normalized_repeat_summary(candidate.summary)
-
-    def _normalized_repeat_summary(self, summary: str) -> str:
-        return re.sub(r"\s+", " ", summary.strip().lower()).rstrip(".")
-
     def _is_possible_duplicate_diff(self, candidate: EntryRecord) -> bool:
         candidate_fp = self._entry_diff_fingerprint(candidate)
         if not candidate_fp:
@@ -4184,36 +4141,6 @@ class PyesisApp:
             if self._entry_day_key(existing.created_at) != candidate_day:
                 continue
             if self._entry_diff_fingerprint(existing) == candidate_fp:
-                return True
-        return False
-
-    def _is_possible_carryover_duplicate(self, candidate: EntryRecord) -> bool:
-        candidate_excerpt = candidate.diff_excerpt.strip()
-        candidate_files = self._entry_files_fingerprint(candidate)
-        if not candidate_excerpt:
-            return False
-
-        candidate_day = self._entry_day_key(candidate.created_at)
-        candidate_week_start = self._entry_week_start_iso(candidate)
-        for existing in reversed(self.config.entries):
-            if existing.repo_path != candidate.repo_path:
-                continue
-            if self._entry_week_start_iso(existing) != candidate_week_start:
-                continue
-
-            existing_day = self._entry_day_key(existing.created_at)
-            if not existing_day or existing_day == candidate_day:
-                continue
-
-            existing_excerpt = existing.diff_excerpt.strip()
-            if not existing_excerpt:
-                continue
-            existing_files = self._entry_files_fingerprint(existing)
-            if not self._fingerprint_overlap(candidate_files, existing_files):
-                continue
-
-            similarity = SequenceMatcher(None, candidate_excerpt, existing_excerpt).ratio()
-            if similarity >= NEAR_DUP_DIFF_SIMILARITY_THRESHOLD:
                 return True
         return False
 
@@ -4237,11 +4164,6 @@ class PyesisApp:
     ) -> bool:
         if self._is_possible_duplicate_diff(new_entry):
             self._set_possible_duplicate_status(f"[POSSIBLE DUPLICATE] {repo.label}: duplicate git diff detected for {file_path}")
-            self._mark_ledger_shown(repo, file_diff_text)
-            return True
-
-        if self._is_possible_carryover_duplicate(new_entry):
-            self._set_possible_duplicate_status(f"[POSSIBLE DUPLICATE] {repo.label}: carry-over git diff from previous day for {file_path}")
             self._mark_ledger_shown(repo, file_diff_text)
             return True
 

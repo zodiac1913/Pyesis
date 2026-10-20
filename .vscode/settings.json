@@ -27,7 +27,8 @@
         "statusBar.debuggingBackground": "#ff00ff",
         "statusBar.debuggingForeground": "#e7e7e7",
         "activityBar.activeBorder": "#15202b",
-        "activityBarTop.activeBorder": "#15202b"
+        "activityBarTop.activeBorder": "#15202b",
+        "statusBar.inactiveBackground": "#ff00ff"
     },
     "peacock.color": "Magenta",
     "ollama-autocoder.model": "llama3.1:8b"

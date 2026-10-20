@@ -81,7 +81,7 @@ class StorageMigrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "pyesis.db"
             with patch(
-                "pyesis.config._diff_similarity",
+                "difflib.SequenceMatcher",
                 side_effect=AssertionError("Saving must not fuzzy-match historical entries"),
             ):
                 save_config(AppConfig(entries=[*entries, entries[1]]), state_path=db_path)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 import tempfile
@@ -110,7 +111,7 @@ class ConfigSummaryProtectionTests(unittest.TestCase):
         self.assertEqual(len(deduped), 2)
         self.assertEqual({entry.diff_hash for entry in deduped}, {"hash-one", "hash-two"})
 
-    def test_dedupe_collapses_same_day_same_file_exact_same_summary(self) -> None:
+    def test_dedupe_keeps_distinct_diffs_with_exact_same_summary(self) -> None:
         first_entry = EntryRecord(
             repo_label="Cats",
             repo_path="/tmp/cats",
@@ -138,8 +139,45 @@ class ConfigSummaryProtectionTests(unittest.TestCase):
 
         deduped = dedupe_entries([first_entry, second_entry])
 
-        self.assertEqual(len(deduped), 1)
-        self.assertEqual(deduped[0].diff_hash, "hash-two")
+        self.assertEqual([entry.diff_hash for entry in deduped], ["hash-one", "hash-two"])
+
+    def test_dedupe_keeps_cross_day_edits_with_similar_or_truncated_excerpts(self) -> None:
+        context = " unchanged context\n" * 800
+        first = EntryRecord(
+            repo_label="Cats",
+            repo_path="/tmp/cats",
+            created_at="2026-10-19T09:00:00",
+            day_name="Monday",
+            week_start_iso="2026-10-16T00:00:00",
+            summary="I updated reporting validation.",
+            diff_hash="full-diff-before",
+            diff_excerpt=f"+++ b/report.cs\n{context}+old_validation();\n",
+        )
+        for excerpt in (first.diff_excerpt.replace("old_validation", "new_validation"), first.diff_excerpt):
+            with self.subTest(identical_excerpt=excerpt == first.diff_excerpt):
+                second = replace(
+                    first,
+                    created_at="2026-10-20T09:00:00",
+                    day_name="Tuesday",
+                    diff_hash="full-diff-after",
+                    diff_excerpt=excerpt,
+                )
+                self.assertEqual(dedupe_entries([first, second]), [first, second])
+
+    def test_dedupe_skips_identical_cross_day_diff_only_in_same_repo(self) -> None:
+        first = EntryRecord(
+            repo_label="Cats",
+            repo_path="/tmp/cats",
+            created_at="2026-10-19T09:00:00",
+            day_name="Monday",
+            week_start_iso="2026-10-16T00:00:00",
+            summary="I updated reporting validation.",
+            diff_hash="same-full-diff",
+            diff_excerpt="+++ b/report.cs\n+validate();\n",
+        )
+        repeat = replace(first, created_at="2026-10-20T09:00:00", day_name="Tuesday")
+        other_repo = replace(repeat, repo_path="/tmp/other")
+        self.assertEqual(dedupe_entries([first, repeat, other_repo]), [first, other_repo])
 
     def test_load_startup_config_snapshot_reads_theme_and_repos_without_entries(self) -> None:
         payload = {

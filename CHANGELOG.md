@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026.10.20.0 - 2026-10-20
+
+### Fixed
+- Capture and saved-entry deduplication retain distinct full diffs instead of suppressing similar context or identical summary wording.
+- Removed fuzzy carry-over comparisons and redundant historical merge scans that delayed work-log updates.
+
+### Changed
+- Native app updates require rebuilding and replacing the installed app; updating the source checkout does not update an existing standalone bundle.
+
 ## 2026.10.8.0 - 2026-10-08
 
 ### Added

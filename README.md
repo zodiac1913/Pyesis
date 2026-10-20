@@ -12,7 +12,7 @@ Desktop tool for monitoring `git diff` activity across multiple repositories and
 
 - Add and remove repositories to monitor.
 - Periodically check for changed `git diff` output, skipping nested `cms-sqlLite-cats-source` copies so they are not treated as weekly work.
-- Check new captures for carry-over duplicates without repeating fuzzy comparisons across the entire saved history on every file save.
+- Skip identical full diffs already captured for a repository. Changed diffs are retained even when their context, summaries, or saved excerpts look the same; fuzzy carry-over comparisons no longer delay scans or suppress work.
 - Generate first-person summaries through a pluggable AI hook.
 - Choose AI provider and model per machine in Settings (for example, lighter or heavier Ollama models based on local hardware).
 - Group entries by day with `@DayName` markers and then by repository name (alphabetical).
@@ -46,6 +46,23 @@ Native zips from `scripts/build_native.py` or GitHub Releases are unsigned on pu
 
 - **Windows / Linux:** unzip and run the shipped executable.
 - **macOS:** Gatekeeper will complain because the `.app` is not notarized. That is Apple's tax on distribution, not a Pyesis defect. On the machine that built or downloaded it: control-click `Pyesis.app` and choose Open, or run `xattr -dr com.apple.quarantine dist/Pyesis.app`. Source launch (`python main.py`) does not need that dance.
+
+### Updating a standalone app
+
+A standalone app contains its own copy of Pyesis. Pulling source changes or fixing
+the checkout does **not** update a previously copied Desktop or Applications app.
+Quit the running app, replace that installed copy with the newly built/downloaded
+app, then launch it normally from Finder. Check the version in the window title.
+The live database stays in `~/PyesisState/`; do not replace or delete it.
+
+For a local build with PyInstaller installed in the project environment:
+
+```bash
+.venv/bin/python scripts/build_native.py --tag v2026.10.20.0
+```
+
+On macOS, the replacement is `dist/Pyesis.app`. Run that native app directly;
+an IDE is not required for normal use.
 
 ## AI configuration
 

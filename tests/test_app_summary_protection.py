@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 import tempfile
@@ -739,7 +740,7 @@ class AppSummaryProtectionTests(unittest.TestCase):
         self.assertEqual(app.config.entries[0].summary, existing.summary)
         self.assertEqual(app.config.entries[1].summary, candidate.summary)
 
-    def test_same_day_same_file_exact_same_summary_merges(self) -> None:
+    def test_same_day_same_file_exact_same_summary_preserves_distinct_diffs(self) -> None:
         app = self._make_app()
         existing = EntryRecord(
             repo_label="Cats",
@@ -769,8 +770,45 @@ class AppSummaryProtectionTests(unittest.TestCase):
 
         app._merge_or_append_captured_entry(candidate)
 
-        self.assertEqual(len(app.config.entries), 1)
-        self.assertEqual(app.config.entries[0].diff_hash, "hash-two")
+        self.assertEqual([entry.diff_hash for entry in app.config.entries], ["hash-one", "hash-two"])
+
+    def test_capture_preserves_cross_day_similar_and_truncated_diffs(self) -> None:
+        app = self._make_app()
+        repo = RepoConfig(path="/tmp/cats", label="Cats")
+        context = " unchanged context\n" * 800
+        previous = app._build_entry(
+            repo, datetime(2026, 10, 19, 9), "I updated reporting validation.",
+            f"+++ b/report.cs\n{context}+old_validation();\n",
+            "full-diff-before", "Backup", HEURISTIC_MODE,
+        )
+        app.config.entries = [previous]
+        for excerpt in (previous.diff_excerpt.replace("unchanged", "unchangeD", 1), previous.diff_excerpt):
+            with self.subTest(identical_excerpt=excerpt == previous.diff_excerpt):
+                candidate = replace(
+                    previous,
+                    created_at="2026-10-20T09:00:00",
+                    day_name="Tuesday",
+                    diff_hash="full-diff-after",
+                    diff_excerpt=excerpt,
+                )
+                with patch("difflib.SequenceMatcher", side_effect=AssertionError("Capture must not fuzzy-match")), patch.object(
+                    app, "_mark_ledger_shown"
+                ) as mark_shown:
+                    self.assertFalse(app._should_skip_captured_entry(repo, "report.cs", excerpt, candidate))
+                mark_shown.assert_not_called()
+
+    def test_capture_skips_identical_cross_day_diff(self) -> None:
+        app = self._make_app()
+        repo = RepoConfig(path="/tmp/cats", label="Cats")
+        previous = app._build_entry(
+            repo, datetime(2026, 10, 19, 9), "I updated reporting validation.",
+            "+++ b/report.cs\n+validate();\n", "same-full-diff", "Backup", HEURISTIC_MODE,
+        )
+        candidate = replace(previous, created_at="2026-10-20T09:00:00", day_name="Tuesday")
+        app.config.entries = [previous]
+        with patch.object(app, "_mark_ledger_shown") as mark_shown:
+            self.assertTrue(app._should_skip_captured_entry(repo, "report.cs", candidate.diff_excerpt, candidate))
+        mark_shown.assert_called_once_with(repo, candidate.diff_excerpt)
 
     def test_next_poll_interval_respects_repo_poll_seconds_even_with_backlog(self) -> None:
         app = self._make_app()

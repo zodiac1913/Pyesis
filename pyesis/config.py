@@ -3,7 +3,6 @@ from __future__ import annotations
 from calendar import monthrange
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
-from difflib import SequenceMatcher
 import hashlib
 import os
 from pathlib import Path
@@ -23,7 +22,6 @@ STATE_HOME_DIRNAME = "PyesisState"
 LEGACY_STATE_PATH = Path("pyesis_state.json")
 LEGACY_BUFFER_DIR = Path("diff_buffers")
 LEGACY_LOG_DIR = Path("logs")
-NEAR_DUP_DIFF_SIMILARITY_THRESHOLD = 0.80
 OLLAMA_DEFAULT_URL = "http://localhost:11434/api/chat"
 OLLAMA_DEFAULT_TIMEOUT_SECONDS = 180
 OLLAMA_DEFAULT_NUM_THREADS = 2
@@ -400,10 +398,9 @@ def _prune_entries(entries: list[EntryRecord], now: datetime | None = None) -> l
     return [entry for entry in entries if _retain_entry(entry, now)]
 
 
-def dedupe_entries(entries: list[EntryRecord], *, include_near_diff: bool = True) -> list[EntryRecord]:
+def dedupe_entries(entries: list[EntryRecord]) -> list[EntryRecord]:
     deduped: list[EntryRecord] = []
-    deduped_file_fp: list[list[str]] = []
-    seen_diff: set[tuple[str, str, str]] = set()
+    seen_diff: set[tuple[str, str]] = set()
     seen_legacy: set[tuple[str, str, str, str, str]] = set()
     seen_semantic: set[tuple[str, str, str, str, tuple[str, ...]]] = set()
     seen_synchronized: set[tuple[str, str, str]] = set()
@@ -413,8 +410,6 @@ def dedupe_entries(entries: list[EntryRecord], *, include_near_diff: bool = True
             continue
         if _is_synchronized_mirror_duplicate(entry, seen_synchronized):
             continue
-        if include_near_diff and _is_near_diff_duplicate(entry, deduped):
-            continue
         if _is_legacy_duplicate(entry, seen_legacy):
             continue
 
@@ -422,18 +417,18 @@ def dedupe_entries(entries: list[EntryRecord], *, include_near_diff: bool = True
         if _is_semantic_duplicate(entry, entry_fp, seen_semantic):
             continue
 
-        _merge_or_append_entry(entry, entry_fp, deduped, deduped_file_fp)
+        deduped.append(entry)
 
     return deduped
 
 
-def _is_diff_duplicate(entry: EntryRecord, seen_diff: set[tuple[str, str, str]]) -> bool:
+def _is_diff_duplicate(entry: EntryRecord, seen_diff: set[tuple[str, str]]) -> bool:
     diff_fingerprint = _entry_diff_fingerprint(entry)
     if not diff_fingerprint:
         return False
 
-    day_key = entry.created_at[:10] if len(entry.created_at) >= 10 else ""
-    diff_key = (entry.repo_path, day_key, diff_fingerprint)
+    # Hashes cover the full diff; similar or truncated excerpts cannot prove equality.
+    diff_key = (entry.repo_path, diff_fingerprint)
     if diff_key in seen_diff:
         return True
     seen_diff.add(diff_key)
@@ -514,43 +509,6 @@ def _excerpt_files_fingerprint(diff_excerpt: str) -> list[str]:
     return files[:16]
 
 
-def _is_near_diff_duplicate(entry: EntryRecord, deduped: list[EntryRecord]) -> bool:
-    excerpt = entry.diff_excerpt.strip()
-    entry_files = _entry_files_fingerprint(entry)
-    if not excerpt:
-        return False
-
-    for existing in reversed(deduped):
-        if not _same_repo_week_cross_day(existing, entry):
-            continue
-
-        existing_excerpt = existing.diff_excerpt.strip()
-        if not existing_excerpt:
-            continue
-        existing_files = _entry_files_fingerprint(existing)
-        if not _fingerprint_overlap(entry_files, existing_files):
-            continue
-
-        if _diff_similarity(excerpt, existing_excerpt) >= NEAR_DUP_DIFF_SIMILARITY_THRESHOLD:
-            return True
-    return False
-
-
-def _same_repo_week_cross_day(existing: EntryRecord, entry: EntryRecord) -> bool:
-    if existing.repo_path != entry.repo_path:
-        return False
-    if existing.week_start_iso != entry.week_start_iso:
-        return False
-
-    existing_day = existing.created_at[:10] if len(existing.created_at) >= 10 else ""
-    entry_day = entry.created_at[:10] if len(entry.created_at) >= 10 else ""
-    return bool(existing_day and entry_day and existing_day != entry_day)
-
-
-def _diff_similarity(left_excerpt: str, right_excerpt: str) -> float:
-    return SequenceMatcher(None, left_excerpt, right_excerpt).ratio()
-
-
 def _is_legacy_duplicate(entry: EntryRecord, seen_legacy: set[tuple[str, str, str, str, str]]) -> bool:
     legacy_key = (
         entry.repo_path,
@@ -586,53 +544,6 @@ def _is_semantic_duplicate(
     return False
 
 
-def _merge_or_append_entry(
-    entry: EntryRecord,
-    entry_fp: list[str],
-    deduped: list[EntryRecord],
-    deduped_file_fp: list[list[str]],
-) -> None:
-    entry_diff = _entry_diff_fingerprint(entry)
-    if entry_fp:
-        for idx, existing in enumerate(deduped):
-            if (
-                existing.repo_path == entry.repo_path
-                and existing.week_start_iso == entry.week_start_iso
-                and existing.day_name == entry.day_name
-                and _fingerprint_overlap(entry_fp, deduped_file_fp[idx])
-            ):
-                if _same_summary_duplicate(existing, entry):
-                    existing_source = (existing.summary_source or "").strip().lower()
-                    entry_source = (entry.summary_source or "").strip().lower()
-                    if existing_source != "heuristic" and entry_source == "heuristic":
-                        return
-                    deduped[idx] = entry
-                    deduped_file_fp[idx] = entry_fp
-                    return
-                existing_diff = _entry_diff_fingerprint(existing)
-                if not entry_diff or not existing_diff or entry_diff != existing_diff:
-                    continue
-                existing_source = (existing.summary_source or "").strip().lower()
-                entry_source = (entry.summary_source or "").strip().lower()
-                if existing_source != "heuristic" and entry_source == "heuristic":
-                    return
-                deduped[idx] = entry
-                deduped_file_fp[idx] = entry_fp
-                return
-
-    deduped.append(entry)
-    deduped_file_fp.append(entry_fp)
-
-
-def _same_summary_duplicate(existing: EntryRecord, candidate: EntryRecord) -> bool:
-    return _normalized_repeat_summary(existing.summary) == _normalized_repeat_summary(candidate.summary)
-
-
-def _normalized_repeat_summary(summary: str) -> str:
-    cleaned = re.sub(r"\s+", " ", summary.strip().lower())
-    return cleaned.rstrip(".")
-
-
 def _summary_prefix40_normalized(summary: str) -> str:
     cleaned = summary.lower()
     cleaned = re.sub(r"\bacross\s+\d+\s+files?\b", "across files", cleaned)
@@ -654,27 +565,6 @@ def _summary_files_fingerprint(summary: str) -> list[str]:
             if path and path not in files:
                 files.append(path.lower())
     return files[:8]
-
-
-def _fingerprint_overlap(current: list[str], previous: list[str]) -> bool:
-    if not current or not previous:
-        return False
-
-    current_set = set(current)
-    previous_set = set(previous)
-    intersect = current_set & previous_set
-    if not intersect:
-        return False
-
-    # Treat subset/superset as the same rolling change series.
-    if current_set <= previous_set or previous_set <= current_set:
-        return True
-
-    union_size = len(current_set | previous_set)
-    if union_size == 0:
-        return False
-    jaccard = len(intersect) / union_size
-    return jaccard >= 0.6
 
 
 def _decode_repo(item: dict[str, Any]) -> RepoConfig:
@@ -877,7 +767,7 @@ def load_config(state_path: Path | None = None) -> AppConfig:
     raw_entries = [_decode_entry(item) for item in raw_entry_items]
     retained_entries = _prune_entries(raw_entries)
     visible_entries = [entry for entry in retained_entries if deleted_entry_key_for_entry(entry) not in deleted_entry_keys]
-    entries = _drop_noise_entries(dedupe_entries(visible_entries, include_near_diff=False))
+    entries = _drop_noise_entries(dedupe_entries(visible_entries))
     config = _base_config_from_data(data, entries, deleted_entries)
     if (
         _should_rewrite_saved_entries(raw_entries, entries, raw_entry_items)
@@ -896,12 +786,10 @@ def save_config(config: AppConfig, state_path: Path | None = None) -> None:
     resolved = state_path or STATE_PATH
     config.deleted_entries = _prune_deleted_entries(config.deleted_entries)
     deleted_entry_keys = {entry.key for entry in config.deleted_entries}
-    # Capture already checks new diffs for carry-over duplicates. Rechecking all
-    # historical pairs on every file save stalls scans before later repos run.
+    # Persist exact deduplication only; fuzzy matching can discard real edits.
     config.entries = _drop_noise_entries(
         dedupe_entries(
             [entry for entry in _prune_entries(config.entries) if deleted_entry_key_for_entry(entry) not in deleted_entry_keys],
-            include_near_diff=False,
         )
     )
     write_config(config, resolved)
