@@ -428,7 +428,8 @@ class AppSummaryProtectionTests(unittest.TestCase):
         )
         app.config.entries = [entry]
         app._apply_ai_environment_defaults = lambda: None
-        app._docx_output_dir = lambda: Path("/tmp/pyesis-docx")
+        output_dir = Path(tempfile.mkdtemp())
+        app._docx_output_dir = lambda: output_dir
         app._open_created_document = lambda _target: None
 
         def fake_build(_evidence_text, *, model_override=None):
@@ -504,7 +505,8 @@ class AppSummaryProtectionTests(unittest.TestCase):
         export_results: list[object] = []
         opened: list[Path] = []
         app._apply_ai_environment_defaults = lambda: export_results.append("env")
-        app._docx_output_dir = lambda: Path("/tmp/pyesis-docx")
+        output_dir = Path(tempfile.mkdtemp())
+        app._docx_output_dir = lambda: output_dir
         app._open_created_document = lambda target: opened.append(target)
 
         with patch("pyesis.app.render_weekly_evidence_text", return_value="Day: Monday\nRepo: Pyesis\n- Summary: Added prompt"), patch(
@@ -525,8 +527,12 @@ class AppSummaryProtectionTests(unittest.TestCase):
         self.assertEqual(mock_build.call_args.args[0], "Day: Monday\nRepo: Pyesis\n- Summary: Added prompt")
         self.assertEqual(mock_build.call_args.kwargs["model_override"], "qwen2.5-coder:latest")
         self.assertEqual(mock_export.call_args.args[0], "Monday\nPyesis\nDetailed weekly report.")
-        self.assertEqual(mock_export.call_args.args[1], Path("/tmp/pyesis-docx"))
+        self.assertEqual(mock_export.call_args.args[1], output_dir)
         self.assertEqual(mock_export.call_args.args[2], "2026-06-26T00:00:00")
+        day_export = mock_export.call_args_list[0]
+        self.assertEqual(day_export.args[1], output_dir / "AIWeeklyDays" / "2026-06-26")
+        self.assertEqual(day_export.kwargs["file_name"], "2026-06-29-Monday.odt")
+        self.assertTrue((output_dir / "AIWeeklyDays" / "2026-06-26" / "2026-06-29-Monday.json").exists())
         self.assertEqual(app.status_var.get(), "AI weekly report exported to WhatIDidThisWeek20260826.odt")
         self.assertEqual(opened, [Path("/tmp/pyesis-docx/WhatIDidThisWeek20260826.odt")])
         self.assertTrue(mock_info.called)

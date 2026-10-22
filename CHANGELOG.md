@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026.10.22.0 - 2026-10-22
+
+### Changed
+- AI Weekly caches each day's report as `.odt` + `.json` under `AIWeeklyDays/<week start>/` in the export folder. On startup, Pyesis pre-generates missing past days back to Sunday (excluding today), so AI Weekly only generates new or changed days and merges the rest.
+
 ## 2026.10.20.0 - 2026-10-20
 
 ### Fixed

@@ -85,6 +85,7 @@ from pyesis.github_auth import (
 from pyesis.git_monitor import DiffSnapshot, capture_snapshot, github_repo_name, is_noise_work_text, should_skip_work_diff, split_diff_by_file, summarize_file_changes, validate_repo
 from pyesis.summary_enhancer import run_periodic_enhancer
 from pyesis.week_archive import archive_completed_weeks
+from pyesis.ai_weekly_days import DayEvidence, build_week_from_days, days_to_prefill, ensure_day_report, split_week_evidence
 
 
 DIFF_EXCERPT_LIMIT = 12_000
@@ -1171,6 +1172,7 @@ class PyesisApp:
         self._refresh_editor()
         self._clear_startup_loading_message()
         self._queue_startup_poll()
+        self._start_ai_weekly_day_prefill()
 
     def _setup_editor_background(self) -> None:
         watermark_names = ("assets/Pyesis-watermark.png", "assets/pyesis-watermark.png")
@@ -4612,10 +4614,57 @@ class PyesisApp:
         self._file_task_in_flight = False
         self._set_long_process_buttons_busy(False)
 
+    def _ai_weekly_day_callbacks(self, model: str):
+        def build_day(chunk: str) -> AIWeeklyReportResult:
+            return build_weekly_report(chunk, model_override=model)
+
+        def export_day(text: str, directory: Path, week_start_iso: str, provider: str, file_name: str) -> Path:
+            return export_ai_weekly_report_odt(text, directory, week_start_iso, provider_details=provider, file_name=file_name)
+
+        return build_day, export_day
+
+    def _start_ai_weekly_day_prefill(self) -> None:
+        """Generate past days of this week (back to Sunday, excluding today) so AI Weekly only builds today."""
+        try:
+            evidence_text = render_weekly_evidence_text(self.config)
+        except Exception:
+            return
+        week_start = self._active_week_start().date()
+        days = days_to_prefill(split_week_evidence(evidence_text, week_start), datetime.now().date())
+        if not days:
+            return
+        model = self.config.ai_ollama_model.strip() or DEFAULT_OLLAMA_WEEKLY_REPORT_MODEL
+        threading.Thread(
+            target=self._ai_weekly_day_prefill_worker,
+            args=(days, week_start, self._docx_output_dir(), model),
+            daemon=True,
+        ).start()
+
+    def _ai_weekly_day_prefill_worker(self, days: list[DayEvidence], week_start, output_dir: Path, model: str) -> None:
+        build_day, export_day = self._ai_weekly_day_callbacks(model)
+        generated = 0
+        for day in days:
+            try:
+                _text, _provider, was_generated = ensure_day_report(output_dir, week_start, day, build_day, export_day)
+            except Exception as exc:
+                message = f"AI weekly prep for {day.day_name} failed: {exc}"
+                self._post_to_ui(lambda text=message: self.status_var.set(text))
+                return
+            generated += int(was_generated)
+        if generated:
+            message = f"AI weekly prep: {generated} past day(s) ready"
+            self._post_to_ui(lambda text=message: self.status_var.set(text))
+
     def _build_ai_weekly_report_worker(self, evidence_text: str, week_start_iso: str, output_dir: Path) -> None:
         try:
             model = self.config.ai_ollama_model.strip() or DEFAULT_OLLAMA_WEEKLY_REPORT_MODEL
-            result = build_weekly_report(evidence_text, model_override=model)
+            week_start = datetime.fromisoformat(week_start_iso).date()
+            days = split_week_evidence(evidence_text, week_start)
+            if days:
+                build_day, export_day = self._ai_weekly_day_callbacks(model)
+                result, _generated = build_week_from_days(days, output_dir, week_start, build_day, export_day)
+            else:
+                result = build_weekly_report(evidence_text, model_override=model)
             target = export_ai_weekly_report_odt(
                 result.text,
                 output_dir,
