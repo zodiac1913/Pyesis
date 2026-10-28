@@ -178,22 +178,22 @@ class AppSummaryProtectionTests(unittest.TestCase):
         app._refresh_editor = lambda: None
         return app
 
-    def test_export_docx_exports_and_opens_document(self) -> None:
+    def test_export_odt_exports_and_opens_document(self) -> None:
         app = self._make_app()
         opened: list[Path] = []
         app._persist = lambda: None
         app._docx_output_dir = lambda: Path("/tmp/pyesis-docx")
         app._open_created_document = lambda target: opened.append(target)
 
-        with patch("pyesis.app.export_docx", return_value=Path("/tmp/pyesis-docx/weekly_changes_20260702_120000.docx")) as mock_export, patch(
+        with patch("pyesis.app.export_odt", return_value=Path("/tmp/pyesis-docx/weekly_changes_20260702_120000.odt")) as mock_export, patch(
             "pyesis.app.messagebox.showinfo"
         ) as mock_info:
-            app._export_docx()
+            app._export_odt()
 
         self.assertEqual(mock_export.call_args.args[0], app.config)
         self.assertEqual(mock_export.call_args.args[1], Path("/tmp/pyesis-docx"))
-        self.assertEqual(app.status_var.get(), "Exported weekly_changes_20260702_120000.docx")
-        self.assertEqual(opened, [Path("/tmp/pyesis-docx/weekly_changes_20260702_120000.docx")])
+        self.assertEqual(app.status_var.get(), "Exported weekly_changes_20260702_120000.odt")
+        self.assertEqual(opened, [Path("/tmp/pyesis-docx/weekly_changes_20260702_120000.odt")])
         self.assertTrue(mock_info.called)
 
     def test_export_week_json_uses_pyesis_date_filename(self) -> None:
@@ -527,12 +527,12 @@ class AppSummaryProtectionTests(unittest.TestCase):
         self.assertEqual(mock_build.call_args.args[0], "Day: Monday\nRepo: Pyesis\n- Summary: Added prompt")
         self.assertEqual(mock_build.call_args.kwargs["model_override"], "qwen2.5-coder:latest")
         self.assertEqual(mock_export.call_args.args[0], "Monday\nPyesis\nDetailed weekly report.")
-        self.assertEqual(mock_export.call_args.args[1], output_dir)
+        self.assertEqual(mock_export.call_args.args[1], output_dir / "AIWeeklyReports")
         self.assertEqual(mock_export.call_args.args[2], "2026-06-26T00:00:00")
         day_export = mock_export.call_args_list[0]
         self.assertEqual(day_export.args[1], output_dir / "AIWeeklyDays" / "2026-06-26")
-        self.assertEqual(day_export.kwargs["file_name"], "2026-06-29-Monday.odt")
-        self.assertTrue((output_dir / "AIWeeklyDays" / "2026-06-26" / "2026-06-29-Monday.json").exists())
+        self.assertEqual(day_export.kwargs["file_name"], "2026-06-29.odt")
+        self.assertTrue((output_dir / "AIWeeklyDays" / "2026-06-26" / "2026-06-29.json").exists())
         self.assertEqual(app.status_var.get(), "AI weekly report exported to WhatIDidThisWeek20260826.odt")
         self.assertEqual(opened, [Path("/tmp/pyesis-docx/WhatIDidThisWeek20260826.odt")])
         self.assertTrue(mock_info.called)
@@ -1146,7 +1146,6 @@ class AppSummaryProtectionTests(unittest.TestCase):
         app._startup_recovery_known_duplicates = set()
         app._save_config_snapshot_async = lambda: self.fail("deleted entries should not be restored")
         app._set_startup_loading_message = lambda _message: None
-        app._maybe_auto_export_daily = lambda: None
         finished: list[str] = []
         app._finish_startup_load = lambda: finished.append("done")
 

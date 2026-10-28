@@ -18,9 +18,8 @@ Desktop tool for monitoring `git diff` activity across multiple repositories and
 - Group entries by day with `@DayName` markers and then by repository name (alphabetical).
 - Edit one saved summary entry at a time when you need to correct wording or add detail.
 - Start each Monday with blank spacing and a weekly header.
-- Export the current log to `.docx`.
+- Export the current log to `.odt`.
 - Generate the AI Weekly Report as a structured `.odt` document, organized by day and repository.
-- Optional daily auto-export at a configured time from Settings, saved as `YYYYMMMddPyesis.docx`.
 - Settings include a configurable document export folder, so generated files do not need to live inside the repo.
 - Accessibility options in Settings: high contrast mode and adjustable UI font size.
 - Keyboard shortcuts for common actions (Settings, README, GitHub, add/remove/check/export repo actions).

@@ -11,8 +11,8 @@ import re
 from docx import Document
 from docx.shared import Inches
 from odf.opendocument import OpenDocumentText
-from odf.style import ParagraphProperties, Style, TextProperties
-from odf.text import List, ListItem, P
+from odf.style import ListLevelLabelAlignment, ListLevelProperties, ParagraphProperties, Style, TextProperties
+from odf.text import List, ListItem, ListLevelStyleBullet, ListStyle, P
 
 from pyesis.config import AppConfig, EntryRecord
 from pyesis.git_monitor import FileChangeSummary, is_noise_work_text, should_skip_work_diff, summarize_file_changes
@@ -308,45 +308,104 @@ def _is_heuristic_entry(entry: EntryRecord) -> bool:
     return entry.author == "Backup"
 
 
-def export_docx(config: AppConfig, output_dir: Path, file_name: str | None = None) -> Path:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    document = Document()
-    active_week_start_iso, active_week_entries = _active_week_entries(config.entries, config.week_end_day)
-    _write_week_block(document, active_week_start_iso, active_week_entries)
+BULLET_LIST_STYLE_NAME = "PyesisBullets"
+BULLET_CHARACTERS = ("\u2022", "\u25e6", "\u25aa")
 
-    if file_name:
-        target = output_dir / file_name
-    else:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        target = output_dir / f"weekly_changes_{timestamp}.docx"
+
+def _add_bullet_list_style(document: OpenDocumentText, base_indent: float = 0.0) -> ListStyle:
+    """Three-level bullet list style; indents (inches) live on the list level, not the paragraphs.
+
+    Uses ODF 1.2 label-alignment so Word and LibreOffice agree. Word adds paragraph margins to
+    list indents, so paragraphs inside these lists must not set their own margin-left.
+    """
+    list_style = ListStyle(name=BULLET_LIST_STYLE_NAME)
+    for level, bullet in enumerate(BULLET_CHARACTERS, start=1):
+        bullet_position = base_indent + 0.25 * (level - 1)
+        level_style = ListLevelStyleBullet(level=level, bulletchar=bullet)
+        properties = ListLevelProperties(listlevelpositionandspacemode="label-alignment")
+        properties.addElement(
+            ListLevelLabelAlignment(
+                labelfollowedby="listtab",
+                textindent="-0.25in",
+                marginleft=f"{bullet_position + 0.25:.2f}in",
+            )
+        )
+        level_style.addElement(properties)
+        list_style.addElement(level_style)
+    document.styles.addElement(list_style)
+    return list_style
+
+
+def _bullet_item(list_style: ListStyle, text: str, paragraph_style: Style | None = None) -> tuple[List, ListItem]:
+    """Return (list, item); children go in the item as nested lists."""
+    bullet_list = List(stylename=list_style)
+    item = ListItem()
+    item.addElement(P(text=text, stylename=paragraph_style) if paragraph_style else P(text=text))
+    bullet_list.addElement(item)
+    return bullet_list, item
+
+
+def export_odt(config: AppConfig, output_dir: Path, file_name: str | None = None) -> Path:
+    """Export the active week's log as a formatted .odt: day headings, repo bullets, nested detail bullets."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    document = OpenDocumentText()
+    heading_style = Style(name="PyesisTitle", family="paragraph")
+    heading_style.addElement(ParagraphProperties(textalign="center"))
+    heading_style.addElement(TextProperties(fontsize="18pt", fontweight="bold"))
+    document.styles.addElement(heading_style)
+    day_style = Style(name="PyesisDay", family="paragraph")
+    day_style.addElement(TextProperties(fontsize="14pt", fontweight="bold"))
+    document.styles.addElement(day_style)
+    repo_style = Style(name="PyesisRepo", family="paragraph")
+    repo_style.addElement(TextProperties(fontweight="bold"))
+    document.styles.addElement(repo_style)
+    intro_style = Style(name="PyesisIntro", family="paragraph")
+    intro_style.addElement(ParagraphProperties(marginbottom="0.1in"))
+    document.styles.addElement(intro_style)
+    list_style = _add_bullet_list_style(document)
+
+    week_start_iso, day_map = _active_week_entries(config.entries, config.week_end_day)
+    week_end = _week_end_date(datetime.fromisoformat(week_start_iso))
+    document.text.addElement(P(text=f"Weekly Report ({week_end.strftime('%Y %b %d')})", stylename=heading_style))
+    document.text.addElement(P(text="What I worked on for this week:", stylename=intro_style))
+
+    for day_name in DAY_ORDER:
+        entries = day_map.get(day_name)
+        if not entries:
+            continue
+        document.text.addElement(P(text=day_name, stylename=day_style))
+        for repo_label, repo_entries in _group_entries_by_repo(entries).items():
+            repo_list, repo_item = _bullet_item(list_style, f"{repo_label}:", repo_style)
+            _write_repo_entries_odt(repo_item, list_style, repo_entries)
+            document.text.addElement(repo_list)
+
+    target = output_dir / (file_name or f"weekly_changes_{datetime.now().strftime('%Y%m%d_%H%M%S')}.odt")
     document.save(target)
     return target
 
 
-def export_ai_weekly_report_docx(
-    report_text: str,
-    output_dir: Path,
-    week_start_iso: str,
-    provider_details: str = "",
-    file_name: str | None = None,
-) -> Path:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    document = Document()
-    week_start = datetime.fromisoformat(week_start_iso)
-    week_end = _week_end_date(week_start)
+def _write_repo_entries_odt(repo_item: ListItem, list_style: ListStyle, repo_entries: list[EntryRecord]) -> None:
+    """Nesting depth sets the bullet level: entries are level 2; continuation lines, evidence and change details level 3."""
+    entries_list = List(stylename=list_style)
+    for entry in repo_entries:
+        lines = _summary_lines(_summary_body_text(entry.summary, entry.diff_excerpt))
+        details = lines[1:]
+        evidence = _entry_evidence_line(entry)
+        if evidence:
+            details.append(f"Evidence: {evidence}")
+        details.extend(f"{label}: {change_line}" for label, change_line in _change_detail_lines(entry.diff_excerpt))
 
-    document.add_heading(f"AI Weekly Report ({week_end.strftime('%Y %b %d')})", level=1)
-    if provider_details.strip():
-        document.add_paragraph(f"Generated with {provider_details.strip()}")
-
-    _write_ai_weekly_report(document, report_text)
-
-    if file_name:
-        target = output_dir / file_name
-    else:
-        target = output_dir / f"WhatIDidThisWeek{datetime.now().strftime('%Y%m%d')}.docx"
-    document.save(target)
-    return target
+        entry_item = ListItem()
+        entry_item.addElement(P(text=lines[0]))
+        if details:
+            detail_list = List(stylename=list_style)
+            for detail in details:
+                detail_item = ListItem()
+                detail_item.addElement(P(text=detail))
+                detail_list.addElement(detail_item)
+            entry_item.addElement(detail_list)
+        entries_list.addElement(entry_item)
+    repo_item.addElement(entries_list)
 
 
 def export_ai_weekly_report_odt(
@@ -358,26 +417,34 @@ def export_ai_weekly_report_odt(
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     document = OpenDocumentText()
-    heading_style = Style(name="AIWeeklyHeading", family="paragraph", parentstylename="Heading 1")
+    heading_style = Style(name="AIWeeklyHeading", family="paragraph")
+    heading_style.addElement(ParagraphProperties(textalign="center"))
     heading_style.addElement(TextProperties(fontsize="18pt", fontweight="bold"))
     document.styles.addElement(heading_style)
-    day_style = Style(name="AIWeeklyDay", family="paragraph", parentstylename="Heading 2")
+    subtitle_style = Style(name="AIWeeklySubtitle", family="paragraph")
+    subtitle_style.addElement(ParagraphProperties(textalign="center", marginbottom="0.15in"))
+    document.styles.addElement(subtitle_style)
+    # Days, repos and bullets step in by 0.25in each (1st, 2nd, 3rd indent).
+    day_style = Style(name="AIWeeklyDay", family="paragraph")
+    day_style.addElement(ParagraphProperties(marginleft="0.25in"))
     day_style.addElement(TextProperties(fontsize="14pt", fontweight="bold"))
     document.styles.addElement(day_style)
-    repo_style = Style(name="AIWeeklyRepo", family="paragraph", parentstylename="Heading 3")
+    repo_style = Style(name="AIWeeklyRepo", family="paragraph")
+    repo_style.addElement(ParagraphProperties(marginleft="0.5in"))
     repo_style.addElement(TextProperties(fontsize="12pt", fontweight="bold"))
     document.styles.addElement(repo_style)
     body_style = Style(name="AIWeeklyBody", family="paragraph")
     body_style.addElement(ParagraphProperties(marginbottom="0.08in"))
     document.styles.addElement(body_style)
+    list_style = _add_bullet_list_style(document, base_indent=0.75)
 
     week_start = datetime.fromisoformat(week_start_iso)
     week_end = _week_end_date(week_start)
     document.text.addElement(P(text=f"AI Weekly Report ({week_end.strftime('%Y %b %d')})", stylename=heading_style))
     if provider_details.strip():
-        document.text.addElement(P(text=f"Generated with {provider_details.strip()}", stylename=body_style))
+        document.text.addElement(P(text=f"Generated with {provider_details.strip()}", stylename=subtitle_style))
 
-    _write_ai_weekly_report_odt(document, report_text, day_style, repo_style, body_style)
+    _write_ai_weekly_report_odt(document, report_text, day_style, repo_style, body_style, list_style)
 
     target = output_dir / (file_name or f"WhatIDidThisWeek{datetime.now().strftime('%Y%m%d')}.odt")
     document.save(target)
@@ -390,14 +457,23 @@ def _write_ai_weekly_report_odt(
     day_style: Style,
     repo_style: Style,
     body_style: Style,
+    list_style: ListStyle,
 ) -> None:
     paragraph_parts: list[str] = []
     current_list: List | None = None
 
+    def add_bullet(text: str) -> None:
+        nonlocal current_list
+        if current_list is None:
+            current_list = List(stylename=list_style)
+        item = ListItem()
+        item.addElement(P(text=text, stylename=body_style))
+        current_list.addElement(item)
+
     def flush_paragraph() -> None:
         nonlocal paragraph_parts
         if paragraph_parts:
-            document.text.addElement(P(text=" ".join(paragraph_parts).strip(), stylename=body_style))
+            add_bullet(" ".join(paragraph_parts).strip())
             paragraph_parts = []
 
     def flush_list() -> None:
@@ -446,12 +522,8 @@ def _write_ai_weekly_report_odt(
         list_item = _weekly_report_list_item(stripped)
         if list_item:
             flush_paragraph()
-            if current_list is None:
-                current_list = List()
             _, body = list_item
-            item = ListItem()
-            item.addElement(P(text=_clean_weekly_report_item_text(body), stylename=body_style))
-            current_list.addElement(item)
+            add_bullet(_clean_weekly_report_item_text(body))
             continue
 
         paragraph_parts.append(_clean_weekly_report_item_text(_clean_weekly_report_inline_text(stripped)))

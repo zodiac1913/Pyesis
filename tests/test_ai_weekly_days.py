@@ -6,7 +6,7 @@ import tempfile
 import unittest
 
 from pyesis.ai_summary import AIWeeklyReportResult
-from pyesis.ai_weekly_days import build_week_from_days, days_to_prefill, ensure_day_report, split_week_evidence
+from pyesis.ai_weekly_days import build_week_from_days, day_cache_dir, days_missing, days_to_save, ensure_day_report, split_week_evidence
 
 
 EVIDENCE = (
@@ -45,14 +45,19 @@ class AIWeeklyDaysTests(unittest.TestCase):
             ],
         )
 
-    def test_prefill_stops_at_sunday_and_skips_today(self) -> None:
+    def test_days_to_save_includes_today_and_skips_future(self) -> None:
         days = split_week_evidence(EVIDENCE, WEEK_START)
-        prefill = days_to_prefill(days, date(2026, 10, 22))
-        self.assertEqual([day.day_name for day in prefill], ["Monday", "Tuesday"])
+        saved = days_to_save(days, date(2026, 10, 20))
+        self.assertEqual([day.day_name for day in saved], ["Friday", "Monday", "Tuesday"])
 
-    def test_prefill_on_sunday_is_empty(self) -> None:
+    def test_missing_days_are_past_days_without_saved_json(self) -> None:
         days = split_week_evidence(EVIDENCE, WEEK_START)
-        self.assertEqual(days_to_prefill(days, date(2026, 10, 18)), [])
+        ensure_day_report(self.output_dir, WEEK_START, days[1], self.build_day, self.export_day)
+        missing = days_missing(days, self.output_dir, WEEK_START, date(2026, 10, 22))
+        self.assertEqual([day.day_name for day in missing], ["Friday", "Tuesday"])
+
+    def test_week_folder_is_week_start(self) -> None:
+        self.assertEqual(day_cache_dir(self.output_dir, WEEK_START), self.output_dir / "AIWeeklyDays" / "2026-10-16")
 
     def test_cached_day_is_reused_and_stale_day_regenerates(self) -> None:
         monday = split_week_evidence(EVIDENCE, WEEK_START)[1]
@@ -69,22 +74,25 @@ class AIWeeklyDaysTests(unittest.TestCase):
         self.assertTrue(generated)
         self.assertEqual(len(self.built), 2)
 
-    def test_build_week_only_generates_missing_days_and_merges_in_order(self) -> None:
+    def test_build_week_merges_saved_json_omits_missing_and_generates_today(self) -> None:
         days = split_week_evidence(EVIDENCE, WEEK_START)
-        for day in days_to_prefill(days, date(2026, 10, 22)):
+        today = date(2026, 10, 22)
+        for day in days[1:3]:
             ensure_day_report(self.output_dir, WEEK_START, day, self.build_day, self.export_day)
+        # A past day's JSON is used even if its evidence changed since it was saved.
+        changed = split_week_evidence(EVIDENCE.replace("Monday work", "Monday more work"), WEEK_START)
         self.built.clear()
 
-        result, generated = build_week_from_days(days, self.output_dir, WEEK_START, self.build_day, self.export_day)
+        result, generated = build_week_from_days(changed, self.output_dir, WEEK_START, self.build_day, self.export_day, today)
 
-        self.assertEqual(generated, 2)
-        self.assertEqual([chunk.split("\n", 1)[0] for chunk in self.built], ["Day: Friday", "Day: Thursday"])
+        self.assertEqual(generated, 1)
+        self.assertEqual([chunk.split("\n", 1)[0] for chunk in self.built], ["Day: Thursday"])
         self.assertEqual(
             [line for line in result.text.split("\n") if line.startswith("Day:")],
-            ["Day: Friday", "Day: Monday", "Day: Tuesday", "Day: Thursday"],
+            ["Day: Monday", "Day: Tuesday", "Day: Thursday"],
         )
         self.assertEqual(result.provider_details, "model-x")
-        self.assertIn("2026-10-19-Monday.odt", self.exported)
+        self.assertIn("2026-10-19.odt", self.exported)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+- All exports are `.odt`. Export ODT writes day headings with nested repo/entry/detail bullets, and AI Weekly ODT lists now carry a real bullet style. The daily `.docx` auto-export was removed.
+- Closing Pyesis (window close or Cmd+Q) now shows "Saving daily work, please wait..." and saves each day's `.odt` + `.json` under `AIWeeklyDays/<week start>/` (named `YYYY-MM-DD`) before exiting. On startup, past days of the week with no saved JSON are written in the background.
+- AI Weekly merges the saved day JSON text without calling Ollama for past days; days with no saved JSON are omitted. Only today is generated if it was not saved yet.
+
 ## 2026.10.22.0 - 2026-10-22
 
 ### Changed

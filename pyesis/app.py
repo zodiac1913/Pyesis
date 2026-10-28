@@ -65,7 +65,7 @@ from pyesis.instance_lock import (
     fatal_error_message,
     show_startup_dialog,
 )
-from pyesis.document_formatter import RenderedTextChunk, export_ai_weekly_report_odt, export_docx, render_plain_text, render_text_chunks, render_weekly_evidence_text
+from pyesis.document_formatter import RenderedTextChunk, export_ai_weekly_report_odt, export_odt, render_plain_text, render_text_chunks, render_weekly_evidence_text
 from pyesis.github_auth import (
     GITHUB_DOTCOM_AUTH_MODE,
     GITHUB_ENTERPRISE_AUTH_MODE,
@@ -85,7 +85,7 @@ from pyesis.github_auth import (
 from pyesis.git_monitor import DiffSnapshot, capture_snapshot, github_repo_name, is_noise_work_text, should_skip_work_diff, split_diff_by_file, summarize_file_changes, validate_repo
 from pyesis.summary_enhancer import run_periodic_enhancer
 from pyesis.week_archive import archive_completed_weeks
-from pyesis.ai_weekly_days import DayEvidence, build_week_from_days, days_to_prefill, ensure_day_report, split_week_evidence
+from pyesis.ai_weekly_days import DayEvidence, WEEKLY_REPORTS_DIR_NAME, build_week_from_days, days_missing, days_to_save, ensure_day_report, split_week_evidence
 
 
 DIFF_EXCERPT_LIMIT = 12_000
@@ -896,7 +896,7 @@ class PyesisApp:
         theme_box.grid(row=13, column=0, sticky="ew", pady=(6, 12))
         theme_box.bind("<<ComboboxSelected>>", self._on_theme_changed)
 
-        ttk.Button(sidebar, text="Export DOCX", underline=0, command=self._export_docx).grid(row=14, column=0, sticky="ew", pady=(6, 0))
+        ttk.Button(sidebar, text="Export ODT", underline=0, command=self._export_odt).grid(row=14, column=0, sticky="ew", pady=(6, 0))
         ttk.Button(sidebar, text="Edit Entry", underline=0, command=self._open_entry_editor).grid(row=15, column=0, sticky="ew", pady=(6, 0))
         self.export_week_json_button = ttk.Button(sidebar, text=EXPORT_WEEK_JSON_BUTTON_TEXT, underline=7, command=self._export_week_json)
         self.export_week_json_button.grid(row=16, column=0, sticky="ew", pady=(6, 0))
@@ -943,7 +943,7 @@ class PyesisApp:
         ai_log_button.grid(row=0, column=6, sticky="e", padx=(6, 0))
 
         ToolTip(github_button, "Open GitHub Repository (Ctrl+Shift+G)")
-        ToolTip(docs_button, lambda: f"Pyesis docx file folder ({self._docx_output_dir()})")
+        ToolTip(docs_button, lambda: f"Pyesis export folder ({self._docx_output_dir()})")
         ToolTip(self.ai_weekly_button, "AI Weekly Report from Ollama")
         ToolTip(info_button, "Open README (F1)")
         ToolTip(self.settings_button, "Settings (Ctrl+,)")
@@ -1156,8 +1156,6 @@ class PyesisApp:
         if self._startup_recovery_recovered:
             self._save_config_snapshot_async()
 
-        self._set_startup_loading_message("Checking auto-export...")
-        self._maybe_auto_export_daily()
         self._set_startup_loading_message("Scheduling background scans...")
         self._finish_startup_load()
 
@@ -1172,7 +1170,7 @@ class PyesisApp:
         self._refresh_editor()
         self._clear_startup_loading_message()
         self._queue_startup_poll()
-        self._start_ai_weekly_day_prefill()
+        self._start_missing_day_save()
 
     def _setup_editor_background(self) -> None:
         watermark_names = ("assets/Pyesis-watermark.png", "assets/pyesis-watermark.png")
@@ -1204,7 +1202,7 @@ class PyesisApp:
         self.root.bind_all("<Alt-a>", lambda _e: self._add_or_update_repo())
         self.root.bind_all("<Alt-r>", lambda _e: self._remove_selected_repo())
         self.root.bind_all("<Alt-c>", lambda _e: self.run_poll_once())
-        self.root.bind_all("<Alt-e>", lambda _e: self._export_docx())
+        self.root.bind_all("<Alt-e>", lambda _e: self._export_odt())
         self.root.bind_all("<Alt-d>", lambda _e: self._open_entry_editor())
         self.root.bind_all("<Alt-x>", lambda _e: self._export_week_json())
         self.root.bind_all("<Alt-j>", lambda _e: self._import_week_json())
@@ -1921,7 +1919,7 @@ class PyesisApp:
 
     def _browse_export_directory(self, export_dir_var: tk.StringVar) -> None:
         selected = filedialog.askdirectory(
-            title="Select DOCX export folder",
+            title="Select export folder",
             initialdir=export_dir_var.get().strip() or str(Path.cwd()),
             mustexist=False,
         )
@@ -2013,10 +2011,9 @@ class PyesisApp:
             return
 
         self._apply_settings_changes(settings)
-        auto_export_state = self.config.auto_export_time or "disabled"
         provider = self._ai_provider_label(self._effective_ai_mode())
         self.status_var.set(
-            f"Auto-export time set to {auto_export_state}; DOCX folder set to {self.config.export_directory}; summary provider set to {provider}"
+            f"Export folder set to {self.config.export_directory}; summary provider set to {provider}"
         )
         dialog.destroy()
 
@@ -2331,11 +2328,7 @@ class PyesisApp:
             github_gpt_model_var=github_gpt_model_var,
         )
 
-        ttk.Label(frame, text="Daily DOCX export time (24h HH:MM)").grid(row=0, column=0, sticky="w")
-        ttk.Entry(frame, textvariable=time_var, width=12).grid(row=1, column=0, sticky="w", pady=(6, 0))
-        ttk.Label(frame, text="Leave blank to disable daily auto-export.").grid(row=2, column=0, sticky="w", pady=(6, 12))
-
-        ttk.Label(frame, text="DOCX export folder").grid(row=3, column=0, sticky="w")
+        ttk.Label(frame, text="Export folder").grid(row=3, column=0, sticky="w")
         export_row = ttk.Frame(frame)
         export_row.grid(row=4, column=0, sticky="ew", pady=(6, 12))
         export_row.columnconfigure(0, weight=1)
@@ -2721,36 +2714,6 @@ class PyesisApp:
         if hour < 0 or hour > 23 or minute < 0 or minute > 59:
             raise ValueError("Out of range")
         return f"{hour:02d}:{minute:02d}"
-
-    def _maybe_auto_export_daily(self) -> None:
-        time_value = self.config.auto_export_time.strip()
-        if not time_value:
-            return
-        try:
-            scheduled = self._normalize_time(time_value)
-        except ValueError:
-            return
-
-        now = datetime.now()
-        scheduled_hour, scheduled_minute = (int(part) for part in scheduled.split(":"))
-        if (now.hour, now.minute) < (scheduled_hour, scheduled_minute):
-            return
-
-        today = now.strftime("%Y-%m-%d")
-        if self.config.last_auto_export_date == today:
-            return
-
-        self.config.week_end_day = self.week_end_var.get()
-        file_name = now.strftime("%Y%b%d") + "Pyesis.docx"
-        try:
-            target = export_docx(self.config, self._docx_output_dir(), file_name=file_name)
-        except Exception as exc:
-            self.status_var.set(f"Auto-export failed: {exc}")
-            return
-
-        self.config.last_auto_export_date = today
-        save_config(self.config)
-        self.status_var.set(f"Auto-exported {target.name}")
 
     def _on_theme_changed(self, _event: tk.Event) -> None:
         self._apply_theme()
@@ -3811,7 +3774,6 @@ class PyesisApp:
 
     def _scheduled_poll(self) -> None:
         self.run_poll_once()
-        self._maybe_auto_export_daily()
         self._schedule_poll()
 
     def _try_capture_snapshot(self, repo: RepoConfig):
@@ -4573,10 +4535,10 @@ class PyesisApp:
         self._poll_thread.start()
         self.root.after(100, self._check_poll_worker)
 
-    def _export_docx(self) -> None:
+    def _export_odt(self) -> None:
         self.config.week_end_day = self.week_end_var.get()
         self._persist()
-        target = export_docx(self.config, self._docx_output_dir())
+        target = export_odt(self.config, self._docx_output_dir())
         self.status_var.set(f"Exported {target.name}")
         messagebox.showinfo("Export complete", f"Saved {target}")
         self._open_created_document(target)
@@ -4623,37 +4585,86 @@ class PyesisApp:
 
         return build_day, export_day
 
-    def _start_ai_weekly_day_prefill(self) -> None:
-        """Generate past days of this week (back to Sunday, excluding today) so AI Weekly only builds today."""
+    def _start_missing_day_save(self) -> None:
+        """At startup, write AI Weekly day files for past days of this week that were never saved."""
         try:
-            evidence_text = render_weekly_evidence_text(self.config)
+            week_start = self._active_week_start().date()
+            output_dir = self._docx_output_dir()
+            days = days_missing(
+                split_week_evidence(render_weekly_evidence_text(self.config), week_start),
+                output_dir,
+                week_start,
+                datetime.now().date(),
+            )
         except Exception:
             return
-        week_start = self._active_week_start().date()
-        days = days_to_prefill(split_week_evidence(evidence_text, week_start), datetime.now().date())
-        if not days:
-            return
+        if days:
+            self.status_var.set(f"Saving {len(days)} missed AI Weekly day(s)...")
+            threading.Thread(
+                target=self._save_missing_days_worker, args=(days, week_start, output_dir), daemon=True
+            ).start()
+
+    def _save_missing_days_worker(self, days: list[DayEvidence], week_start, output_dir: Path) -> None:
         model = self.config.ai_ollama_model.strip() or DEFAULT_OLLAMA_WEEKLY_REPORT_MODEL
+        build_day, export_day = self._ai_weekly_day_callbacks(model)
+        for day in days:
+            try:
+                ensure_day_report(output_dir, week_start, day, build_day, export_day)
+            except Exception as exc:
+                message = f"Saving AI Weekly day {day.day_name} failed: {exc}"
+                self._post_to_ui(lambda text=message: self.status_var.set(text))
+                return
+        self._post_to_ui(lambda: self.status_var.set(f"Saved {len(days)} missed AI Weekly day(s)"))
+
+    def _on_close_request(self) -> None:
+        """Save today's (and any unsaved) AI Weekly day files before the window closes."""
+        if getattr(self, "_closing", False):
+            return
+        self._closing = True
+        try:
+            self._apply_ai_environment_defaults()
+            evidence_text = render_weekly_evidence_text(self.config)
+            week_start = self._active_week_start().date()
+            days = days_to_save(split_week_evidence(evidence_text, week_start), datetime.now().date())
+        except Exception:
+            days = []
+        if not days:
+            self.root.destroy()
+            return
+
+        self._save_dialog = tk.Toplevel(self.root)
+        self._save_dialog.title("Pyesis")
+        self._save_dialog.transient(self.root)
+        self._save_dialog.protocol("WM_DELETE_WINDOW", lambda: None)
+        ttk.Label(self._save_dialog, text="Saving daily work, please wait...", padding=24).pack()
+        self._save_dialog.update_idletasks()
+        self._save_dialog.grab_set()
+        self.ollama_activity_var.set("[WORKING] Saving daily AI Weekly file")
         threading.Thread(
-            target=self._ai_weekly_day_prefill_worker,
-            args=(days, week_start, self._docx_output_dir(), model),
+            target=self._save_days_on_close_worker,
+            args=(days, week_start, self._docx_output_dir()),
             daemon=True,
         ).start()
 
-    def _ai_weekly_day_prefill_worker(self, days: list[DayEvidence], week_start, output_dir: Path, model: str) -> None:
+    def _save_days_on_close_worker(self, days: list[DayEvidence], week_start, output_dir: Path) -> None:
+        model = self.config.ai_ollama_model.strip() or DEFAULT_OLLAMA_WEEKLY_REPORT_MODEL
         build_day, export_day = self._ai_weekly_day_callbacks(model)
-        generated = 0
+        error = ""
         for day in days:
             try:
-                _text, _provider, was_generated = ensure_day_report(output_dir, week_start, day, build_day, export_day)
+                ensure_day_report(output_dir, week_start, day, build_day, export_day)
             except Exception as exc:
-                message = f"AI weekly prep for {day.day_name} failed: {exc}"
-                self._post_to_ui(lambda text=message: self.status_var.set(text))
-                return
-            generated += int(was_generated)
-        if generated:
-            message = f"AI weekly prep: {generated} past day(s) ready"
-            self._post_to_ui(lambda text=message: self.status_var.set(text))
+                error = f"{day.day_name}: {exc}"
+                break
+        self._post_to_ui(lambda: self._finish_close(error))
+
+    def _finish_close(self, error: str) -> None:
+        if error and not messagebox.askyesno("Pyesis", f"Daily save failed ({error}).\n\nClose anyway?"):
+            self._save_dialog.destroy()
+            self.ollama_activity_var.set(OLLAMA_IDLE_STATUS)
+            self._closing = False
+            return
+        self.root.destroy()
 
     def _build_ai_weekly_report_worker(self, evidence_text: str, week_start_iso: str, output_dir: Path) -> None:
         try:
@@ -4662,12 +4673,16 @@ class PyesisApp:
             days = split_week_evidence(evidence_text, week_start)
             if days:
                 build_day, export_day = self._ai_weekly_day_callbacks(model)
-                result, _generated = build_week_from_days(days, output_dir, week_start, build_day, export_day)
+                result, _generated = build_week_from_days(
+                    days, output_dir, week_start, build_day, export_day, datetime.now().date()
+                )
             else:
                 result = build_weekly_report(evidence_text, model_override=model)
+            reports_dir = output_dir / WEEKLY_REPORTS_DIR_NAME
+            reports_dir.mkdir(parents=True, exist_ok=True)
             target = export_ai_weekly_report_odt(
                 result.text,
-                output_dir,
+                reports_dir,
                 week_start_iso,
                 provider_details=result.provider_details,
             )
@@ -4882,6 +4897,10 @@ class PyesisApp:
 def launch() -> None:
     root = tk.Tk()
     app = PyesisApp(root)
+    root.protocol("WM_DELETE_WINDOW", app._on_close_request)
+    if sys.platform == "darwin":
+        # Cmd+Q and macOS logout/shutdown quit requests go through here instead of WM_DELETE_WINDOW.
+        root.createcommand("::tk::mac::Quit", app._on_close_request)
     root.minsize(980, 640)
     app.status_var.set("Ready")
     if sys.platform == "darwin":

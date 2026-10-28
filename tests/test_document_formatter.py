@@ -7,10 +7,8 @@ import unittest
 from zipfile import ZipFile
 from unittest.mock import patch
 
-from docx import Document
-
 from pyesis.config import AppConfig, EntryRecord
-from pyesis.document_formatter import export_ai_weekly_report_docx, export_ai_weekly_report_odt, render_plain_text, render_text_chunks, render_weekly_evidence_text
+from pyesis.document_formatter import export_ai_weekly_report_odt, export_odt, render_plain_text, render_text_chunks, render_weekly_evidence_text
 
 
 class DocumentFormatterTests(unittest.TestCase):
@@ -37,37 +35,65 @@ class DocumentFormatterTests(unittest.TestCase):
         self.assertIn("I added parser recovery details.", content)
         self.assertIn("I clarified the import path changes.", content)
 
-    def test_export_ai_weekly_report_docx_writes_word_file(self) -> None:
+    def test_ai_weekly_odt_centers_title_indents_and_bullets_prose(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            target = export_ai_weekly_report_odt(
+                "Day: Monday\nRepo: Pyesis\n\nI added parser recovery details.\n\nI clarified import paths.",
+                Path(tmp_dir),
+                "2026-06-26T00:00:00",
+            )
+            with ZipFile(target) as archive:
+                content = archive.read("content.xml").decode("utf-8")
+                styles = archive.read("styles.xml").decode("utf-8")
+
+        self.assertIn('fo:text-align="center"', styles)
+        self.assertIn('fo:margin-left="0.25in"', styles)
+        self.assertIn('fo:margin-left="0.5in"', styles)
+        self.assertIn('fo:margin-left="1.00in"', styles)
+        self.assertIn('text:list-level-position-and-space-mode="label-alignment"', styles)
+        self.assertNotIn("parent-style-name", styles)
+        # ODF requires paragraph-properties before text-properties; Word drops them otherwise.
+        for name in ("AIWeeklyHeading", "AIWeeklyDay", "AIWeeklyRepo"):
+            style_xml = styles.split(f'style:name="{name}"')[1].split("</style:style>")[0]
+            self.assertLess(style_xml.index("paragraph-properties"), style_xml.index("text-properties"))
+        self.assertEqual(content.count("<text:list-item>"), 2)
+
+    def test_export_odt_writes_day_headings_and_nested_bullets(self) -> None:
+        config = AppConfig(
+            repos=[],
+            entries=[
+                EntryRecord(
+                    repo_label="Pyesis",
+                    repo_path="/tmp/pyesis",
+                    created_at="2026-06-29T06:37:47",
+                    day_name="Monday",
+                    week_start_iso="2026-06-26T00:00:00",
+                    summary="I added parser recovery details.\nI clarified import paths.",
+                    diff_hash="hash-1",
+                    diff_excerpt="",
+                    summary_source="ollama",
+                    author="AI",
+                )
+            ],
+        )
         with tempfile.TemporaryDirectory() as tmp_dir:
             with patch("pyesis.document_formatter.datetime") as mock_datetime:
-                mock_datetime.now.return_value = datetime(2026, 8, 26, 19, 15, 0)
+                mock_datetime.now.return_value = datetime(2026, 6, 29, 12, 0, 0)
                 mock_datetime.fromisoformat.side_effect = datetime.fromisoformat
-                target = export_ai_weekly_report_docx(
-                    "## Monday\n### Pyesis\n- Summary: I added parser recovery details.\n- Summary: I clarified the import path changes.",
-                    Path(tmp_dir),
-                    "2026-06-26T00:00:00",
-                    provider_details="qwen3-coder:30b",
-                )
+                target = export_odt(config, Path(tmp_dir), file_name="week.odt")
+            with ZipFile(target) as archive:
+                content = archive.read("content.xml").decode("utf-8")
+                styles = archive.read("styles.xml").decode("utf-8")
 
-            self.assertEqual(target.name, "WhatIDidThisWeek20260826.docx")
-            self.assertTrue(target.exists())
-            document = Document(target)
-            paragraphs = [
-                (
-                    paragraph.text,
-                    paragraph.style.name,
-                    None if paragraph.paragraph_format.left_indent is None else round(paragraph.paragraph_format.left_indent.inches, 2),
-                )
-                for paragraph in document.paragraphs
-                if paragraph.text.strip()
-            ]
-
-        self.assertIn(("AI Weekly Report (2026 Jul 02)", "Heading 1", None), paragraphs)
-        self.assertIn(("Monday", "Normal", 0.25), paragraphs)
-        self.assertIn(("Pyesis", "Normal", 0.5), paragraphs)
-        self.assertIn(("I added parser recovery details.", "List Bullet", 0.75), paragraphs)
-        self.assertIn(("I clarified the import path changes.", "List Bullet", 0.75), paragraphs)
-        self.assertNotIn(("Summary: I added parser recovery details.", "List Bullet", 0.75), paragraphs)
+        self.assertEqual(target.name, "week.odt")
+        self.assertIn("Weekly Report (2026 Jul 02)", content)
+        self.assertIn(">Monday<", content)
+        self.assertIn("PyesisBullets", content)
+        self.assertIn("text:list-level-style-bullet", styles)
+        self.assertNotIn("@Monday", content)
+        # repo bullet > entry bullet > continuation bullet
+        self.assertEqual(content.count("<text:list "), 3)
+        self.assertIn("I clarified import paths.", content)
 
     def test_render_weekly_evidence_text_can_target_previous_week(self) -> None:
         config = AppConfig(
