@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## 2026.10.28.0 - 2026-10-28
+
+### Added
+- At 14:15 each day Pyesis saves the day's AI Weekly files behind a "Saving daily work, please wait..." banner and stays open. On the last workday of the week (Week End Day) it also compiles the week into `AIWeeklyReports/`, opens the report and shuts Pyesis down; it won't repeat that if the report for the day already exists. Export/Import Week JSON now open in the `json` folder of the export directory.
 
 ### Changed
 - All exports are `.odt`. Export ODT writes day headings with nested repo/entry/detail bullets, and AI Weekly ODT lists now carry a real bullet style. The daily `.docx` auto-export was removed.

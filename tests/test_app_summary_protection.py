@@ -178,6 +178,77 @@ class AppSummaryProtectionTests(unittest.TestCase):
         app._refresh_editor = lambda: None
         return app
 
+    def test_auto_save_day_runs_once_after_cutoff(self) -> None:
+        app = self._make_app()
+        app.week_end_var = DummyVar("Sunday")
+        saved: list[tuple[list[str], object]] = []
+        app._days_to_save_now = lambda: (["day"], "week")
+        app._save_days_with_dialog = lambda days, week_start, on_done: saved.append((days, on_done))
+
+        with patch("pyesis.app.datetime") as mock_datetime:
+            mock_datetime.now.return_value = datetime(2026, 10, 28, 14, 14)
+            app._maybe_auto_save_day()
+            self.assertEqual(saved, [])
+
+            mock_datetime.now.return_value = datetime(2026, 10, 28, 14, 15)
+            app._maybe_auto_save_day()
+            self.assertEqual(len(saved), 1)
+
+            app._auto_saving = False
+            app._maybe_auto_save_day()
+            self.assertEqual(len(saved), 1)
+
+            mock_datetime.now.return_value = datetime(2026, 10, 29, 14, 20)
+            app._maybe_auto_save_day()
+            self.assertEqual(len(saved), 2)
+
+    def test_final_workday_compiles_week_then_opens_and_shuts_down(self) -> None:
+        app = self._make_app()
+        app.week_end_var = DummyVar("Wednesday")
+        output_dir = Path(tempfile.mkdtemp())
+        calls: dict[str, object] = {}
+        destroyed: list[bool] = []
+        opened: list[Path] = []
+        app.root.destroy = lambda: destroyed.append(True)
+        app._docx_output_dir = lambda: output_dir
+        app._days_to_save_now = lambda: (["day"], "week")
+        app._active_week_start = lambda: datetime(2026, 10, 23)
+        app._open_created_document = lambda target: opened.append(target)
+        app._save_days_with_dialog = lambda days, week_start, on_done, compile_args=None, message="": calls.update(
+            on_done=on_done, compile_args=compile_args
+        )
+
+        with patch("pyesis.app.datetime") as mock_datetime, patch("pyesis.app.render_weekly_evidence_text", return_value="evidence"):
+            mock_datetime.now.return_value = datetime(2026, 10, 28, 14, 16)  # a Wednesday
+            app._maybe_auto_save_day()
+
+        self.assertEqual(calls["compile_args"], ("evidence", "2026-10-23T00:00:00"))
+        self.assertEqual(calls["on_done"], app._finish_final_save)
+
+        app._compiled_report_target = output_dir / "AIWeeklyReports" / "WhatIDidThisWeek20261028.odt"
+        app._finish_final_save("")
+        self.assertEqual(opened, [app._compiled_report_target])
+        self.assertEqual(destroyed, [True])
+
+    def test_final_workday_does_not_repeat_once_report_exists(self) -> None:
+        app = self._make_app()
+        app.week_end_var = DummyVar("Wednesday")
+        output_dir = Path(tempfile.mkdtemp())
+        (output_dir / "AIWeeklyReports").mkdir()
+        (output_dir / "AIWeeklyReports" / "WhatIDidThisWeek20261028.odt").write_bytes(b"x")
+        calls: list[object] = []
+        app._docx_output_dir = lambda: output_dir
+        app._days_to_save_now = lambda: (["day"], "week")
+        app._save_days_with_dialog = lambda days, week_start, on_done, compile_args=None, message="": calls.append(
+            (on_done, compile_args)
+        )
+
+        with patch("pyesis.app.datetime") as mock_datetime:
+            mock_datetime.now.return_value = datetime(2026, 10, 28, 14, 16)
+            app._maybe_auto_save_day()
+
+        self.assertEqual(calls, [(app._finish_auto_save, None)])
+
     def test_export_odt_exports_and_opens_document(self) -> None:
         app = self._make_app()
         opened: list[Path] = []

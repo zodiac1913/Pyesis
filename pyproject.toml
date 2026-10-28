@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pyesis"
-version = "2026.10.22.0"
+version = "2026.10.28.0"
 description = "Desktop git diff monitor with weekly report output"
 readme = "README.md"
 requires-python = ">=3.11"

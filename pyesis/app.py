@@ -120,6 +120,8 @@ LISTBOX_SELECT_EVENT = "<<ListboxSelect>>"
 AGING_ACTION_BUTTON_STYLE = "AgingAction.TButton"
 IMPORT_WEEK_FAILED_TITLE = "Import failed"
 AI_WEEKLY_REPORT_TITLE = "AI Weekly Report"
+WEEK_JSON_DIR_NAME = "json"
+AUTO_SAVE_DAY_TIME = (14, 15)
 EXPORT_WEEK_JSON_BUTTON_TEXT = "Export Week JSON"
 IMPORT_WEEK_JSON_BUTTON_TEXT = "Import Week JSON"
 AI_WEEKLY_BUTTON_TEXT = "AI Weekly"
@@ -3774,6 +3776,7 @@ class PyesisApp:
 
     def _scheduled_poll(self) -> None:
         self.run_poll_once()
+        self._maybe_auto_save_day()
         self._schedule_poll()
 
     def _try_capture_snapshot(self, repo: RepoConfig):
@@ -4616,37 +4619,48 @@ class PyesisApp:
                 return
         self._post_to_ui(lambda: self.status_var.set(f"Saved {len(days)} missed AI Weekly day(s)"))
 
-    def _on_close_request(self) -> None:
-        """Save today's (and any unsaved) AI Weekly day files before the window closes."""
-        if getattr(self, "_closing", False):
-            return
-        self._closing = True
-        try:
-            self._apply_ai_environment_defaults()
-            evidence_text = render_weekly_evidence_text(self.config)
-            week_start = self._active_week_start().date()
-            days = days_to_save(split_week_evidence(evidence_text, week_start), datetime.now().date())
-        except Exception:
-            days = []
-        if not days:
-            self.root.destroy()
-            return
+    def _days_to_save_now(self) -> tuple[list[DayEvidence], object]:
+        self._apply_ai_environment_defaults()
+        week_start = self._active_week_start().date()
+        evidence_text = render_weekly_evidence_text(self.config)
+        return days_to_save(split_week_evidence(evidence_text, week_start), datetime.now().date()), week_start
 
+    def _save_days_with_dialog(
+        self,
+        days: list[DayEvidence],
+        week_start,
+        on_done: Callable[[str], None],
+        compile_args: tuple[str, str] | None = None,
+        message: str = "Saving daily work, please wait...",
+    ) -> None:
+        """Block the UI behind a wait banner while day files are written; on_done gets an error message or ''.
+
+        With compile_args (evidence text, week start ISO) the weekly report is compiled afterwards
+        and its path is left in self._compiled_report_target.
+        """
+        self._compiled_report_target = None
         self._save_dialog = tk.Toplevel(self.root)
         self._save_dialog.title("Pyesis")
         self._save_dialog.transient(self.root)
         self._save_dialog.protocol("WM_DELETE_WINDOW", lambda: None)
-        ttk.Label(self._save_dialog, text="Saving daily work, please wait...", padding=24).pack()
+        ttk.Label(self._save_dialog, text=message, padding=24).pack()
         self._save_dialog.update_idletasks()
         self._save_dialog.grab_set()
         self.ollama_activity_var.set("[WORKING] Saving daily AI Weekly file")
         threading.Thread(
-            target=self._save_days_on_close_worker,
-            args=(days, week_start, self._docx_output_dir()),
+            target=self._save_days_worker,
+            args=(days, week_start, self._docx_output_dir(), on_done, compile_args),
             daemon=True,
         ).start()
 
-    def _save_days_on_close_worker(self, days: list[DayEvidence], week_start, output_dir: Path) -> None:
+    def _save_days_worker(
+        self,
+        days: list[DayEvidence],
+        week_start,
+        output_dir: Path,
+        on_done: Callable[[str], None],
+        compile_args: tuple[str, str] | None = None,
+    ) -> None:
         model = self.config.ai_ollama_model.strip() or DEFAULT_OLLAMA_WEEKLY_REPORT_MODEL
         build_day, export_day = self._ai_weekly_day_callbacks(model)
         error = ""
@@ -4656,7 +4670,26 @@ class PyesisApp:
             except Exception as exc:
                 error = f"{day.day_name}: {exc}"
                 break
-        self._post_to_ui(lambda: self._finish_close(error))
+        if compile_args and not error:
+            try:
+                _result, self._compiled_report_target = self._compile_weekly_report(*compile_args, output_dir)
+            except Exception as exc:
+                error = f"weekly report: {exc}"
+        self._post_to_ui(lambda: on_done(error))
+
+    def _on_close_request(self) -> None:
+        """Save today's (and any unsaved) AI Weekly day files before the window closes."""
+        if getattr(self, "_closing", False) or getattr(self, "_auto_saving", False):
+            return
+        self._closing = True
+        try:
+            days, week_start = self._days_to_save_now()
+        except Exception:
+            days, week_start = [], None
+        if not days:
+            self.root.destroy()
+            return
+        self._save_days_with_dialog(days, week_start, self._finish_close)
 
     def _finish_close(self, error: str) -> None:
         if error and not messagebox.askyesno("Pyesis", f"Daily save failed ({error}).\n\nClose anyway?"):
@@ -4666,26 +4699,83 @@ class PyesisApp:
             return
         self.root.destroy()
 
+    def _maybe_auto_save_day(self) -> None:
+        """Once a day at AUTO_SAVE_DAY_TIME, save today's work so end-of-day isn't spent waiting on Ollama."""
+        now = datetime.now()
+        today = now.date()
+        if (now.hour, now.minute) < AUTO_SAVE_DAY_TIME or getattr(self, "_auto_saved_date", None) == today:
+            return
+        if getattr(self, "_closing", False) or getattr(self, "_auto_saving", False):
+            return
+        self._auto_saved_date = today
+        try:
+            days, week_start = self._days_to_save_now()
+        except Exception:
+            return
+        if not days:
+            return
+        self._auto_saving = True
+        if self._is_final_workday(now) and not self._weekly_report_exists_for(now):
+            evidence_text = render_weekly_evidence_text(self.config)
+            self._save_days_with_dialog(
+                days,
+                week_start,
+                self._finish_final_save,
+                compile_args=(evidence_text, self._active_week_start().isoformat()),
+                message="Saving daily work and compiling the weekly report, please wait...",
+            )
+            return
+        self._save_days_with_dialog(days, week_start, self._finish_auto_save)
+
+    def _is_final_workday(self, now: datetime) -> bool:
+        return now.strftime("%A") == self.week_end_var.get()
+
+    def _weekly_report_exists_for(self, now: datetime) -> bool:
+        """True once today's weekly report was written, so relaunching later on the same day doesn't shut the app down again."""
+        reports_dir = self._docx_output_dir() / WEEKLY_REPORTS_DIR_NAME
+        return (reports_dir / f"WhatIDidThisWeek{now.strftime('%Y%m%d')}.odt").exists()
+
+    def _finish_final_save(self, error: str) -> None:
+        """Last workday: show the weekly report (the signal it ran) and shut Pyesis down."""
+        target = self._compiled_report_target
+        if error or target is None:
+            self._finish_auto_save(error or "weekly report was not produced")
+            messagebox.showerror(AI_WEEKLY_REPORT_TITLE, f"Weekly report failed: {error}")
+            return
+        self._open_created_document(target)
+        self.root.destroy()
+
+    def _finish_auto_save(self, error: str) -> None:
+        self._save_dialog.destroy()
+        self.ollama_activity_var.set(OLLAMA_IDLE_STATUS)
+        self._auto_saving = False
+        self.status_var.set(f"Daily save failed ({error})" if error else "Daily work saved")
+
+    def _compile_weekly_report(self, evidence_text: str, week_start_iso: str, output_dir: Path) -> tuple[AIWeeklyReportResult, Path]:
+        """Merge saved day text (generating today if needed) and write the weekly .odt to AIWeeklyReports."""
+        model = self.config.ai_ollama_model.strip() or DEFAULT_OLLAMA_WEEKLY_REPORT_MODEL
+        week_start = datetime.fromisoformat(week_start_iso).date()
+        days = split_week_evidence(evidence_text, week_start)
+        if days:
+            build_day, export_day = self._ai_weekly_day_callbacks(model)
+            result, _generated = build_week_from_days(
+                days, output_dir, week_start, build_day, export_day, datetime.now().date()
+            )
+        else:
+            result = build_weekly_report(evidence_text, model_override=model)
+        reports_dir = output_dir / WEEKLY_REPORTS_DIR_NAME
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        target = export_ai_weekly_report_odt(
+            result.text,
+            reports_dir,
+            week_start_iso,
+            provider_details=result.provider_details,
+        )
+        return result, target
+
     def _build_ai_weekly_report_worker(self, evidence_text: str, week_start_iso: str, output_dir: Path) -> None:
         try:
-            model = self.config.ai_ollama_model.strip() or DEFAULT_OLLAMA_WEEKLY_REPORT_MODEL
-            week_start = datetime.fromisoformat(week_start_iso).date()
-            days = split_week_evidence(evidence_text, week_start)
-            if days:
-                build_day, export_day = self._ai_weekly_day_callbacks(model)
-                result, _generated = build_week_from_days(
-                    days, output_dir, week_start, build_day, export_day, datetime.now().date()
-                )
-            else:
-                result = build_weekly_report(evidence_text, model_override=model)
-            reports_dir = output_dir / WEEKLY_REPORTS_DIR_NAME
-            reports_dir.mkdir(parents=True, exist_ok=True)
-            target = export_ai_weekly_report_odt(
-                result.text,
-                reports_dir,
-                week_start_iso,
-                provider_details=result.provider_details,
-            )
+            result, target = self._compile_weekly_report(evidence_text, week_start_iso, output_dir)
             error = ""
         except Exception as exc:
             result = None
@@ -4754,7 +4844,7 @@ class PyesisApp:
             exported_at = datetime.now()
             week_start = self._active_week_start()
             default_name = f"Pyesis{exported_at.strftime('%Y%m%d')}.json"
-            export_dir = self._docx_output_dir()
+            export_dir = self._docx_output_dir() / WEEK_JSON_DIR_NAME
             export_dir.mkdir(parents=True, exist_ok=True)
 
             target = filedialog.asksaveasfilename(
@@ -4790,7 +4880,7 @@ class PyesisApp:
             return
 
         try:
-            export_dir = self._docx_output_dir()
+            export_dir = self._docx_output_dir() / WEEK_JSON_DIR_NAME
             source = filedialog.askopenfilename(
                 title="Import week entries from JSON",
                 initialdir=str(export_dir),
