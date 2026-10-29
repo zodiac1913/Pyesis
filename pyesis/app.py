@@ -4612,7 +4612,7 @@ class PyesisApp:
         build_day, export_day = self._ai_weekly_day_callbacks(model)
         for day in days:
             try:
-                ensure_day_report(output_dir, week_start, day, build_day, export_day)
+                ensure_day_report(output_dir, week_start, day, build_day, export_day, require_current=False)
             except Exception as exc:
                 message = f"Saving AI Weekly day {day.day_name} failed: {exc}"
                 self._post_to_ui(lambda text=message: self.status_var.set(text))
@@ -4666,7 +4666,10 @@ class PyesisApp:
         error = ""
         for day in days:
             try:
-                ensure_day_report(output_dir, week_start, day, build_day, export_day)
+                ensure_day_report(
+                    output_dir, week_start, day, build_day, export_day,
+                    require_current=day.day_date == datetime.now().date(),
+                )
             except Exception as exc:
                 error = f"{day.day_name}: {exc}"
                 break
@@ -4678,7 +4681,7 @@ class PyesisApp:
         self._post_to_ui(lambda: on_done(error))
 
     def _on_close_request(self) -> None:
-        """Save today's (and any unsaved) AI Weekly day files before the window closes."""
+        """Save elapsed days and compile their weekly report before closing the window."""
         if getattr(self, "_closing", False) or getattr(self, "_auto_saving", False):
             return
         self._closing = True
@@ -4689,7 +4692,13 @@ class PyesisApp:
         if not days:
             self.root.destroy()
             return
-        self._save_days_with_dialog(days, week_start, self._finish_close)
+        self._save_days_with_dialog(
+            days,
+            week_start,
+            self._finish_close,
+            compile_args=(render_weekly_evidence_text(self.config), self._active_week_start().isoformat()),
+            message="Saving daily work and compiling the weekly report, please wait...",
+        )
 
     def _finish_close(self, error: str) -> None:
         if error and not messagebox.askyesno("Pyesis", f"Daily save failed ({error}).\n\nClose anyway?"):
@@ -4752,7 +4761,7 @@ class PyesisApp:
         self.status_var.set(f"Daily save failed ({error})" if error else "Daily work saved")
 
     def _compile_weekly_report(self, evidence_text: str, week_start_iso: str, output_dir: Path) -> tuple[AIWeeklyReportResult, Path]:
-        """Merge saved day text (generating today if needed) and write the weekly .odt to AIWeeklyReports."""
+        """Ensure elapsed day reports exist, then merge them into the weekly ODT."""
         model = self.config.ai_ollama_model.strip() or DEFAULT_OLLAMA_WEEKLY_REPORT_MODEL
         week_start = datetime.fromisoformat(week_start_iso).date()
         days = split_week_evidence(evidence_text, week_start)

@@ -2,10 +2,9 @@
 
 Each day's Ollama text is saved as a visible .odt plus a .json sidecar holding the text and a
 hash of that day's evidence, in AIWeeklyDays/<week start>/ named <date>.*. Pyesis writes
-missing past days at startup and saves every day up to today when it closes, so the final
-AI Weekly only merges the saved JSON text (days with no JSON are omitted) and generates today
-if it was not saved yet. save-on-close reuses a day only while its evidence hash still matches;
-edits or JSON imports for that day force a regeneration.
+missing past days at startup and saves every day up to today when it closes. The final
+AI Weekly ensures every elapsed day has a report before merging the saved text.
+Saved past days are reused; today's report is regenerated when its evidence changes.
 """
 
 from __future__ import annotations
@@ -63,11 +62,15 @@ def days_to_save(days: list[DayEvidence], today: date) -> list[DayEvidence]:
 
 
 def days_missing(days: list[DayEvidence], output_dir: Path, week_start: date, today: date) -> list[DayEvidence]:
-    """Past days (today excluded) that have no saved JSON yet; written at startup."""
+    """Past days with missing files; repaired at startup without rewriting saved work."""
     return [
         day
         for day in days
-        if day.day_date < today and load_cached_day(output_dir, week_start, day, require_current=False) is None
+        if day.day_date < today
+        and (
+            load_cached_day(output_dir, week_start, day, require_current=False) is None
+            or not (day_cache_dir(output_dir, week_start) / f"{_day_stem(day)}.odt").is_file()
+        )
     ]
 
 
@@ -100,17 +103,21 @@ def ensure_day_report(
     day: DayEvidence,
     build_day: BuildDay,
     export_day: ExportDay,
+    *,
+    require_current: bool = True,
 ) -> tuple[str, str, bool]:
-    """Return (text, provider_details, generated) for one day, generating and caching if stale."""
+    """Save one day; require_current=False preserves completed past-day text despite later edits."""
     with _DAY_LOCK:
-        cached = load_cached_day(output_dir, week_start, day)
+        cached = load_cached_day(output_dir, week_start, day, require_current=require_current)
+        cache_dir = day_cache_dir(output_dir, week_start)
+        week_start_iso = datetime.combine(week_start, datetime.min.time()).isoformat()
         if cached is not None:
+            if not (cache_dir / f"{_day_stem(day)}.odt").is_file():
+                export_day(cached[0], cache_dir, week_start_iso, cached[1], f"{_day_stem(day)}.odt")
             return cached[0], cached[1], False
 
         result = build_day(day.evidence_text)
-        cache_dir = day_cache_dir(output_dir, week_start)
         cache_dir.mkdir(parents=True, exist_ok=True)
-        week_start_iso = datetime.combine(week_start, datetime.min.time()).isoformat()
         export_day(result.text, cache_dir, week_start_iso, result.provider_details, f"{_day_stem(day)}.odt")
         sidecar = cache_dir / f"{_day_stem(day)}.json"
         sidecar.write_text(
@@ -137,17 +144,17 @@ def build_week_from_days(
     export_day: ExportDay,
     today: date,
 ) -> tuple[AIWeeklyReportResult, int]:
-    """Merge saved day texts in order. Past days come from saved JSON only (omitted if absent);
-    today is generated if not yet saved. Returns the merged result and how many days were generated."""
+    """Save elapsed days in order before merging; return the report and AI generation count."""
     texts: list[str] = []
     providers: list[str] = []
     generated = 0
-    for day in days:
-        if day.day_date >= today:
-            text, provider, was_generated = ensure_day_report(output_dir, week_start, day, build_day, export_day)
-        else:
-            saved = load_cached_day(output_dir, week_start, day, require_current=False)
-            text, provider, was_generated = (saved[0], saved[1], False) if saved else ("", "", False)
+    for day in sorted(days_to_save(days, today), key=lambda item: item.day_date):
+        try:
+            text, provider, was_generated = ensure_day_report(
+                output_dir, week_start, day, build_day, export_day, require_current=day.day_date == today
+            )
+        except Exception as exc:
+            raise RuntimeError(f"{day.day_name} ({day.day_date.isoformat()}): {exc}") from exc
         if text.strip():
             texts.append(text)
         if provider and provider not in providers:

@@ -31,7 +31,9 @@ class AIWeeklyDaysTests(unittest.TestCase):
 
     def export_day(self, text, directory, week_start_iso, provider, file_name) -> Path:
         self.exported.append(file_name)
-        return directory / file_name
+        target = directory / file_name
+        target.write_text(text, encoding="utf-8")
+        return target
 
     def test_split_maps_days_to_dates_in_week(self) -> None:
         days = split_week_evidence(EVIDENCE, WEEK_START)
@@ -74,22 +76,21 @@ class AIWeeklyDaysTests(unittest.TestCase):
         self.assertTrue(generated)
         self.assertEqual(len(self.built), 2)
 
-    def test_build_week_merges_saved_json_omits_missing_and_generates_today(self) -> None:
+    def test_build_week_reuses_saved_past_days_and_builds_missing_days(self) -> None:
         days = split_week_evidence(EVIDENCE, WEEK_START)
         today = date(2026, 10, 22)
         for day in days[1:3]:
             ensure_day_report(self.output_dir, WEEK_START, day, self.build_day, self.export_day)
-        # A past day's JSON is used even if its evidence changed since it was saved.
         changed = split_week_evidence(EVIDENCE.replace("Monday work", "Monday more work"), WEEK_START)
         self.built.clear()
 
         result, generated = build_week_from_days(changed, self.output_dir, WEEK_START, self.build_day, self.export_day, today)
 
-        self.assertEqual(generated, 1)
-        self.assertEqual([chunk.split("\n", 1)[0] for chunk in self.built], ["Day: Thursday"])
+        self.assertEqual(generated, 2)
+        self.assertEqual([chunk.split("\n", 1)[0] for chunk in self.built], ["Day: Friday", "Day: Thursday"])
         self.assertEqual(
             [line for line in result.text.split("\n") if line.startswith("Day:")],
-            ["Day: Monday", "Day: Tuesday", "Day: Thursday"],
+            ["Day: Friday", "Day: Monday", "Day: Tuesday", "Day: Thursday"],
         )
         self.assertEqual(result.provider_details, "model-x")
         self.assertIn("2026-10-19.odt", self.exported)
