@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026.11.5.0 - 2026-11-05
+
+### Fixed
+- AI Weekly no longer invents days: each day's text is pinned to its real weekday when generated and when merged from saved JSON, so a model relabeling repos as other weekdays can't add days you didn't work.
+- Saved daily reports are preserved when compiling, missing day ODTs are restored from cached text, and closing Pyesis compiles the weekly report (opening it on Week End Day).
+
+### Changed
+- The weekly report title is now "DASM Weekly Report".
+
 ## 2026.10.28.0 - 2026-10-28
 
 ### Added
