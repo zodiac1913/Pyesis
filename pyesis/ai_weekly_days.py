@@ -157,15 +157,11 @@ def ensure_day_report(
             return cached[0], cached[1], False
 
         result = build_day(day.evidence_text)
-<<<<<<< Updated upstream
-=======
         result = AIWeeklyReportResult(
             text=pin_day_text(result.text, day.day_name),
             timing_ms=result.timing_ms,
             provider_details=result.provider_details,
         )
-        cache_dir = day_cache_dir(output_dir, week_start)
->>>>>>> Stashed changes
         cache_dir.mkdir(parents=True, exist_ok=True)
         export_day(result.text, cache_dir, week_start_iso, result.provider_details, f"{_day_stem(day)}.odt")
         sidecar = cache_dir / f"{_day_stem(day)}.json"
