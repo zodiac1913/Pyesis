@@ -67,7 +67,7 @@ class AIWeeklyDaysTests(unittest.TestCase):
         self.assertTrue(generated)
         text, provider, generated = ensure_day_report(self.output_dir, WEEK_START, monday, self.build_day, self.export_day)
         self.assertFalse(generated)
-        self.assertEqual(text, "Day: Monday\nProse.")
+        self.assertEqual(text, "Day: Monday\n\nProse.")
         self.assertEqual(provider, "model-x")
         self.assertEqual(len(self.built), 1)
 
@@ -94,6 +94,19 @@ class AIWeeklyDaysTests(unittest.TestCase):
         )
         self.assertEqual(result.provider_details, "model-x")
         self.assertIn("2026-10-19.odt", self.exported)
+
+    def test_model_day_labels_are_pinned_to_the_real_day(self) -> None:
+        monday = split_week_evidence(EVIDENCE, WEEK_START)[1]
+
+        def mislabeling_build(chunk: str) -> AIWeeklyReportResult:
+            return AIWeeklyReportResult(
+                text="Day: Monday\nRepo: A\n\nA work.\n\nDay: Tuesday\nRepo: B\n\nB work.\n\nDay: Friday\nRepo: A\n\nMore A.",
+                provider_details="model-x",
+            )
+
+        text, _provider, _generated = ensure_day_report(self.output_dir, WEEK_START, monday, mislabeling_build, self.export_day)
+
+        self.assertEqual(text, "Day: Monday\nRepo: A\n\nA work.\n\nMore A.\n\nRepo: B\n\nB work.")
 
 
 if __name__ == "__main__":

@@ -440,7 +440,7 @@ def export_ai_weekly_report_odt(
 
     week_start = datetime.fromisoformat(week_start_iso)
     week_end = _week_end_date(week_start)
-    document.text.addElement(P(text=f"AI Weekly Report ({week_end.strftime('%Y %b %d')})", stylename=heading_style))
+    document.text.addElement(P(text=f"DASM Weekly Report ({week_end.strftime('%Y %b %d')})", stylename=heading_style))
     if provider_details.strip():
         document.text.addElement(P(text=f"Generated with {provider_details.strip()}", stylename=subtitle_style))
 

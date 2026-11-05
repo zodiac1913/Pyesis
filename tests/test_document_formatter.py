@@ -29,7 +29,7 @@ class DocumentFormatterTests(unittest.TestCase):
             with ZipFile(target) as archive:
                 content = archive.read("content.xml").decode("utf-8")
 
-        self.assertIn("AI Weekly Report (2026 Jul 02)", content)
+        self.assertIn("DASM Weekly Report (2026 Jul 02)", content)
         self.assertIn(">Monday<", content)
         self.assertIn(">Pyesis<", content)
         self.assertIn("I added parser recovery details.", content)

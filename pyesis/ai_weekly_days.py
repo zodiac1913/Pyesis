@@ -17,7 +17,13 @@ import json
 from pathlib import Path
 import threading
 
-from pyesis.ai_summary import AIWeeklyReportResult, _join_weekly_report_parts, _split_weekly_evidence_by_day
+from pyesis.ai_summary import (
+    _WEEKLY_DAY_LINE,
+    _WEEKLY_REPO_LINE,
+    AIWeeklyReportResult,
+    _join_weekly_report_parts,
+    _split_weekly_evidence_by_day,
+)
 
 
 DAY_CACHE_DIR_NAME = "AIWeeklyDays"
@@ -74,6 +80,40 @@ def days_missing(days: list[DayEvidence], output_dir: Path, week_start: date, to
     ]
 
 
+def pin_day_text(text: str, day_name: str) -> str:
+    """Force one day's report text under a single 'Day: <day_name>' heading.
+
+    Each day is generated on its own, yet small models (e.g. hermes3) relabel repos as other
+    weekdays. Model 'Day:' lines are replaced and repeated repo sections are merged in order;
+    other lines are kept as written. Text without any 'Day:' line is returned unchanged.
+    """
+    lines = text.replace("\r\n", "\n").split("\n")
+    if not any(_WEEKLY_DAY_LINE.match(line.strip()) for line in lines):
+        return text
+    sections: dict[str, list[str]] = {}
+    current = ""
+    for raw_line in lines:
+        line = raw_line.strip()
+        if _WEEKLY_DAY_LINE.match(line):
+            continue
+        if _WEEKLY_REPO_LINE.match(line):
+            current = "Repo: " + line.split(":", 1)[1].strip()
+            sections.setdefault(current, [])
+            continue
+        section = sections.setdefault(current, [])
+        if line or (section and section[-1]):
+            section.append(line)
+
+    parts = [f"Day: {day_name}"]
+    for heading, body in sections.items():
+        content = "\n".join(body).strip()
+        if heading:
+            parts.append(heading)
+        if content:
+            parts.append(content)
+    return _join_weekly_report_parts(parts)
+
+
 def day_cache_dir(output_dir: Path, week_start: date) -> Path:
     return output_dir / DAY_CACHE_DIR_NAME / week_start.isoformat()
 
@@ -93,7 +133,7 @@ def load_cached_day(
         return None
     if require_current and data.get("evidenceHash") != day.evidence_hash:
         return None
-    text = str(data.get("text", ""))
+    text = pin_day_text(str(data.get("text", "")), day.day_name)
     return (text, str(data.get("providerDetails", ""))) if text.strip() else None
 
 
@@ -117,6 +157,15 @@ def ensure_day_report(
             return cached[0], cached[1], False
 
         result = build_day(day.evidence_text)
+<<<<<<< Updated upstream
+=======
+        result = AIWeeklyReportResult(
+            text=pin_day_text(result.text, day.day_name),
+            timing_ms=result.timing_ms,
+            provider_details=result.provider_details,
+        )
+        cache_dir = day_cache_dir(output_dir, week_start)
+>>>>>>> Stashed changes
         cache_dir.mkdir(parents=True, exist_ok=True)
         export_day(result.text, cache_dir, week_start_iso, result.provider_details, f"{_day_stem(day)}.odt")
         sidecar = cache_dir / f"{_day_stem(day)}.json"

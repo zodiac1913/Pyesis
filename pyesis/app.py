@@ -4692,6 +4692,7 @@ class PyesisApp:
         if not days:
             self.root.destroy()
             return
+<<<<<<< Updated upstream
         self._save_days_with_dialog(
             days,
             week_start,
@@ -4699,6 +4700,25 @@ class PyesisApp:
             compile_args=(render_weekly_evidence_text(self.config), self._active_week_start().isoformat()),
             message="Saving daily work and compiling the weekly report, please wait...",
         )
+=======
+        now = datetime.now()
+        if self._is_final_workday(now) and not self._weekly_report_exists_for(now):
+            self._save_days_with_dialog(
+                days,
+                week_start,
+                self._finish_close_with_report,
+                compile_args=(render_weekly_evidence_text(self.config), self._active_week_start().isoformat()),
+                message="Saving daily work and compiling the weekly report, please wait...",
+            )
+            return
+        self._save_days_with_dialog(days, week_start, self._finish_close)
+>>>>>>> Stashed changes
+
+    def _finish_close_with_report(self, error: str) -> None:
+        target = getattr(self, "_compiled_report_target", None)
+        if not error and target is not None:
+            self._open_created_document(target)
+        self._finish_close(error)
 
     def _finish_close(self, error: str) -> None:
         if error and not messagebox.askyesno("Pyesis", f"Daily save failed ({error}).\n\nClose anyway?"):
