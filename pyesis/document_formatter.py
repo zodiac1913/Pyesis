@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -89,6 +90,16 @@ def _week_end_date(week_start: datetime) -> datetime:
     return week_start + timedelta(days=6)
 
 
+def _week_days(week_start: datetime) -> Iterator[tuple[str, datetime]]:
+    for offset in range(7):
+        day_date = week_start + timedelta(days=offset)
+        yield day_date.strftime("%A"), day_date
+
+
+def _day_heading(day_name: str, day_date: datetime) -> str:
+    return f"@{day_name} {day_date.strftime('%y%m%d')}"
+
+
 def _group_entries(entries: list[EntryRecord]) -> dict[str, dict[str, list[EntryRecord]]]:
     grouped: dict[str, dict[str, list[EntryRecord]]] = defaultdict(lambda: defaultdict(list))
     for entry in sorted(entries, key=lambda item: item.created_at):
@@ -160,7 +171,7 @@ def render_weekly_evidence_text(
         lines.append("No captured entries for the current week.")
         return "\n".join(lines).rstrip() + "\n"
 
-    for day_name in DAY_ORDER:
+    for day_name, _ in _week_days(week_start):
         entries = selected_week_entries.get(day_name)
         if not entries:
             continue
@@ -218,7 +229,7 @@ def render_text_chunks(
     with cached_file_change_summaries():
         _append_week_header(chunks, active_week_start_iso)
         if active_week_entries:
-            _append_week_entries(chunks, active_week_entries, entry_tag_resolver, warning_comment_resolver, delete_tag_resolver)
+            _append_week_entries(chunks, active_week_start_iso, active_week_entries, entry_tag_resolver, warning_comment_resolver, delete_tag_resolver)
 
     return chunks
 
@@ -234,16 +245,17 @@ def _append_week_header(chunks: list[RenderedTextChunk], week_start_iso: str) ->
 
 def _append_week_entries(
     chunks: list[RenderedTextChunk],
+    week_start_iso: str,
     day_map: dict[str, list[EntryRecord]],
     entry_tag_resolver,
     warning_comment_resolver,
     delete_tag_resolver,
 ) -> None:
-    for day_name in DAY_ORDER:
+    for day_name, day_date in _week_days(datetime.fromisoformat(week_start_iso)):
         entries = day_map.get(day_name)
         if not entries:
             continue
-        chunks.append(RenderedTextChunk(f"@{day_name}\n", tags=("day-heading",)))
+        chunks.append(RenderedTextChunk(f"{_day_heading(day_name, day_date)}\n", tags=("day-heading",)))
         _append_day_repo_entries(chunks, entries, entry_tag_resolver, warning_comment_resolver, delete_tag_resolver)
         chunks.append(RenderedTextChunk("\n"))
 
@@ -365,15 +377,16 @@ def export_odt(config: AppConfig, output_dir: Path, file_name: str | None = None
     list_style = _add_bullet_list_style(document)
 
     week_start_iso, day_map = _active_week_entries(config.entries, config.week_end_day)
-    week_end = _week_end_date(datetime.fromisoformat(week_start_iso))
+    week_start = datetime.fromisoformat(week_start_iso)
+    week_end = _week_end_date(week_start)
     document.text.addElement(P(text=f"Weekly Report ({week_end.strftime('%Y %b %d')})", stylename=heading_style))
     document.text.addElement(P(text="What I worked on for this week:", stylename=intro_style))
 
-    for day_name in DAY_ORDER:
+    for day_name, day_date in _week_days(week_start):
         entries = day_map.get(day_name)
         if not entries:
             continue
-        document.text.addElement(P(text=day_name, stylename=day_style))
+        document.text.addElement(P(text=_day_heading(day_name, day_date), stylename=day_style))
         for repo_label, repo_entries in _group_entries_by_repo(entries).items():
             repo_list, repo_item = _bullet_item(list_style, f"{repo_label}:", repo_style)
             _write_repo_entries_odt(repo_item, list_style, repo_entries)
@@ -444,7 +457,7 @@ def export_ai_weekly_report_odt(
     if provider_details.strip():
         document.text.addElement(P(text=f"Generated with {provider_details.strip()}", stylename=subtitle_style))
 
-    _write_ai_weekly_report_odt(document, report_text, day_style, repo_style, body_style, list_style)
+    _write_ai_weekly_report_odt(document, report_text, week_start, day_style, repo_style, body_style, list_style)
 
     target = output_dir / (file_name or f"WhatIDidThisWeek{datetime.now().strftime('%Y%m%d')}.odt")
     document.save(target)
@@ -454,6 +467,7 @@ def export_ai_weekly_report_odt(
 def _write_ai_weekly_report_odt(
     document: OpenDocumentText,
     report_text: str,
+    week_start: datetime,
     day_style: Style,
     repo_style: Style,
     body_style: Style,
@@ -461,6 +475,7 @@ def _write_ai_weekly_report_odt(
 ) -> None:
     paragraph_parts: list[str] = []
     current_list: List | None = None
+    dates_by_name = dict(_week_days(week_start))
 
     def add_bullet(text: str) -> None:
         nonlocal current_list
@@ -498,7 +513,7 @@ def _write_ai_weekly_report_odt(
             day_heading = _parse_weekly_report_day_heading(heading_text)
             repo_heading = _parse_weekly_report_repo_heading(heading_text)
             if day_heading:
-                document.text.addElement(P(text=day_heading, stylename=day_style))
+                document.text.addElement(P(text=_day_heading(day_heading, dates_by_name[day_heading]), stylename=day_style))
             elif repo_heading:
                 document.text.addElement(P(text=repo_heading, stylename=repo_style))
             else:
@@ -509,7 +524,7 @@ def _write_ai_weekly_report_odt(
         if day_heading:
             flush_paragraph()
             flush_list()
-            document.text.addElement(P(text=day_heading, stylename=day_style))
+            document.text.addElement(P(text=_day_heading(day_heading, dates_by_name[day_heading]), stylename=day_style))
             continue
 
         repo_heading = _parse_weekly_report_repo_heading(stripped)
@@ -723,11 +738,11 @@ def _write_week_block(
     document.add_paragraph(f"({week_end.strftime('%Y %b %d')})")
     document.add_paragraph("What I worked on for this week:")
 
-    for day_name in DAY_ORDER:
+    for day_name, day_date in _week_days(week_start):
         entries = day_map.get(day_name)
         if not entries:
             continue
-        document.add_paragraph(f"@{day_name}")
+        document.add_paragraph(_day_heading(day_name, day_date))
         for repo_label, repo_entries in _group_entries_by_repo(entries).items():
             repo_paragraph = document.add_paragraph(style="List Bullet")
             repo_paragraph.paragraph_format.left_indent = None

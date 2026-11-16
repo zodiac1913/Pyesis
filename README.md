@@ -15,9 +15,9 @@ Desktop tool for monitoring `git diff` activity across multiple repositories and
 - Skip identical full diffs already captured for a repository. Changed diffs are retained even when their context, summaries, or saved excerpts look the same; fuzzy carry-over comparisons no longer delay scans or suppress work.
 - Generate first-person summaries through a pluggable AI hook.
 - Choose AI provider and model per machine in Settings (for example, lighter or heavier Ollama models based on local hardware).
-- Group entries by day with `@DayName` markers and then by repository name (alphabetical).
+- Group entries chronologically from the day after the configured week end, with `@DayName YYMMDD` headings, then by repository name (alphabetical).
 - Edit one saved summary entry at a time when you need to correct wording or add detail.
-- Start each Monday with blank spacing and a weekly header.
+- Start each configured work week with blank spacing and a weekly header.
 - Export the current log to `.odt`.
 - Generate the AI Weekly Report as a structured `.odt` document, organized by day and repository. Missing daily reports are saved in date order before merging; completed past days are reused even if their evidence changed, while today's report is refreshed as needed. Missing daily ODTs are restored from cached text without another AI request. Shutdown saves the latest day and compiles the weekly report, as does the final-workday automatic save.
 - Settings include a configurable document export folder, so generated files do not need to live inside the repo.

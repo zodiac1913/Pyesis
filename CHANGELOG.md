@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026.11.16.0 - 2026-11-16
+
+### Fixed
+- Weekly entries and AI evidence follow the configured week chronologically, including Friday work before Monday when the week ends Thursday.
+
+### Changed
+- Day headings in the work log and ODT reports include the date as `@DayName YYMMDD`.
+
 ## 2026.11.5.0 - 2026-11-05
 
 ### Fixed

@@ -30,7 +30,7 @@ class DocumentFormatterTests(unittest.TestCase):
                 content = archive.read("content.xml").decode("utf-8")
 
         self.assertIn("DASM Weekly Report (2026 Jul 02)", content)
-        self.assertIn(">Monday<", content)
+        self.assertIn(">@Monday 260629<", content)
         self.assertIn(">Pyesis<", content)
         self.assertIn("I added parser recovery details.", content)
         self.assertIn("I clarified the import path changes.", content)
@@ -87,10 +87,9 @@ class DocumentFormatterTests(unittest.TestCase):
 
         self.assertEqual(target.name, "week.odt")
         self.assertIn("Weekly Report (2026 Jul 02)", content)
-        self.assertIn(">Monday<", content)
+        self.assertIn(">@Monday 260629<", content)
         self.assertIn("PyesisBullets", content)
         self.assertIn("text:list-level-style-bullet", styles)
-        self.assertNotIn("@Monday", content)
         # repo bullet > entry bullet > continuation bullet
         self.assertEqual(content.count("<text:list "), 3)
         self.assertIn("I clarified import paths.", content)
@@ -310,7 +309,7 @@ class DocumentFormatterTests(unittest.TestCase):
             mock_datetime.fromisoformat.side_effect = datetime.fromisoformat
             chunks = render_text_chunks(config)
 
-        day_chunk = next(chunk for chunk in chunks if chunk.text == "@Monday\n")
+        day_chunk = next(chunk for chunk in chunks if chunk.text == "@Monday 260629\n")
         repo_chunk = next(chunk for chunk in chunks if chunk.text == "\t• Pyesis:\n")
         item_chunk = next(chunk for chunk in chunks if chunk.text == "\t\t• I tightened preview rendering in pyesis/app.py.\n")
 
